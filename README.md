@@ -1,19 +1,19 @@
 # ACS (Adaptive Competitive Self-organizing) アルゴリズム
 
-Pythonによる適応的競争自己組織化（ACS）アルゴリズムの実装です。本実装は、リアルタイムクラスタリングとベクトル量子化のための新しい自己組織化モデルを提供します。
+Python による適応的競争自己組織化（ACS）アルゴリズムの実装です。本実装は、リアルタイムクラスタリングとベクトル量子化のための新しい自己組織化モデルを提供します。
 
 ## 参考論文
 
 本実装は以下の論文に基づいています：
 
-> Zahra Sarafraz, Hossein Sarafraz and Mohammad R Sayeh (2018). "Real-time classifier based on adaptive competitive self-organizing algorithm", *Adaptive Behavior*, Vol. 26(1) 21–31. DOI: [10.1177/1059712318760695](https://doi.org/10.1177/1059712318760695)
+> Zahra Sarafraz, Hossein Sarafraz and Mohammad R Sayeh (2018). "Real-time classifier based on adaptive competitive self-organizing algorithm", _Adaptive Behavior_, Vol. 26(1) 21–31. DOI: [10.1177/1059712318760695](https://doi.org/10.1177/1059712318760695)
 
 ### 論文の主な特徴
 
 - **動的構造と自己調整パラメータ**: モデルは外部制御機構を必要としない教師なし分類器として機能します
 - **寄生的限界点問題への対処**: より正確なラベル割り当てを実現します
-- **エネルギー関数ベース**: Lyapunov関数形式のエネルギー関数により、有限個の孤立平衡点での安定化を保証します
-- **競争メカニズム**: Lotka-Volterra競争排除に基づく競争メカニズムと勾配降下理論を組み合わせています
+- **エネルギー関数ベース**: Lyapunov 関数形式のエネルギー関数により、有限個の孤立平衡点での安定化を保証します
+- **競争メカニズム**: Lotka-Volterra 競争排除に基づく競争メカニズムと勾配降下理論を組み合わせています
 
 ## ディレクトリ構成
 
@@ -38,6 +38,7 @@ pandas  # CSV出力用（オプション）
 ```
 
 インストール方法：
+
 ```bash
 pip install numpy scikit-learn matplotlib seaborn scipy japanize-matplotlib pandas
 ```
@@ -77,14 +78,14 @@ cluster_centers = acs_model.get_cluster_centers()
 ### 主要なパラメータ
 
 - **gamma (γ)**: エネルギー関数の目標値に関連するパラメータ。論文式(9)参照
-- **beta (β)**: 競争係数。Winner-Takes-All機構の強さを制御
+- **beta (β)**: 競争係数。Winner-Takes-All 機構の強さを制御
 - **learning_rate_W, learning_rate_lambda, learning_rate_Z**: 各パラメータの学習率
-- **activation_type**: 
+- **activation_type**:
   - `'circular'`: 円形の活性化関数（論文式(2)）
   - `'elliptical'`: 楕円形の活性化関数（論文式(6)）
 - **theta_new**: 新規クラスタ生成の閾値
 - **death_patience_steps**: クラスタ削除までの非活性許容ステップ数
-- **Z_death_threshold**: クラスタ削除のZ値閾値
+- **Z_death_threshold**: クラスタ削除の Z 値閾値
 
 ### 動的クラスタリング機能
 
@@ -95,7 +96,7 @@ cluster_centers = acs_model.get_cluster_centers()
 
 ## test_acs_circular.py / test_acs_elliptical.py の使い方
 
-これらのテストスクリプトは、Irisデータセットを使用してACSアルゴリズムの性能を評価します。
+これらのテストスクリプトは、Iris データセットを使用して ACS アルゴリズムの性能を評価します。
 
 ### 実行方法
 
@@ -109,13 +110,13 @@ python test_acs_elliptical.py
 
 ### テストスクリプトの機能
 
-1. **ランダムサーチによるハイパーパラメータ最適化**: 最大5000回の試行で最適なパラメータ組み合わせを探索
+1. **ランダムサーチによるハイパーパラメータ最適化**: 最大 5000 回の試行で最適なパラメータ組み合わせを探索
 2. **性能評価指標**:
    - Adjusted Rand Index (ARI)
-   - マッピング後のAccuracy
+   - マッピング後の Accuracy
    - 混同行列
 3. **可視化**:
-   - PCA空間でのクラスタリング結果
+   - PCA 空間でのクラスタリング結果
    - エポック毎の評価指標推移
    - エネルギー関数の等高線図
    - 混同行列のヒートマップ
@@ -140,24 +141,27 @@ result_test_acs_[circular/elliptical]_random_YYYYMMDD_HHMMSS/
 ### 論文の主要概念の実装
 
 1. **エネルギー関数**: 式(9)に基づくエネルギー関数の実装
+
    ```
    E = [γ - Σ(Z_j × X_j)]² + β × Σ(X_s × X_j) (s≠j)
    ```
 
 2. **活性化関数**:
+
    - 円形: X_jp = 1 / (1 + λ_j × ||U_p - W_j||²)
    - 楕円形: より複雑な形状の谷を形成可能
 
 3. **動的パラメータ更新**:
    - W_ij（ラベル）: 勾配降下法による更新
    - λ（警戒パラメータ）: クラスタサイズの動的調整
-   - Z_j（深さパラメータ）: 勝者は1へ、敗者は0へ収束
+   - Z_j（深さパラメータ）: 勝者は 1 へ、敗者は 0 へ収束
 
 ### 性能
 
-論文Table 2の結果と比較：
-- Irisデータセット（円形）: Accuracy 93%
-- Irisデータセット（楕円形）: Accuracy 95.3%
+論文 Table 2 の結果と比較：
+
+- Iris データセット（円形）: Accuracy 93%
+- Iris データセット（楕円形）: Accuracy 95.3%
 
 ## 注意事項
 
@@ -171,5 +175,15 @@ result_test_acs_[circular/elliptical]_random_YYYYMMDD_HHMMSS/
 
 ## 参考
 
-- 論文PDF: ACS.pdf（リポジトリには含まれません）
-- 関連研究: Self-Organizing Maps (SOM), Adaptive Resonance Theory (ART)
+```
+@article{sarafraz2018real,
+  title={Real-time classifier based on adaptive competitive self-organizing algorithm},
+  author={Sarafraz, Zahra and Sarafraz, Hossein and Sayeh, Mohammad R},
+  journal={Adaptive Behavior},
+  volume={26},
+  number={1},
+  pages={21--31},
+  year={2018},
+  publisher={SAGE Publications Sage UK: London, England}
+}
+```
