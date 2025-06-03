@@ -1,0 +1,42 @@
+# PDF files
+*.pdf
+
+# Log files
+*.log
+
+# Result directories
+result_test_acs*/
+
+# Version directories
+v1/
+v2/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*~
