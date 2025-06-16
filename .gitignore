@@ -42,3 +42,11 @@ Thumbs.db
 *~
 
 Iris/result_test_acs_circular_grid
+
+nc/era5_msl/
+
+*.nc
+
+*.txt
+
+prmsl/result_prmsl_acs_random_elliptical/

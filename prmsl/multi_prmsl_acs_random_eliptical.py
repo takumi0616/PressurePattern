@@ -203,22 +203,22 @@ def main_process_logic():
     print("\n--- 2. ランダムサーチ設定 ---")
     # ★★★ グリッドをランダムサーチ用の分布(範囲)に変更 ★★★
     param_dist = {
-        'gamma': (0.01, 1.0),
-        'beta': (0.01, 1.0),
+        'gamma': (0.01, 3.0),
+        'beta': (0.001, 1.0),
         'learning_rate_W': (0.001, 0.1),
         'learning_rate_lambda': (0.001, 0.1),
         'learning_rate_Z': (0.001, 0.1),
         'initial_lambda_vector_val': (0.001, 1.0),
-        'initial_lambda_crossterm_val': (-0.01, 0.1),
+        'initial_lambda_crossterm_val': (-0.5, 0.5),
         'initial_Z_val': (0.01, 1.0),
-        'initial_Z_new_cluster': (0.01, 0.5),
-        'theta_new': (0.01, 0.5),
+        'initial_Z_new_cluster': (0.01, 1.0),
+        'theta_new': (0.001, 1.0),
         'Z_death_threshold': (0.01, 0.1),
-        'death_patience_steps': [n_samples // 4, n_samples, n_samples * 2], # 離散選択
-        'num_epochs': [50, 100, 500, 1000, 10000] # 離散選択
+        'death_patience_steps': [n_samples // 10, n_samples // 4, n_samples // 2, n_samples, n_samples * 2], # 離散選択
+        'num_epochs': [1000] # 離散選択
     }
     
-    N_TRIALS = 100000  # ★★★ ランダムサーチの最大試行回数を設定 ★★★
+    N_TRIALS = 10000  # ★★★ ランダムサーチの最大試行回数を設定 ★★★
     ACCURACY_GOAL = 0.8 # ★★★ 早期終了のための目標精度 ★★★
 
     fixed_params_for_acs = {
@@ -231,7 +231,7 @@ def main_process_logic():
     # --- 3. 並列ランダムサーチの実行 ---
     print("\n--- 3. 並列ランダムサーチ実行 ---")
     available_cpus = os.cpu_count()
-    num_processes_to_use = max(1, int(available_cpus * 0.8)) if available_cpus else 2
+    num_processes_to_use = max(1, int(available_cpus * 0.95)) if available_cpus else 2
     print(f"利用可能CPU数: {available_cpus}, 使用プロセス数: {num_processes_to_use}")
 
     tasks_for_pool = []
