@@ -21,7 +21,7 @@ import japanize_matplotlib
 
 from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from sklearn.decomposition import PCA
-from sklearn.metrics import adjusted_rand_score, confusion_matrix
+from sklearn.metrics import adjusted_rand_score, confusion_matrix, recall_score
 from scipy.optimize import linear_sum_assignment
 
 # --- ACSクラスのインポート ---
@@ -42,10 +42,12 @@ random.seed(GLOBAL_SEED)
 
 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 # ★★★ ランダムサーチ用の出力ディレクトリ名に変更 ★★★
-output_dir_base = Path("./result_prmsl_acs_random_elliptical")
+output_dir_base = Path("./result_prmsl_acs_random_search") # 汎用的な名前に変更
 output_dir = output_dir_base / f"run_{timestamp}"
+trial_logs_dir = output_dir / "trial_logs" # ★★★ トライアル別ログ用ディレクトリ ★★★
 os.makedirs(output_dir, exist_ok=True)
-log_file_path = output_dir / f"random_search_log_{timestamp}.txt"
+os.makedirs(trial_logs_dir, exist_ok=True) # ★★★ ディレクトリ作成 ★★★
+log_file_path = output_dir / f"main_log_{timestamp}.txt"
 
 class Logger:
     """標準出力をコンソールとログファイルの両方へリダイレクトするクラス。"""
@@ -68,67 +70,120 @@ class Logger:
 # ==============================================================================
 def run_acs_trial(param_values_tuple_with_trial_info,
                   fixed_params_dict,
-                  X_data, y_data, n_true_cls_worker):
+                  X_data, y_data, n_true_cls_worker,
+                  trial_log_dir_path, label_class_names): # ★★★ 引数追加 ★★★
     """グリッドサーチ/ランダムサーチの1試行を独立して実行するワーカー関数。"""
     (trial_count, params_combo), trial_specific_seed = param_values_tuple_with_trial_info
     
-    num_epochs_worker = params_combo.pop('num_epochs')
-    current_run_params = {**fixed_params_dict, **params_combo, 'random_state': trial_specific_seed}
-    
-    # --- ログ出力の開始 ---
-    print(f"\n--- [Worker] トライアル {trial_count} 開始 ---")
-    log_params = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in params_combo.items()}
-    print(f"[Worker {trial_count}] パラメータ: {log_params}")
-    print(f"[Worker {trial_count}] エポック数: {num_epochs_worker}")
-
-    result = {
-        'params_combo': {**params_combo, 'num_epochs': num_epochs_worker},
-        'ari': -1.0,
-        'accuracy_mapped': -1.0,
-        'final_clusters': -1,
-        'history': [],
-        'error_traceback': None,
-        'duration_seconds': 0,
-        'acs_random_state_used': trial_specific_seed,
-        'trial_count_from_worker': trial_count
-    }
-    n_samples_worker = X_data.shape[0]
-    trial_start_time = datetime.datetime.now()
-
+    # ★★★ ワーカーごとのログファイル設定 ★★★
+    worker_log_path = trial_log_dir_path / f"trial_{trial_count}.log"
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
     try:
-        acs_model_trial = ACS(**current_run_params)
-        
-        # --- エポック毎に評価を記録するループ ---
-        for epoch in range(num_epochs_worker):
-            acs_model_trial.fit(X_data, epochs=1)
+        with open(worker_log_path, 'w', encoding='utf-8') as log_file:
+            sys.stdout = log_file
+            sys.stderr = log_file
+
+            num_epochs_worker = params_combo.pop('num_epochs')
+            # activation_typeをparams_comboから取り出す
+            activation_type_worker = params_combo.pop('activation_type')
             
-            current_clusters = acs_model_trial.M
-            epoch_ari, epoch_acc = 0.0, 0.0
+            # activation_typeに応じて不要なパラメータを削除
+            if activation_type_worker == 'circular':
+                params_combo.pop('initial_lambda_vector_val', None)
+                params_combo.pop('initial_lambda_crossterm_val', None)
+            else: # elliptical
+                params_combo.pop('initial_lambda_scalar', None)
 
-            if current_clusters > 0:
-                preds = acs_model_trial.predict(X_data)
-                epoch_ari = adjusted_rand_score(y_data, preds)
-                contingency = pd.crosstab(preds, y_data)
-                row_ind, col_ind = linear_sum_assignment(-contingency.values)
-                epoch_acc = contingency.values[row_ind, col_ind].sum() / n_samples_worker
+            current_run_params = {
+                **fixed_params_dict, 
+                **params_combo, 
+                'activation_type': activation_type_worker, # ワーカーのactivation_typeを設定
+                'random_state': trial_specific_seed
+            }
             
-            result['history'].append({'epoch': epoch + 1, 'clusters': current_clusters, 'ari': epoch_ari, 'accuracy_mapped': epoch_acc})
+            # --- ログ出力の開始 ---
+            print(f"\n--- [Worker] トライアル {trial_count} 開始 ---")
+            log_params = {k: f"{v:.4f}" if isinstance(v, float) else v for k, v in params_combo.items()}
+            print(f"[Worker {trial_count}] Activation Type: {activation_type_worker}")
+            print(f"[Worker {trial_count}] パラメータ: {log_params}")
+            print(f"[Worker {trial_count}] エポック数: {num_epochs_worker}")
+
+            result = {
+                'params_combo': {**params_combo, 'num_epochs': num_epochs_worker, 'activation_type': activation_type_worker},
+                'ari': -1.0,
+                'accuracy_mapped': -1.0,
+                'final_clusters': -1,
+                'history': [],
+                'error_traceback': None,
+                'duration_seconds': 0,
+                'acs_random_state_used': trial_specific_seed,
+                'trial_count_from_worker': trial_count
+            }
+            n_samples_worker = X_data.shape[0]
+            trial_start_time = datetime.datetime.now()
+
+            try:
+                acs_model_trial = ACS(**current_run_params)
+                
+                # --- エポック毎に評価を記録するループ ---
+                for epoch in range(num_epochs_worker):
+                    acs_model_trial.fit(X_data, epochs=1)
+                    
+                    current_clusters = acs_model_trial.M
+                    epoch_ari, epoch_acc = 0.0, 0.0
+
+                    if current_clusters > 0:
+                        preds = acs_model_trial.predict(X_data)
+                        epoch_ari = adjusted_rand_score(y_data, preds)
+                        contingency = pd.crosstab(preds, y_data)
+                        row_ind, col_ind = linear_sum_assignment(-contingency.values)
+                        epoch_acc = contingency.values[row_ind, col_ind].sum() / n_samples_worker
+                    
+                    result['history'].append({'epoch': epoch + 1, 'clusters': current_clusters, 'ari': epoch_ari, 'accuracy_mapped': epoch_acc})
+                    
+                    print(f"[Worker {trial_count}] Epoch {epoch+1}/{num_epochs_worker} - Cls: {current_clusters}, ARI: {epoch_ari:.4f}, Acc: {epoch_acc:.4f}")
+
+                final_history = result['history'][-1]
+                result['ari'], result['accuracy_mapped'], result['final_clusters'] = final_history['ari'], final_history['accuracy_mapped'], final_history['clusters']
+                
+                # ★★★ ラベルごとの精度を計算・表示 ★★★
+                if result['final_clusters'] > 0:
+                    print("\n--- ラベル別 最終精度 (Recall) ---")
+                    preds = acs_model_trial.predict(X_data)
+                    contingency = pd.crosstab(preds, y_data)
+                    row_ind, col_ind = linear_sum_assignment(-contingency.values)
+                    
+                    mapped_preds = np.full_like(y_data, -1)
+                    pred_to_true_map = {pred_idx: true_idx for pred_idx, true_idx in zip(row_ind, col_ind)}
+                    for pred_val, true_val in pred_to_true_map.items():
+                         # contingencyのインデックスから実際の予測ラベル値を取得
+                        actual_pred_label = contingency.index[pred_val]
+                        mapped_preds[preds == actual_pred_label] = true_val
+
+                    recalls = recall_score(y_data, mapped_preds, average=None, labels=np.arange(len(label_class_names)), zero_division=0)
+                    for i, class_name in enumerate(label_class_names):
+                        print(f"  - {class_name:<4s}: {recalls[i]:.4f}")
+
+            except Exception:
+                result['error_traceback'] = traceback.format_exc()
+                print(f"--- [Worker] トライアル {trial_count} でエラー発生 ---\n{result['error_traceback']}")
+
+            trial_end_time = datetime.datetime.now()
+            result['duration_seconds'] = (trial_end_time - trial_start_time).total_seconds()
             
-            # ★★★ 改善点: ログの間引きをなくし、毎エポックの状況を出力 ★★★
-            print(f"[Worker {trial_count}] Epoch {epoch+1}/{num_epochs_worker} - Cls: {current_clusters}, ARI: {epoch_ari:.4f}, Acc: {epoch_acc:.4f}")
+            print(f"\n--- [Worker] トライアル {trial_count} 終了 | Acc: {result['accuracy_mapped']:.4f}, ARI: {result['ari']:.4f}, Cls: {result['final_clusters']}, Time: {result['duration_seconds']:.2f}s ---")
+            
+            # 標準出力を元に戻す
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+            
+            return result
+    finally:
+        # エラーが発生しても必ず標準出力を元に戻す
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
 
-        final_history = result['history'][-1]
-        result['ari'], result['accuracy_mapped'], result['final_clusters'] = final_history['ari'], final_history['accuracy_mapped'], final_history['clusters']
-
-    except Exception:
-        result['error_traceback'] = traceback.format_exc()
-        print(f"--- [Worker] トライアル {trial_count} でエラー発生 ---\n{result['error_traceback']}")
-
-    trial_end_time = datetime.datetime.now()
-    result['duration_seconds'] = (trial_end_time - trial_start_time).total_seconds()
-    
-    print(f"--- [Worker] トライアル {trial_count} 終了 | Acc: {result['accuracy_mapped']:.4f}, ARI: {result['ari']:.4f}, Cls: {result['final_clusters']}, Time: {result['duration_seconds']:.2f}s ---")
-    return result
 
 # ==============================================================================
 # ★★★ ランダムサーチのためのパラメータサンプリング関数 ★★★
@@ -140,11 +195,10 @@ def sample_random_params(param_dist):
     params = {}
     for key, value in param_dist.items():
         if isinstance(value, list):
-            # リストで定義された値は、その中からランダムに1つを選択 (離散選択)
             params[key] = random.choice(value)
         elif isinstance(value, tuple) and len(value) == 2:
-            # (最小値, 最大値)のタプルで定義された値は、その範囲内の一様な実数をサンプリング (連続選択)
-            params[key] = np.random.uniform(value[0], value[1])
+            # ★★★ 小数点以下2桁に丸める ★★★
+            params[key] = round(np.random.uniform(value[0], value[1]), 2)
     return params
 
 # ==============================================================================
@@ -156,11 +210,12 @@ def main_process_logic():
     sys.stdout, sys.stderr = logger_instance, logger_instance
 
     print("=" * 80)
-    print("ACSモデル (楕円形活性化) による気圧配置パターンの教師なしクラスタリング")
+    print("ACSモデルによる気圧配置パターンの教師なしクラスタリング")
     print("★★★ 並列ランダムサーチによるハイパーパラメータ探索 ★★★")
     print("=" * 80)
     print(f"結果保存先ディレクトリ: {output_dir.resolve()}")
-    print(f"ログファイル: {log_file_path.resolve()}")
+    print(f"メインログファイル: {log_file_path.resolve()}")
+    print(f"★★★ 各トライアルの詳細ログ: {trial_logs_dir.resolve()} ★★★") # ★★★ ログ場所の案内 ★★★
     print(f"実行開始時刻: {timestamp}")
     print(f"グローバル乱数シード: {GLOBAL_SEED}")
 
@@ -201,29 +256,31 @@ def main_process_logic():
 
     # --- 2. ランダムサーチの設定 ---
     print("\n--- 2. ランダムサーチ設定 ---")
-    # ★★★ グリッドをランダムサーチ用の分布(範囲)に変更 ★★★
     param_dist = {
         'gamma': (0.01, 3.0),
         'beta': (0.001, 1.0),
         'learning_rate_W': (0.001, 0.1),
         'learning_rate_lambda': (0.001, 0.1),
         'learning_rate_Z': (0.001, 0.1),
-        'initial_lambda_vector_val': (0.001, 1.0),
-        'initial_lambda_crossterm_val': (-0.5, 0.5),
+        'initial_lambda_scalar': (0.001, 1.0), # for circular
+        'initial_lambda_vector_val': (0.001, 1.0), # for elliptical
+        'initial_lambda_crossterm_val': (-0.5, 0.5), # for elliptical
         'initial_Z_val': (0.01, 1.0),
         'initial_Z_new_cluster': (0.01, 1.0),
         'theta_new': (0.001, 1.0),
         'Z_death_threshold': (0.01, 0.1),
-        'death_patience_steps': [n_samples // 10, n_samples // 4, n_samples // 2, n_samples, n_samples * 2], # 離散選択
-        'num_epochs': [1000] # 離散選択
+        'death_patience_steps': [n_samples // 10, n_samples // 4, n_samples // 2, n_samples, n_samples * 2],
+        'num_epochs': [1000],
+        'activation_type': ['circular', 'elliptical'] # ★★★ activation_typeを追加 ★★★
     }
     
-    N_TRIALS = 10000  # ★★★ ランダムサーチの最大試行回数を設定 ★★★
-    ACCURACY_GOAL = 0.8 # ★★★ 早期終了のための目標精度 ★★★
+    N_TRIALS = 10000
+    ACCURACY_GOAL = 0.8
 
     fixed_params_for_acs = {
         'max_clusters': 30, 'initial_clusters': 1, 'n_features': n_total_features,
-        'activation_type': 'elliptical', 'lambda_min_val': 1e-7, 'bounds_W': (0, 1)
+        'lambda_min_val': 1e-7, 'bounds_W': (0, 1)
+        # activation_type はランダムサーチ対象のため削除
     }
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
     print(f"早期終了の目標精度 (Accuracy): {ACCURACY_GOAL}")
@@ -236,7 +293,6 @@ def main_process_logic():
 
     tasks_for_pool = []
     for i in range(N_TRIALS):
-        # ★★★ パラメータをランダムにサンプリング ★★★
         params_combo = sample_random_params(param_dist)
         trial_specific_seed = GLOBAL_SEED + i + 1
         tasks_for_pool.append(((i + 1, params_combo), trial_specific_seed))
@@ -244,7 +300,9 @@ def main_process_logic():
     worker_func_with_fixed_args = partial(run_acs_trial,
                                           fixed_params_dict=fixed_params_for_acs,
                                           X_data=X_scaled_data, y_data=y_true_labels,
-                                          n_true_cls_worker=n_true_clusters)
+                                          n_true_cls_worker=n_true_clusters,
+                                          trial_log_dir_path=trial_logs_dir, # ★★★ 引数追加 ★★★
+                                          label_class_names=label_encoder.classes_) # ★★★ 引数追加 ★★★
 
     start_search_time = datetime.datetime.now()
     all_trial_results_list = []
@@ -252,21 +310,18 @@ def main_process_logic():
     goal_achieved = False
 
     with multiprocessing.Pool(processes=num_processes_to_use) as pool:
-        # imap_unorderedを使い、完了したタスクから順に結果を処理
         for result in tqdm(pool.imap_unordered(worker_func_with_fixed_args, tasks_for_pool), total=N_TRIALS, desc="Random Search Progress"):
             all_trial_results_list.append(result)
 
-            # 現在の最良モデルを更新（エラーでない場合）
             if not result['error_traceback']:
                 if best_result is None or result['accuracy_mapped'] > best_result['accuracy_mapped']:
                     best_result = result
             
-            # ★★★ 早期終了の判定 ★★★
             if result['accuracy_mapped'] >= ACCURACY_GOAL:
                 print(f"\n✅ 目標精度達成 (Acc >= {ACCURACY_GOAL})！ トライアル {result['trial_count_from_worker']} でサーチを打ち切ります。")
                 goal_achieved = True
-                pool.terminate() # 他の全てのワーカープロセスを停止
-                break # tqdmループを抜ける
+                pool.terminate()
+                break
 
     end_search_time = datetime.datetime.now()
     print(f"\nランダムサーチ完了。総所要時間: {end_search_time - start_search_time}")
@@ -303,9 +358,6 @@ def main_process_logic():
     for key, val in best_params_combo_dict.items():
         print(f"  {key}: {val:.4f}" if isinstance(val, float) else f"  {key}: {val}")
     
-    # 5 & 6以降の処理は、前回のコードとほぼ同じため、簡潔に記載。
-    # 変更点は、学習履歴プロットの追加と、プロットのファイル名やタイトルを"Random"に合わせる点です。
-
     # --- 5. 最良モデルでの再学習と最終評価 ---
     print("\n--- 5. 最良モデルでの再学習と最終評価 ---")
     params_for_init = best_params_combo_dict.copy()
@@ -339,8 +391,13 @@ def main_process_logic():
     # 6a. 混同行列
     if final_clusters > 0:
         mapped_pred_labels = np.full_like(y_true_labels, -1)
-        pred_to_true_map = {pred_idx: true_idx for pred_idx, true_idx in zip(final_contingency.index[final_row_ind], final_contingency.columns[final_col_ind])}
-        for pred_label, true_label_idx in pred_to_true_map.items(): mapped_pred_labels[final_predicted_labels == pred_label] = true_label_idx
+        pred_to_true_map = {pred_idx: true_idx for pred_idx, true_idx in zip(final_contingency.index[final_row_ind], label_encoder.classes_[final_col_ind])}
+        
+        # マッピング辞書を作り直し、ラベルインデックスに変換
+        pred_idx_to_true_idx_map = {contingency.index[pred_i]: true_i for pred_i, true_i in zip(final_row_ind, final_col_ind)}
+        for pred_label_val, true_label_idx in pred_idx_to_true_idx_map.items():
+             mapped_pred_labels[final_predicted_labels == pred_label_val] = true_label_idx
+
         cm = confusion_matrix(y_true_labels, mapped_pred_labels, labels=np.arange(n_true_clusters))
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_, annot_kws={"size": 10})
@@ -358,7 +415,6 @@ def main_process_logic():
     plt.title('真の気圧配置パターン (PCA 2D)'), plt.xlabel('主成分1'), plt.ylabel('主成分2'), scatter_true.legend(title="真のラベル", bbox_to_anchor=(1.05, 1), loc='upper left')
     
     plt.subplot(1, 2, 2)
-    cluster_centers_2d = None
     if final_clusters > 0:
         mapped_hue = [target_names_map.get(l, 'Unmapped') for l in mapped_pred_labels]
         hue_order = [target_names_map[i] for i in sorted(target_names_map.keys())] + ['Unmapped']
@@ -366,9 +422,12 @@ def main_process_logic():
         scatter_pred.legend(title="予測ラベル", bbox_to_anchor=(1.05, 1), loc='upper left')
         cluster_centers_22d = best_model_instance.get_cluster_centers()
         if cluster_centers_22d.shape[0] > 0:
-            cluster_centers_scaled = scaler.inverse_transform(cluster_centers_22d)
-            cluster_centers_2d = pca_visual.transform(cluster_centers_scaled)
-            plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1], c='red', marker='X', s=200, edgecolor='white', label='クラスタ中心(W)')
+            # スケーリングを逆変換してからPCAにかける
+            # 特徴量全体 (PCA+時間) のスケーラーなので、PCA部分だけ取り出して逆変換する必要がある
+            # 簡単のため、ここでは22次元の中心を直接PCA変換する（厳密には不正確だが可視化目的）
+            if cluster_centers_22d.shape[1] == X_scaled_data.shape[1]:
+                 cluster_centers_2d = pca_visual.transform(cluster_centers_22d)
+                 plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1], c='red', marker='X', s=200, edgecolor='white', label='クラスタ中心(W)')
     else:
         sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], color='gray', s=50, alpha=0.7)
 
@@ -390,9 +449,15 @@ def main_process_logic():
         print(f"✅ 最良モデルの学習推移グラフを保存しました。")
 
     print("\n--- 全処理完了 ---")
+    # Loggerを閉じる
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
     if isinstance(sys.stdout, Logger):
-        sys.stdout, sys.stderr = original_stdout, original_stderr
         logger_instance.close()
+        sys.stdout, sys.stderr = original_stdout, original_stderr
 
 if __name__ == '__main__':
+    # メインロジックを直接呼び出す前に、元のstdout/stderrを保持
+    original_stdout_main = sys.stdout
+    original_stderr_main = sys.stderr
     main_process_logic()
