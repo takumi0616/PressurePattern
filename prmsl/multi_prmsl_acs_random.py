@@ -248,7 +248,7 @@ def main_process_logic():
 
     # --- ★★★ 効率化のため、複数パターンのPCAを事前計算 ★★★ ---
     print("\n--- 最初に3パターンのPCAデータを事前計算します... ---")
-    pca_dims_to_test = [20, 40, 60]
+    pca_dims_to_test = [15, 20, 25]
     precalculated_pca_data = {}
     for n_dim in pca_dims_to_test:
         print(f"  ... PCA (n={n_dim}) を計算中 ...")
@@ -279,7 +279,7 @@ def main_process_logic():
         'activation_type': ['circular', 'elliptical']
     }
     
-    N_TRIALS = 10
+    N_TRIALS = 1000
     ACCURACY_GOAL = 0.8
 
     fixed_params_for_acs = {
@@ -293,7 +293,7 @@ def main_process_logic():
     # --- 3. 並列ランダムサーチの実行 ---
     print("\n--- 3. 並列ランダムサーチ実行 ---")
     available_cpus = os.cpu_count()
-    num_processes_to_use = max(1, int(available_cpus * 0.95)) if available_cpus else 2
+    num_processes_to_use = max(1, int(available_cpus * 0.9)) if available_cpus else 2
     print(f"利用可能CPU数: {available_cpus}, 使用プロセス数: {num_processes_to_use}")
 
     tasks_for_pool = []
