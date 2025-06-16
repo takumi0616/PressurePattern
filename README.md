@@ -187,3 +187,7 @@ result_test_acs_[circular/elliptical]_random_YYYYMMDD_HHMMSS/
   publisher={SAGE Publications Sage UK: London, England}
 }
 ```
+
+```bash
+nohup python multi_prmsl_acs_random.py > output.log 2>&1 &
+```

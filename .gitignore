@@ -48,5 +48,3 @@ nc/era5_msl/
 *.nc
 
 *.txt
-
-prmsl/result_prmsl_acs_random_elliptical/
