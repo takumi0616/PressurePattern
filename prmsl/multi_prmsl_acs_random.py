@@ -26,6 +26,8 @@ from scipy.optimize import linear_sum_assignment
 
 # --- ACSクラスのインポート ---
 try:
+    # numbaで最適化されたacs.pyをインポートします。
+    # 呼び出し側のコードは変更不要です。
     from acs import ACS
     print("ACS class (acs.py) imported successfully.")
 except ImportError as e:
@@ -98,6 +100,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
             else:
                 X_features = X_pca
             
+            # PCA後の特徴量と時間特徴量のスケールを最終的に[0,1]に統一するためにScalerを適用
             scaler = MinMaxScaler()
             X_scaled_data = scaler.fit_transform(X_features)
             n_features_worker = X_scaled_data.shape[1]
@@ -158,10 +161,9 @@ def run_acs_trial(param_values_tuple_with_trial_info,
                         row_ind, col_ind = linear_sum_assignment(-contingency.values)
                         epoch_acc = contingency.values[row_ind, col_ind].sum() / n_samples_worker
                     result['history'].append({'epoch': epoch + 1, 'clusters': current_clusters, 'ari': epoch_ari, 'accuracy_mapped': epoch_acc})
-                    if (epoch + 1) % 100 == 0: # 100エポックごとにログ出力
+                    if (epoch + 1) % 100 == 0:
                         print(f"[Worker {trial_count}] Epoch {epoch+1}/{num_epochs_worker} - Cls: {current_clusters}, ARI: {epoch_ari:.4f}, Acc: {epoch_acc:.4f}")
 
-                # ★★★ 改善点: 学習履歴全体から最高の性能を示したエポックの結果を、この試行の最終結果とする ★★★
                 if result['history']:
                     best_epoch_history = max(result['history'], key=lambda x: x['accuracy_mapped'])
                     result['ari'] = best_epoch_history['ari']
@@ -169,7 +171,6 @@ def run_acs_trial(param_values_tuple_with_trial_info,
                     result['final_clusters'] = best_epoch_history['clusters']
                     result['best_epoch'] = best_epoch_history['epoch']
                 
-                # 参考情報として、最終エポック時点でのRecallもログに残す
                 if acs_model_trial.M > 0:
                     print("\n--- ラベル別 最終精度 (Recall at final epoch) ---")
                     preds = acs_model_trial.predict(X_scaled_data)
@@ -205,9 +206,65 @@ def sample_random_params(param_dist):
         if isinstance(value, list):
             params[key] = random.choice(value)
         elif isinstance(value, tuple) and len(value) == 2:
-            # 浮動小数点数の場合、有効数字4桁に丸める
             params[key] = round(np.random.uniform(value[0], value[1]), 4)
     return params
+
+# ★★★ 新設: エネルギー等高線プロットを生成する関数 ★★★
+def plot_energy_contour_for_epoch(model, epoch, save_path, X_pca_visual, y_true_labels, target_names_map, pca_visual_model):
+    """指定されたモデルの状態でエネルギー等高線プロットを生成し保存する。"""
+    
+    # 2D描画領域のグリッドを作成
+    x_min, x_max = X_pca_visual[:, 0].min() - 0.1, X_pca_visual[:, 0].max() + 0.1
+    y_min, y_max = X_pca_visual[:, 1].min() - 0.1, X_pca_visual[:, 1].max() + 0.1
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, 80), np.linspace(y_min, y_max, 80))
+
+    # グリッド上の各点を高次元空間に逆変換
+    grid_points_2d = np.c_[xx.ravel(), yy.ravel()]
+    try:
+        # pca_visual_modelはX_scaled_data_bestで学習済みなので、2D->高次元へ逆変換
+        grid_points_high_dim = pca_visual_model.inverse_transform(grid_points_2d)
+    except Exception as e:
+        print(f"Epoch {epoch}: PCA逆変換中にエラー: {e}")
+        return
+
+    # 各点でのエネルギーを計算
+    energy_values = np.zeros(grid_points_high_dim.shape[0])
+    for i in range(len(grid_points_high_dim)):
+        energy_values[i] = model.calculate_energy_at_point(grid_points_high_dim[i, :])
+    
+    Z_grid = energy_values.reshape(xx.shape)
+
+    # プロット作成
+    plt.figure(figsize=(10, 8))
+    
+    # エネルギー等高線をプロット
+    plt.contourf(xx, yy, Z_grid, levels=20, cmap='viridis', alpha=0.5)
+    plt.colorbar(label='エネルギー (E)')
+    plt.contour(xx, yy, Z_grid, levels=20, colors='white', linewidths=0.5, alpha=0.6)
+
+    # データ点をプロット
+    sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=[target_names_map.get(l, 'N/A') for l in y_true_labels], 
+                    palette='bright', s=50, alpha=0.9, edgecolor='w', linewidth=0.5)
+
+    # クラスタ中心(W)をプロット
+    cluster_centers = model.get_cluster_centers()
+    if cluster_centers.shape[0] > 0:
+        try:
+            # 高次元のクラスタ中心を2Dに変換
+            cluster_centers_2d = pca_visual_model.transform(cluster_centers)
+            plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1], c='black', marker='o', s=150, edgecolor='white', linewidth=1.5, label='クラスタ中心 (W)')
+        except Exception as e:
+            print(f"Epoch {epoch}: クラスタ中心のPCA変換中にエラー: {e}")
+
+    plt.title(f'エネルギー等高線とクラスタリング状態 (Epoch: {epoch})', fontsize=16)
+    plt.xlabel('主成分1'), plt.ylabel('主成分2')
+    plt.legend(title="凡例", bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.tight_layout(rect=[0, 0, 0.85, 1])
+    
+    # ファイルに保存
+    plot_filepath = save_path / f"energy_contour_epoch_{epoch:04d}.png"
+    plt.savefig(plot_filepath, dpi=150, bbox_inches='tight')
+    plt.close()
 
 # ==============================================================================
 # メイン処理
@@ -254,16 +311,22 @@ def main_process_logic():
     sin_time = ds_filtered['sin_time'].values.reshape(-1, 1)
     cos_time = ds_filtered['cos_time'].values.reshape(-1, 1)
 
-    # --- 複数パターンのPCAを事前計算 ---
-    print("\n--- 最初に複数パターンのPCAデータを事前計算します... ---")
+    # 前処理の順序を変更 (MinMaxScaler -> PCA)
+    print("\n--- 前処理: データを[0,1]にスケーリングしてからPCAを適用します ---")
+    scaler_for_pca = MinMaxScaler()
+    msl_flat_scaled = scaler_for_pca.fit_transform(msl_flat)
+    print("✅ 海面気圧データをスケーリングしました。")
+    del msl_flat
+
+    print("\n--- スケーリング済みデータで複数パターンのPCAを事前計算します... ---")
     pca_dims_to_test = [15, 20, 25]
     precalculated_pca_data = {}
     for n_dim in pca_dims_to_test:
         print(f"  ... PCA (n={n_dim}) を計算中 ...")
         pca_model = PCA(n_components=n_dim, random_state=GLOBAL_SEED)
-        precalculated_pca_data[n_dim] = pca_model.fit_transform(msl_flat)
+        precalculated_pca_data[n_dim] = pca_model.fit_transform(msl_flat_scaled)
     print("✅ 全パターンのPCA計算が完了しました。")
-    del msl_flat # メモリ解放
+    del msl_flat_scaled
 
     # --- 2. ランダムサーチの設定 ---
     print("\n--- 2. ランダムサーチ設定 ---")
@@ -287,7 +350,7 @@ def main_process_logic():
         'activation_type': ['circular', 'elliptical']
     }
     
-    N_TRIALS = 100
+    N_TRIALS = 1000
     ACCURACY_GOAL = 0.7
 
     fixed_params_for_acs = {
@@ -328,11 +391,9 @@ def main_process_logic():
         for result in tqdm(pool.imap_unordered(worker_func_with_fixed_args, tasks_for_pool), total=N_TRIALS, desc="Random Search Progress"):
             all_trial_results_list.append(result)
             if not result['error_traceback']:
-                # 各試行の「最高精度」を比較して best_result を更新
                 if best_result is None or result['accuracy_mapped'] > best_result['accuracy_mapped']:
                     best_result = result
-            # 各試行の「最高精度」が目標を達成したら早期終了
-            if result['accuracy_mapped'] >= ACCURACY_GOAL:
+            if best_result and best_result.get('accuracy_mapped', 0) >= ACCURACY_GOAL:
                 print(f"\n✅ 目標精度達成 (Acc >= {ACCURACY_GOAL})！ トライアル {result['trial_count_from_worker']} でサーチを打ち切ります。")
                 goal_achieved = True
                 pool.terminate()
@@ -351,10 +412,10 @@ def main_process_logic():
         df_data = []
         for res in all_trial_results_list:
             row = res['params_combo'].copy()
-            # ★★★ 改善点: CSVにも最高精度時のエポック数を保存 ★★★
             row.update({'ari': res['ari'], 'accuracy_mapped': res['accuracy_mapped'], 'final_clusters': res['final_clusters'],
                         'best_epoch': res['best_epoch'],
-                        'duration_seconds': res['duration_seconds'], 'error_present': bool(res['error_traceback'])})
+                        'duration_seconds': res['duration_seconds'], 'error_present': bool(res['error_traceback']),
+                        'trial_id': res['trial_count_from_worker']})
             df_data.append(row)
         
         results_df = pd.DataFrame(df_data).sort_values(by=['accuracy_mapped', 'ari'], ascending=False)
@@ -366,9 +427,9 @@ def main_process_logic():
         print("エラー: 全ての試行でエラーが発生、または有効な結果が得られませんでした。")
         sys.exit(1)
         
-    # ★★★ 改善点: 結果表示に最高精度を達成したエポック数を追加 ★★★
     print(f"\n--- 最良パラメータ ({'目標達成' if goal_achieved else '探索終了時点'}) ---")
     best_params_combo_dict = best_result['params_combo']
+    print(f"Trial ID: {best_result['trial_count_from_worker']}")
     print(f"最高精度 (Mapped): {best_result['accuracy_mapped']:.4f} (at Epoch {best_result['best_epoch']})")
     print(f"最高精度時のARI: {best_result['ari']:.4f}")
     print(f"最高精度時のクラスタ数: {best_result['final_clusters']}")
@@ -393,11 +454,9 @@ def main_process_logic():
     X_scaled_data_best = final_scaler.fit_transform(X_features_best)
 
     params_for_init = best_params_copy
-    # ★★★ 改善点: 最高精度を記録したエポック数で再学習する ★★★
     epochs_for_refit = best_result['best_epoch']
-    params_for_init.pop('num_epochs') # 元のnum_epochsは使わないので削除
-    print(f"最高精度を記録した {epochs_for_refit} エポックで再学習します。")
-
+    params_for_init.pop('num_epochs')
+    
     best_model_full_params_for_refit = {
         **fixed_params_for_acs, 
         **params_for_init, 
@@ -406,10 +465,33 @@ def main_process_logic():
     }
     
     best_model_instance = ACS(**best_model_full_params_for_refit)
-    # 指定されたエポック数で再学習
-    best_model_instance.fit(X_scaled_data_best, epochs=epochs_for_refit)
-    print("✅ 最良モデルの再学習が完了しました。")
+    
+    # --- 6. 結果の可視化と保存 ---
+    print("\n--- 6. 結果の可視化 ---")
+    pca_visual = PCA(n_components=2, random_state=GLOBAL_SEED)
+    X_pca_visual = pca_visual.fit_transform(X_scaled_data_best)
+    
+    # ★★★ 改善点: エネルギープロット用のディレクトリを作成 ★★★
+    energy_plot_dir = output_dir / f"energy_plots_trial_{best_result['trial_count_from_worker']}"
+    os.makedirs(energy_plot_dir, exist_ok=True)
+    print(f"✅ エネルギー等高線プロットを {energy_plot_dir.resolve()} に保存します。")
 
+    # ★★★ 改善点: 1エポックずつ再学習と可視化を行うループ ★★★
+    print(f"\n--- 最良モデルでの再学習とエネルギー遷移の可視化 (計 {epochs_for_refit} エポック) ---")
+    for epoch in tqdm(range(1, epochs_for_refit + 1), desc="再学習とプロット生成"):
+        best_model_instance.fit(X_scaled_data_best, epochs=1)
+        plot_energy_contour_for_epoch(
+            model=best_model_instance,
+            epoch=epoch,
+            save_path=energy_plot_dir,
+            X_pca_visual=X_pca_visual,
+            y_true_labels=y_true_labels,
+            target_names_map=target_names_map,
+            pca_visual_model=pca_visual
+        )
+    print("\n✅ 再学習とエネルギー遷移プロットの生成が完了しました。")
+
+    # --- 最終状態での評価とプロット ---
     final_predicted_labels = best_model_instance.predict(X_scaled_data_best) if best_model_instance.M > 0 else np.full(n_samples, -1)
     final_ari = adjusted_rand_score(y_true_labels, final_predicted_labels)
     final_clusters = best_model_instance.M
@@ -419,16 +501,10 @@ def main_process_logic():
         final_row_ind, final_col_ind = linear_sum_assignment(-final_contingency.values)
         final_accuracy = final_contingency.values[final_row_ind, final_col_ind].sum() / n_samples
     
-    print("\n--- 最終評価結果 ---")
+    print("\n--- 最終評価結果 (After Refit) ---")
     print(f"Accuracy (Mapped): {final_accuracy:.4f}")
     print(f"ARI: {final_ari:.4f}")
     print(f"最終クラスタ数: {final_clusters}")
-
-
-    # --- 6. 結果の可視化と保存 ---
-    print("\n--- 6. 結果の可視化 ---")
-    pca_visual = PCA(n_components=2, random_state=GLOBAL_SEED)
-    X_pca_visual = pca_visual.fit_transform(X_scaled_data_best)
 
     # 6a. 混同行列
     if final_clusters > 0:
@@ -447,8 +523,8 @@ def main_process_logic():
     else:
         print("クラスタが形成されなかったため、混同行列はスキップします。")
 
-    # 6b. PCAクラスタリング結果
-    plt.figure(figsize=(18, 8)) # 横幅を少し広げる
+    # 6b. PCAクラスタリング結果 (最終状態)
+    plt.figure(figsize=(18, 8))
     plt.subplot(1, 2, 1)
     scatter_true = sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=[target_names_map[l] for l in y_true_labels], palette='viridis', s=20, alpha=0.7)
     plt.title('真の気圧配置パターン (PCA 2D)', fontsize=16), plt.xlabel('主成分1'), plt.ylabel('主成分2'), scatter_true.legend(title="真のラベル", bbox_to_anchor=(1.02, 1), loc='upper left')
@@ -472,11 +548,11 @@ def main_process_logic():
     else:
         sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], color='gray', s=20, alpha=0.7)
 
-    plt.title(f'ACSクラスタリング結果 (再学習後)\nAcc: {final_accuracy:.3f}, Cls: {final_clusters}', fontsize=16)
+    plt.title(f'ACSクラスタリング結果 (最終Epoch: {epochs_for_refit})\nAcc: {final_accuracy:.3f}, Cls: {final_clusters}', fontsize=16)
     plt.xlabel('主成分1'), plt.ylabel('主成分2')
     plt.tight_layout(rect=[0, 0, 0.9, 1])
-    plt.savefig(output_dir / f"pca_clustering_plot_{timestamp}.png", dpi=300, bbox_inches='tight'), plt.close()
-    print(f"✅ PCAクラスタリング結果を保存しました。")
+    plt.savefig(output_dir / f"pca_clustering_plot_final_{timestamp}.png", dpi=300, bbox_inches='tight'), plt.close()
+    print(f"✅ 最終状態のPCAクラスタリング結果を保存しました。")
     
     # 6c. 学習履歴プロット
     if best_result and best_result['history']:
@@ -487,7 +563,6 @@ def main_process_logic():
         ax.plot(epochs, history_acc, 's-', markersize=4, color='tab:blue', label='Accuracy (Mapped)')
         ax.set_xlabel('エポック数'), ax.set_ylabel('Accuracy (マッピング後)'), ax.set_title('最良モデルの学習推移 (ランダムサーチ時)')
         
-        # ★★★ 改善点: 最高精度を達成したエポックに縦線を追加 ★★★
         best_epoch_num = best_result.get('best_epoch')
         if best_epoch_num:
             best_acc_val = best_result.get('accuracy_mapped')

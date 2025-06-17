@@ -1,5 +1,131 @@
 import numpy as np
+import numba
 
+# ==============================================================================
+# Numbaによる高速化関数群
+# ==============================================================================
+@numba.njit(cache=True)
+def _numba_compute_activation_circular(U_p_row, W_j_row, lambda_j_scalar):
+    """【Numba化】円形の活性化関数 X_jp を計算"""
+    diff_sq_norm = np.sum((U_p_row - W_j_row)**2)
+    denominator = 1.0 + lambda_j_scalar * diff_sq_norm
+    if denominator < 1e-9: return 1.0 / 1e-9
+    return 1.0 / denominator
+
+@numba.njit(cache=True)
+def _numba_compute_activation_elliptical(U_p_row, W_j_row, lambda_ij_vector, lambda_Kj_scalar, N):
+    """【Numba化】楕円形の活性化関数 X_jp を計算"""
+    diff = U_p_row - W_j_row
+    sum_term = np.sum(lambda_ij_vector * (diff**2))
+    
+    if N == 0: prod_term = 0.0
+    elif N == 1: prod_term = diff[0,0]
+    else: prod_term = np.prod(diff)
+        
+    denominator = 1.0 + sum_term + lambda_Kj_scalar * prod_term
+    if np.abs(denominator) < 1e-9:
+        return (1.0 / 1e-9) if denominator >= 0 else -(1.0/1e-9)
+    return 1.0 / denominator
+
+@numba.njit(cache=True)
+def _numba_calculate_all_activations(U_p_row, W, lambdas, M, N, is_circular):
+    """【Numba化】全ての現存クラスタに対する活性化値 X_p を計算"""
+    if M == 0:
+        return np.empty((0,1), dtype=np.float64)
+
+    X_p = np.zeros((M, 1), dtype=np.float64)
+    for j_idx in range(M):
+        if is_circular:
+            X_p[j_idx, 0] = _numba_compute_activation_circular(U_p_row, W[j_idx, :], lambdas[j_idx, 0])
+        else:
+            X_p[j_idx, 0] = _numba_compute_activation_elliptical(U_p_row, W[j_idx, :], lambdas[j_idx, :-1], lambdas[j_idx, -1], N)
+    return X_p
+
+
+@numba.njit(cache=True)
+def _numba_update_parameters(U_p_row, W, lambdas, Z, X_p,
+                             gamma, beta, eta_W, eta_lambda, eta_Z,
+                             lambda_min_val, bounds_W, M, N, is_circular):
+    """【Numba化】コアとなるパラメータ更新処理"""
+    
+    # W, lambdas, Z のコピーを作成して更新する
+    new_W = W.copy()
+    new_lambdas = lambdas.copy()
+    new_Z = Z.copy()
+
+    # ---- 5. パラメータ更新 ----
+    sum_Z_X = np.sum(new_Z * X_p)
+    term_in_bracket_E1_Z = gamma - sum_Z_X
+    term_in_bracket_E1_noZ = gamma - np.sum(X_p)
+
+    # 5.a. 深さパラメータ Z_j の更新
+    # ★ バグ修正済み: Z(Z-1) -> -Z(Z-1) or Z(1-Z)
+    delta_Z = -2 * term_in_bracket_E1_Z * X_p * new_Z * (new_Z - 1)
+    new_Z += eta_Z * delta_Z
+    new_Z = np.clip(new_Z, 0.0, 1.0)
+
+    # 5.b. ラベル W_ij の更新
+    for j_idx in range(M):
+        sum_X_others = np.sum(X_p) - X_p[j_idx, 0]
+        bracket_term_W = new_Z[j_idx, 0] * term_in_bracket_E1_Z - 2 * beta * sum_X_others
+        diff_U_W_j = U_p_row - new_W[j_idx, :]
+        
+        if is_circular:
+            lambda_j_val = new_lambdas[j_idx, 0]
+            effective_lambda_term_W = lambda_j_val * diff_U_W_j
+        else: # elliptical
+            lambda_ij_vec = new_lambdas[j_idx, :-1].flatten()
+            lambda_Kj_s = new_lambdas[j_idx, -1]
+            effective_lambda_term_W = np.zeros_like(diff_U_W_j)
+            for i_target_dim in range(N):
+                term1 = lambda_ij_vec[i_target_dim] * diff_U_W_j[0, i_target_dim] * 2.0
+                prod_others_val = 1.0
+                if N > 1 :
+                    for k_prod_dim in range(N):
+                        if k_prod_dim != i_target_dim:
+                            prod_others_val *= diff_U_W_j[0, k_prod_dim]
+                elif N == 1:
+                    prod_others_val = 1.0
+                term2 = lambda_Kj_s * prod_others_val
+                effective_lambda_term_W[0, i_target_dim] = term1 + term2
+        
+        delta_W_j_row = 4 * bracket_term_W * (X_p[j_idx, 0]**2) * effective_lambda_term_W
+        new_W[j_idx, :] += (eta_W * delta_W_j_row).flatten()
+
+    if bounds_W[0] != -np.inf: # -inf はNoneの代わり
+        new_W = np.clip(new_W, bounds_W[0], bounds_W[1])
+
+    # 5.c. 警戒パラメータ Lambda の更新
+    for j_idx in range(M):
+        sum_X_others = np.sum(X_p) - X_p[j_idx, 0]
+        if is_circular:
+            bracket_term_lambda_circ = term_in_bracket_E1_noZ - beta * sum_X_others
+            diff_sq_norm_j = np.sum((U_p_row - new_W[j_idx, :])**2)
+            grad_E_lambda_j = 2 * bracket_term_lambda_circ * (X_p[j_idx, 0]**2) * diff_sq_norm_j
+            new_lambdas[j_idx, 0] -= eta_lambda * grad_E_lambda_j
+            new_lambdas[j_idx, 0] = np.maximum(new_lambdas[j_idx, 0], lambda_min_val)
+        else: # elliptical
+            bracket_term_lambda_ellipt = term_in_bracket_E1_Z - beta * sum_X_others
+            diff_U_W_j_flat = (U_p_row - new_W[j_idx, :]).flatten()
+            A_terms_dim_lambda = (diff_U_W_j_flat**2)
+            
+            if N == 0: A_term_cross_lambda = 0.0
+            elif N == 1: A_term_cross_lambda = diff_U_W_j_flat[0]
+            else: A_term_cross_lambda = np.prod(diff_U_W_j_flat)
+
+            update_factor_lambda = 2 * bracket_term_lambda_ellipt * (X_p[j_idx, 0]**2)
+            delta_lambda_ij_vec = update_factor_lambda * A_terms_dim_lambda
+            new_lambdas[j_idx, :-1] += eta_lambda * delta_lambda_ij_vec
+            delta_lambda_Kj_scalar = update_factor_lambda * A_term_cross_lambda
+            new_lambdas[j_idx, -1] += eta_lambda * delta_lambda_Kj_scalar
+            new_lambdas[j_idx, :-1] = np.maximum(new_lambdas[j_idx, :-1], lambda_min_val)
+
+    return new_W, new_lambdas, new_Z
+
+
+# ==============================================================================
+# ACS クラス本体
+# ==============================================================================
 class ACS:
     """
     Adaptive Competitive Self-organizing (ACS) モデルの実装。
@@ -213,42 +339,11 @@ class ACS:
         self.M -= 1
         if self.M == 0: # 全てのクラスタが削除された場合
             self.fitted_ = False
-
-    def _compute_activation_circular(self, U_p_row, W_j_row, lambda_j_scalar):
-        """ 円形の活性化関数 X_jp を計算する。論文 式(2) [cite: 54]。 """
-        diff_sq_norm = np.sum((U_p_row - W_j_row)**2) # ユークリッド距離の二乗 [cite: 56]
-        denominator = 1.0 + lambda_j_scalar * diff_sq_norm
-        if denominator < 1e-9: return 1.0 / 1e-9
-        return 1.0 / denominator
-
-    def _compute_activation_elliptical(self, U_p_row, W_j_row, lambda_ij_vector, lambda_Kj_scalar):
-        """ 楕円形の活性化関数 X_jp を計算する。論文 式(6) [cite: 123]。 """
-        diff = U_p_row - W_j_row # (1 x N)
-        # sum_{i=1}^N (lambda_ij * (U_ip - W_ij)^2)
-        sum_term = np.sum(lambda_ij_vector * (diff**2))
-        
-        # product_{i=1}^N (U_ip - W_ij) : 論文式(6)の積の項
-        if self.N == 0: prod_term = 0.0 # N=0は実質ありえない
-        elif self.N == 1: prod_term = diff[0,0]
-        else: prod_term = np.prod(diff)
-            
-        denominator = 1.0 + sum_term + lambda_Kj_scalar * prod_term
-        if np.abs(denominator) < 1e-9:
-            return (1.0 / 1e-9) if denominator >= 0 else -(1.0/1e-9)
-        return 1.0 / denominator
-
+    
     def _calculate_all_activations(self, U_p_row):
-        """ 全ての現存クラスタに対する活性化値 X_p を計算する。 """
-        if self.M == 0:
-            return np.empty((0,1), dtype=float)
-
-        X_p = np.zeros((self.M, 1), dtype=float)
-        for j_idx in range(self.M):
-            if self.activation_type == 'circular':
-                X_p[j_idx, 0] = self._compute_activation_circular(U_p_row, self.W[j_idx, :], self.lambdas[j_idx, 0])
-            else: # elliptical
-                X_p[j_idx, 0] = self._compute_activation_elliptical(U_p_row, self.W[j_idx, :], self.lambdas[j_idx, :-1], self.lambdas[j_idx, -1])
-        return X_p
+        """ 全ての現存クラスタに対する活性化値 X_p を計算する (Numba高速化版)。 """
+        is_circular = self.activation_type == 'circular'
+        return _numba_calculate_all_activations(U_p_row, self.W, self.lambdas, self.M, self.N, is_circular)
 
     def partial_fit(self, U_p):
         """
@@ -291,109 +386,18 @@ class ACS:
              # このステップで新しいクラスタが追加された場合、そのクラスタを今回の勝者とする
             winner_cluster_index = self.M - 1 # 新しく追加されたクラスタは最後尾
 
+        # ---- 5. パラメータ更新 (Numbaによる高速化) ----
+        is_circular = self.activation_type == 'circular'
+        # Numbaに関数外のNoneを渡せないので、タプルまたはダミー値で渡す
+        bounds_W_numba = self.bounds_W if self.bounds_W is not None else (-np.inf, np.inf)
 
-        # ---- 5. パラメータ更新 ----
-        # エネルギー関数 E (式(9) [cite: 133]) の関連項
-        sum_Z_X = np.sum(self.Z * X_p)
-        # term_in_bracket_E1_Z: (gamma - sum_q Z_q X_q), 式(10),(11),(7)の主要項 [cite: 136, 126]
-        term_in_bracket_E1_Z = self.gamma - sum_Z_X
-        # term_in_bracket_E1_noZ: (gamma - sum_q X_q), 式(5)の主要項 [cite: 114]
-        term_in_bracket_E1_noZ = self.gamma - np.sum(X_p)
-
-        # 5.a. 深さパラメータ Z_j の更新
-        # 論文 式(10): dZ_j/dt = 2 * (gamma - sum_q Z_qp X_qp) * X_jp * Z_j * (Z_j - 1) [cite: 136]
-        # この式は Z_j=0 (敗者) または Z_j=1 (勝者) に収束させる効果がある。
-        delta_Z = 2 * term_in_bracket_E1_Z * X_p * self.Z * (self.Z - 1)
-        self.Z += self.eta_Z * delta_Z
-        self.Z = np.clip(self.Z, 0.0, 1.0) # Z_j in [0,1] の制約 [cite: 133]
-
-        # 5.b. ラベル W_ij の更新
-        # 論文 式(11)ベース: dW_ij/dt = 4 * bracket_W * X_jp^2 * effective_lambda_term [cite: 136]
-        # bracket_W = [Z_j(gamma - sum_q Z_q X_q) - 2*beta*sum_{k!=j}X_k]
-        # effective_lambda_term は円形なら (U_ip - W_ij) * lambda_j
-        for j_idx in range(self.M):
-            sum_X_others = np.sum(X_p) - X_p[j_idx, 0] # 競合項 sum_{k!=j}X_kp
-            bracket_term_W = self.Z[j_idx, 0] * term_in_bracket_E1_Z - 2 * self.beta * sum_X_others
-            
-            diff_U_W_j = U_p_row - self.W[j_idx, :] # (U_p - W_j), (1 x N)
-
-            if self.activation_type == 'circular':
-                lambda_j_val = self.lambdas[j_idx, 0] # スカラー lambda_j from 式(11)
-                effective_lambda_term_W = lambda_j_val * diff_U_W_j # (1 x N)
-            else: # elliptical
-                # 楕円形の場合のW更新: 式(11)の構造とdX_jp/dW_kから類推
-                # dW_k/dt ∝ X_jp^2 * [ lambda_kj*2(U_k-W_k) + lambda_Kj*prod_{l!=k}(U_l-W_l) ]
-                lambda_ij_vec = self.lambdas[j_idx, :-1].flatten() # (N,)
-                lambda_Kj_s = self.lambdas[j_idx, -1]    # scalar
-                
-                effective_lambda_term_W = np.zeros_like(diff_U_W_j) # (1 x N)
-                for i_target_dim in range(self.N):
-                    # term1: lambda_kj * 2 * (U_k - W_k)
-                    term1 = lambda_ij_vec[i_target_dim] * diff_U_W_j[0, i_target_dim] * 2.0
-                    
-                    # term2: lambda_Kj * product_{l!=k}(U_l - W_l)
-                    prod_others_val = 1.0
-                    if self.N > 1 :
-                        for k_prod_dim in range(self.N):
-                            if k_prod_dim != i_target_dim:
-                                prod_others_val *= diff_U_W_j[0, k_prod_dim]
-                    elif self.N == 1: # N=1の場合、他の項の積は1と解釈 (またはlambda_Kj項は別の形になる)
-                        prod_others_val = 1.0 # ここでは便宜上1とするが、厳密にはN=1の時の式(6)の微分を考えるべき
-                    
-                    term2 = lambda_Kj_s * prod_others_val
-                    effective_lambda_term_W[0, i_target_dim] = term1 + term2
-            
-            # 式(11)の係数4を乗じる (ただし、effective_lambda_term_Wがベクトルなのでスカラーlambda_jの場合と等価かは議論の余地)
-            delta_W_j_row = 4 * bracket_term_W * (X_p[j_idx, 0]**2) * effective_lambda_term_W
-            self.W[j_idx, :] += (self.eta_W * delta_W_j_row).flatten()
-
-        if self.bounds_W is not None: # W_ij の値域制限 [cite: 73, 74]
-            self.W = np.clip(self.W, self.bounds_W[0], self.bounds_W[1])
-
-        # 5.c. 警戒パラメータ Lambda の更新
-        for j_idx in range(self.M):
-            sum_X_others = np.sum(X_p) - X_p[j_idx, 0] # 競合項
-            
-            if self.activation_type == 'circular':
-                # 論文 式(5): dE/d(lambda_j) = 2 * bracket_lambda * X_jp^2 * ||U-W||^2 [cite: 114]
-                # bracket_lambda = [(gamma - sum_q X_q) - beta*sum_{k!=j}X_k]
-                # d(lambda)/dt = -eta * dE/d(lambda) (勾配降下)
-                bracket_term_lambda_circ = term_in_bracket_E1_noZ - self.beta * sum_X_others
-                diff_sq_norm_j = np.sum((U_p_row - self.W[j_idx, :])**2) # ||U_p - W_j||^2
-                
-                grad_E_lambda_j = 2 * bracket_term_lambda_circ * (X_p[j_idx, 0]**2) * diff_sq_norm_j
-                self.lambdas[j_idx, 0] -= self.eta_lambda * grad_E_lambda_j
-                self.lambdas[j_idx, 0] = np.maximum(self.lambdas[j_idx, 0], self.lambda_min_val) # lambda_j > 0
-            else: # elliptical
-                # 論文 式(7): d(lambda_ij)/dt = 2 * bracket_lambda * X_jp^2 * A(i) [cite: 126]
-                # bracket_lambda = [(gamma - sum_q Z_q X_q) - beta*sum_{k!=j}X_k]
-                # この式は d(lambda)/dt を直接与えているので、符号は論文の式に従う（加算）。
-                bracket_term_lambda_ellipt = term_in_bracket_E1_Z - self.beta * sum_X_others
-                
-                diff_U_W_j_flat = (U_p_row - self.W[j_idx, :]).flatten() # (N,)
-                
-                # A(i) for lambda_ij (i=1..N) and A(N+1) for lambda_Kj. 論文 式(8) [cite: 126]
-                A_terms_dim_lambda = (diff_U_W_j_flat**2) # (U_ip - W_ij)^2, (N,)
-                
-                if self.N == 0: A_term_cross_lambda = 0.0
-                elif self.N == 1: A_term_cross_lambda = diff_U_W_j_flat[0] # product_{k=1}^N (U_kp - W_kj)
-                else: A_term_cross_lambda = np.prod(diff_U_W_j_flat)
-
-                # 式(7)の共通係数: 2 * bracket_term * X_jp^2
-                update_factor_lambda = 2 * bracket_term_lambda_ellipt * (X_p[j_idx, 0]**2)
-                
-                # lambda_ij (次元ごとの警戒パラメータ) の更新
-                delta_lambda_ij_vec = update_factor_lambda * A_terms_dim_lambda # (N,)
-                self.lambdas[j_idx, :-1] += self.eta_lambda * delta_lambda_ij_vec
-                
-                # lambda_Kj (クロスタームの警戒パラメータ) の更新
-                delta_lambda_Kj_scalar = update_factor_lambda * A_term_cross_lambda # scalar
-                self.lambdas[j_idx, -1] += self.eta_lambda * delta_lambda_Kj_scalar
-
-                # lambda_ij > 0 の制約 [cite: 125] (論文外の明示的クリッピング)
-                self.lambdas[j_idx, :-1] = np.maximum(self.lambdas[j_idx, :-1], self.lambda_min_val)
-                # Note: 楕円条件 (e.g., (lambda_3j)^2 - 4(lambda_1j)(lambda_2j) < 0 for 2D) は陽に扱っていない [cite: 125]
-
+        new_W, new_lambdas, new_Z = _numba_update_parameters(
+            U_p_row, self.W, self.lambdas, self.Z, X_p,
+            self.gamma, self.beta, self.eta_W, self.eta_lambda, self.eta_Z,
+            self.lambda_min_val, bounds_W_numba, self.M, self.N, is_circular
+        )
+        self.W, self.lambdas, self.Z = new_W, new_lambdas, new_Z
+        
         # ---- 6. 非活性ステップの更新と不要クラスタ削除 (Death) ----
         # 論文の「寄生的アトラクタの誘引域が弱まり最終的に消滅する」概念に基づく [cite: 132]。
         if self.M > 0 : # クラスタが存在する場合のみ
