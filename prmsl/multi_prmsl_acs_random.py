@@ -69,10 +69,10 @@ class Logger:
 # ==============================================================================
 def run_acs_trial(param_values_tuple_with_trial_info,
                   fixed_params_dict,
-                  pca_data_dict, # ★★★ 変更: X_data -> pca_data_dict
+                  pca_data_dict,
                   y_data,
-                  sin_time_data, # ★★★ 追加
-                  cos_time_data, # ★★★ 追加
+                  sin_time_data,
+                  cos_time_data,
                   n_true_cls_worker,
                   trial_log_dir_path,
                   label_class_names):
@@ -87,7 +87,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
             sys.stdout = log_file
             sys.stderr = log_file
             
-            # --- ★★★ ワーカー内部で特徴量を動的に構築 ★★★ ---
+            # --- ワーカー内部で特徴量を動的に構築 ---
             pca_n_components = params_combo.pop('pca_n_components')
             include_time_features = params_combo.pop('include_time_features')
             
@@ -101,7 +101,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
             scaler = MinMaxScaler()
             X_scaled_data = scaler.fit_transform(X_features)
             n_features_worker = X_scaled_data.shape[1]
-            # --- ★★★ 特徴量構築ここまで ★★★ ---
+            # --- 特徴量構築ここまで ---
 
             num_epochs_worker = params_combo.pop('num_epochs')
             activation_type_worker = params_combo.pop('activation_type')
@@ -114,7 +114,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
 
             current_run_params = {
                 **fixed_params_dict,
-                'n_features': n_features_worker, # 動的に決定した特徴量を設定
+                'n_features': n_features_worker,
                 'activation_type': activation_type_worker,
                 **params_combo,
                 'random_state': trial_specific_seed
@@ -136,7 +136,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
                     'num_epochs': num_epochs_worker,
                     'activation_type': activation_type_worker
                 },
-                'ari': -1.0, 'accuracy_mapped': -1.0, 'final_clusters': -1,
+                'ari': -1.0, 'accuracy_mapped': -1.0, 'final_clusters': -1, 'best_epoch': 0,
                 'history': [], 'error_traceback': None, 'duration_seconds': 0,
                 'acs_random_state_used': trial_specific_seed,
                 'trial_count_from_worker': trial_count
@@ -158,13 +158,20 @@ def run_acs_trial(param_values_tuple_with_trial_info,
                         row_ind, col_ind = linear_sum_assignment(-contingency.values)
                         epoch_acc = contingency.values[row_ind, col_ind].sum() / n_samples_worker
                     result['history'].append({'epoch': epoch + 1, 'clusters': current_clusters, 'ari': epoch_ari, 'accuracy_mapped': epoch_acc})
-                    print(f"[Worker {trial_count}] Epoch {epoch+1}/{num_epochs_worker} - Cls: {current_clusters}, ARI: {epoch_ari:.4f}, Acc: {epoch_acc:.4f}")
+                    if (epoch + 1) % 100 == 0: # 100エポックごとにログ出力
+                        print(f"[Worker {trial_count}] Epoch {epoch+1}/{num_epochs_worker} - Cls: {current_clusters}, ARI: {epoch_ari:.4f}, Acc: {epoch_acc:.4f}")
 
-                final_history = result['history'][-1]
-                result['ari'], result['accuracy_mapped'], result['final_clusters'] = final_history['ari'], final_history['accuracy_mapped'], final_history['clusters']
+                # ★★★ 改善点: 学習履歴全体から最高の性能を示したエポックの結果を、この試行の最終結果とする ★★★
+                if result['history']:
+                    best_epoch_history = max(result['history'], key=lambda x: x['accuracy_mapped'])
+                    result['ari'] = best_epoch_history['ari']
+                    result['accuracy_mapped'] = best_epoch_history['accuracy_mapped']
+                    result['final_clusters'] = best_epoch_history['clusters']
+                    result['best_epoch'] = best_epoch_history['epoch']
                 
-                if result['final_clusters'] > 0:
-                    print("\n--- ラベル別 最終精度 (Recall) ---")
+                # 参考情報として、最終エポック時点でのRecallもログに残す
+                if acs_model_trial.M > 0:
+                    print("\n--- ラベル別 最終精度 (Recall at final epoch) ---")
                     preds = acs_model_trial.predict(X_scaled_data)
                     contingency = pd.crosstab(preds, y_data)
                     row_ind, col_ind = linear_sum_assignment(-contingency.values)
@@ -182,7 +189,7 @@ def run_acs_trial(param_values_tuple_with_trial_info,
 
             trial_end_time = datetime.datetime.now()
             result['duration_seconds'] = (trial_end_time - trial_start_time).total_seconds()
-            print(f"\n--- [Worker] トライアル {trial_count} 終了 | Acc: {result['accuracy_mapped']:.4f}, ARI: {result['ari']:.4f}, Cls: {result['final_clusters']}, Time: {result['duration_seconds']:.2f}s ---")
+            print(f"\n--- [Worker] トライアル {trial_count} 終了 | Best Acc: {result['accuracy_mapped']:.4f} at Epoch {result['best_epoch']}, Time: {result['duration_seconds']:.2f}s ---")
             
             sys.stdout = original_stdout
             sys.stderr = original_stderr
@@ -198,7 +205,8 @@ def sample_random_params(param_dist):
         if isinstance(value, list):
             params[key] = random.choice(value)
         elif isinstance(value, tuple) and len(value) == 2:
-            params[key] = round(np.random.uniform(value[0], value[1]), 2)
+            # 浮動小数点数の場合、有効数字4桁に丸める
+            params[key] = round(np.random.uniform(value[0], value[1]), 4)
     return params
 
 # ==============================================================================
@@ -246,8 +254,8 @@ def main_process_logic():
     sin_time = ds_filtered['sin_time'].values.reshape(-1, 1)
     cos_time = ds_filtered['cos_time'].values.reshape(-1, 1)
 
-    # --- ★★★ 効率化のため、複数パターンのPCAを事前計算 ★★★ ---
-    print("\n--- 最初に3パターンのPCAデータを事前計算します... ---")
+    # --- 複数パターンのPCAを事前計算 ---
+    print("\n--- 最初に複数パターンのPCAデータを事前計算します... ---")
     pca_dims_to_test = [15, 20, 25]
     precalculated_pca_data = {}
     for n_dim in pca_dims_to_test:
@@ -260,8 +268,8 @@ def main_process_logic():
     # --- 2. ランダムサーチの設定 ---
     print("\n--- 2. ランダムサーチ設定 ---")
     param_dist = {
-        'pca_n_components': pca_dims_to_test, # ★★★ 追加 ★★★
-        'include_time_features': [True, False], # ★★★ 追加 ★★★
+        'pca_n_components': pca_dims_to_test,
+        'include_time_features': [True, False],
         'gamma': (0.01, 3.0),
         'beta': (0.001, 1.0),
         'learning_rate_W': (0.001, 0.1),
@@ -274,18 +282,17 @@ def main_process_logic():
         'initial_Z_new_cluster': (0.01, 1.0),
         'theta_new': (0.001, 1.0),
         'Z_death_threshold': (0.01, 0.1),
-        'death_patience_steps': [n_samples // 10, n_samples // 4, n_samples // 2, n_samples, n_samples * 2],
+        'death_patience_steps': [n_samples // 10, n_samples // 4, n_samples // 2, n_samples],
         'num_epochs': [1000],
         'activation_type': ['circular', 'elliptical']
     }
     
-    N_TRIALS = 1000
-    ACCURACY_GOAL = 0.8
+    N_TRIALS = 100
+    ACCURACY_GOAL = 0.7
 
     fixed_params_for_acs = {
         'max_clusters': 30, 'initial_clusters': 1,
         'lambda_min_val': 1e-7, 'bounds_W': (0, 1)
-        # n_featuresはワーカー内で動的に決まるため削除
     }
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
     print(f"早期終了の目標精度 (Accuracy): {ACCURACY_GOAL}")
@@ -321,8 +328,10 @@ def main_process_logic():
         for result in tqdm(pool.imap_unordered(worker_func_with_fixed_args, tasks_for_pool), total=N_TRIALS, desc="Random Search Progress"):
             all_trial_results_list.append(result)
             if not result['error_traceback']:
+                # 各試行の「最高精度」を比較して best_result を更新
                 if best_result is None or result['accuracy_mapped'] > best_result['accuracy_mapped']:
                     best_result = result
+            # 各試行の「最高精度」が目標を達成したら早期終了
             if result['accuracy_mapped'] >= ACCURACY_GOAL:
                 print(f"\n✅ 目標精度達成 (Acc >= {ACCURACY_GOAL})！ トライアル {result['trial_count_from_worker']} でサーチを打ち切ります。")
                 goal_achieved = True
@@ -333,7 +342,6 @@ def main_process_logic():
     print(f"\nランダムサーチ完了。総所要時間: {end_search_time - start_search_time}")
 
     # --- 4. 結果の集計と最良モデルの選定 ---
-    # (省略... 変更なし)
     print("\n--- 4. 結果集計 ---")
     if not all_trial_results_list:
         print("エラー: サーチから結果が返されませんでした。")
@@ -343,7 +351,9 @@ def main_process_logic():
         df_data = []
         for res in all_trial_results_list:
             row = res['params_combo'].copy()
+            # ★★★ 改善点: CSVにも最高精度時のエポック数を保存 ★★★
             row.update({'ari': res['ari'], 'accuracy_mapped': res['accuracy_mapped'], 'final_clusters': res['final_clusters'],
+                        'best_epoch': res['best_epoch'],
                         'duration_seconds': res['duration_seconds'], 'error_present': bool(res['error_traceback'])})
             df_data.append(row)
         
@@ -356,19 +366,18 @@ def main_process_logic():
         print("エラー: 全ての試行でエラーが発生、または有効な結果が得られませんでした。")
         sys.exit(1)
         
+    # ★★★ 改善点: 結果表示に最高精度を達成したエポック数を追加 ★★★
     print(f"\n--- 最良パラメータ ({'目標達成' if goal_achieved else '探索終了時点'}) ---")
     best_params_combo_dict = best_result['params_combo']
-    print(f"Accuracy (Mapped): {best_result['accuracy_mapped']:.4f}")
-    print(f"ARI: {best_result['ari']:.4f}")
-    print(f"最終クラスタ数: {best_result['final_clusters']}")
+    print(f"最高精度 (Mapped): {best_result['accuracy_mapped']:.4f} (at Epoch {best_result['best_epoch']})")
+    print(f"最高精度時のARI: {best_result['ari']:.4f}")
+    print(f"最高精度時のクラスタ数: {best_result['final_clusters']}")
     print("パラメータ:")
     for key, val in best_params_combo_dict.items():
         print(f"  {key}: {val:.4f}" if isinstance(val, float) else f"  {key}: {val}")
 
     # --- 5. 最良モデルでの再学習と最終評価 ---
-    # (省略... 変更なし、ただし特徴量構築は再実行が必要)
     print("\n--- 5. 最良モデルでの再学習と最終評価 ---")
-    # 最良モデルのパラメータに基づいて特徴量を再構築
     best_params_copy = best_result['params_combo'].copy()
     best_pca_n = best_params_copy.pop('pca_n_components')
     best_include_time = best_params_copy.pop('include_time_features')
@@ -384,7 +393,11 @@ def main_process_logic():
     X_scaled_data_best = final_scaler.fit_transform(X_features_best)
 
     params_for_init = best_params_copy
-    epochs_for_refit = params_for_init.pop('num_epochs')
+    # ★★★ 改善点: 最高精度を記録したエポック数で再学習する ★★★
+    epochs_for_refit = best_result['best_epoch']
+    params_for_init.pop('num_epochs') # 元のnum_epochsは使わないので削除
+    print(f"最高精度を記録した {epochs_for_refit} エポックで再学習します。")
+
     best_model_full_params_for_refit = {
         **fixed_params_for_acs, 
         **params_for_init, 
@@ -393,6 +406,7 @@ def main_process_logic():
     }
     
     best_model_instance = ACS(**best_model_full_params_for_refit)
+    # 指定されたエポック数で再学習
     best_model_instance.fit(X_scaled_data_best, epochs=epochs_for_refit)
     print("✅ 最良モデルの再学習が完了しました。")
 
@@ -412,9 +426,7 @@ def main_process_logic():
 
 
     # --- 6. 結果の可視化と保存 ---
-    # (省略... 変更なし、ただしPCAの可視化は再学習時のデータで行う)
     print("\n--- 6. 結果の可視化 ---")
-    # 可視化のための2D PCA (これは常に2次元で実行)
     pca_visual = PCA(n_components=2, random_state=GLOBAL_SEED)
     X_pca_visual = pca_visual.fit_transform(X_scaled_data_best)
 
@@ -428,7 +440,7 @@ def main_process_logic():
         cm = confusion_matrix(y_true_labels, mapped_pred_labels, labels=np.arange(n_true_clusters))
         plt.figure(figsize=(12, 10))
         sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_, annot_kws={"size": 10})
-        plt.title(f"混同行列 (ACS - Random Search)\nAccuracy: {final_accuracy:.4f}, ARI: {final_ari:.4f}", fontsize=14)
+        plt.title(f"混同行列 (ACS - 再学習後)\nAccuracy: {final_accuracy:.4f}, ARI: {final_ari:.4f}", fontsize=14)
         plt.xlabel("予測ラベル (マッピング後)"), plt.ylabel("真のラベル")
         plt.savefig(output_dir / f"confusion_matrix_{timestamp}.png", dpi=300, bbox_inches='tight'), plt.close()
         print(f"✅ 混同行列を保存しました。")
@@ -436,27 +448,33 @@ def main_process_logic():
         print("クラスタが形成されなかったため、混同行列はスキップします。")
 
     # 6b. PCAクラスタリング結果
-    plt.figure(figsize=(16, 7))
+    plt.figure(figsize=(18, 8)) # 横幅を少し広げる
     plt.subplot(1, 2, 1)
-    scatter_true = sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=[target_names_map[l] for l in y_true_labels], palette='viridis', s=50, alpha=0.7)
-    plt.title('真の気圧配置パターン (PCA 2D)'), plt.xlabel('主成分1'), plt.ylabel('主成分2'), scatter_true.legend(title="真のラベル", bbox_to_anchor=(1.05, 1), loc='upper left')
+    scatter_true = sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=[target_names_map[l] for l in y_true_labels], palette='viridis', s=20, alpha=0.7)
+    plt.title('真の気圧配置パターン (PCA 2D)', fontsize=16), plt.xlabel('主成分1'), plt.ylabel('主成分2'), scatter_true.legend(title="真のラベル", bbox_to_anchor=(1.02, 1), loc='upper left')
     
     plt.subplot(1, 2, 2)
     if final_clusters > 0:
         mapped_hue = [target_names_map.get(l, 'Unmapped') for l in mapped_pred_labels]
         hue_order = [target_names_map[i] for i in sorted(target_names_map.keys())] + ['Unmapped']
-        scatter_pred = sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=mapped_hue, hue_order=hue_order, palette='viridis', s=50, alpha=0.7)
-        scatter_pred.legend(title="予測ラベル", bbox_to_anchor=(1.05, 1), loc='upper left')
+        scatter_pred = sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], hue=mapped_hue, hue_order=hue_order, palette='viridis', s=20, alpha=0.7)
         
         cluster_centers = best_model_instance.get_cluster_centers()
         if cluster_centers.shape[0] > 0:
-            cluster_centers_2d = pca_visual.transform(final_scaler.inverse_transform(cluster_centers))
-            plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1], c='red', marker='X', s=200, edgecolor='white', label='クラスタ中心(W)')
+            cluster_centers_2d = pca_visual.transform(cluster_centers)
+            plt.scatter(cluster_centers_2d[:, 0], cluster_centers_2d[:, 1], c='red', marker='X', s=250, edgecolor='black', linewidth=1.5, label='クラスタ中心 (W)', zorder=10)
+        
+        handles, labels = scatter_pred.get_legend_handles_labels()
+        center_handle = plt.Line2D([0], [0], marker='X', color='w', label='クラスタ中心 (W)', markerfacecolor='red', markeredgecolor='black', markersize=12)
+        handles.insert(0, center_handle)
+        labels.insert(0, 'クラスタ中心 (W)')
+        scatter_pred.legend(handles=handles, labels=labels, title="予測ラベル", bbox_to_anchor=(1.02, 1), loc='upper left')
     else:
-        sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], color='gray', s=50, alpha=0.7)
+        sns.scatterplot(x=X_pca_visual[:, 0], y=X_pca_visual[:, 1], color='gray', s=20, alpha=0.7)
 
-    plt.title(f'ACSクラスタリング結果 (PCA 2D)\nAcc: {final_accuracy:.3f}, Cls: {final_clusters}', fontsize=14)
-    plt.xlabel('主成分1'), plt.ylabel('主成分2'), plt.tight_layout()
+    plt.title(f'ACSクラスタリング結果 (再学習後)\nAcc: {final_accuracy:.3f}, Cls: {final_clusters}', fontsize=16)
+    plt.xlabel('主成分1'), plt.ylabel('主成分2')
+    plt.tight_layout(rect=[0, 0, 0.9, 1])
     plt.savefig(output_dir / f"pca_clustering_plot_{timestamp}.png", dpi=300, bbox_inches='tight'), plt.close()
     print(f"✅ PCAクラスタリング結果を保存しました。")
     
@@ -466,9 +484,19 @@ def main_process_logic():
         epochs = [h['epoch'] for h in history]
         history_acc = [h['accuracy_mapped'] for h in history]
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(epochs, history_acc, 's-', color='tab:blue', label='Accuracy (Mapped)')
+        ax.plot(epochs, history_acc, 's-', markersize=4, color='tab:blue', label='Accuracy (Mapped)')
         ax.set_xlabel('エポック数'), ax.set_ylabel('Accuracy (マッピング後)'), ax.set_title('最良モデルの学習推移 (ランダムサーチ時)')
-        ax.grid(True, linestyle='--'), ax.legend(), fig.tight_layout()
+        
+        # ★★★ 改善点: 最高精度を達成したエポックに縦線を追加 ★★★
+        best_epoch_num = best_result.get('best_epoch')
+        if best_epoch_num:
+            best_acc_val = best_result.get('accuracy_mapped')
+            ax.axvline(x=best_epoch_num, color='red', linestyle='--', 
+                       label=f'Best Epoch ({best_epoch_num}): Acc={best_acc_val:.3f}')
+        
+        ax.grid(True, linestyle='--')
+        ax.legend()
+        fig.tight_layout()
         plt.savefig(output_dir / f"best_model_history_{timestamp}.png", dpi=300, bbox_inches='tight'), plt.close()
         print(f"✅ 最良モデルの学習推移グラフを保存しました。")
 

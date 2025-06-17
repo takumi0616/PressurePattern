@@ -48,3 +48,7 @@ nc/era5_msl/
 *.nc
 
 *.txt
+
+*.png
+
+*.csv
