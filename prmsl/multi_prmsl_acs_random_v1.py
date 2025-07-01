@@ -39,7 +39,7 @@ except ImportError as e:
 # ==============================================================================
 # グローバル設定
 # ==============================================================================
-GLOBAL_SEED = 42
+GLOBAL_SEED = 17
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
 
@@ -481,7 +481,7 @@ def main_process_logic():
         'num_epochs': [1000], 'activation_type': ['circular', 'elliptical']
     }
     
-    N_TRIALS = 10
+    N_TRIALS = 500
     BACC_GOAL = 0.7 # ★目標をバランス化正解率に変更
 
     fixed_params_for_acs = {
