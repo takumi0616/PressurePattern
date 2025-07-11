@@ -189,5 +189,5 @@ result_test_acs_[circular/elliptical]_random_YYYYMMDD_HHMMSS/
 ```
 
 ```bash
-nohup python multi_prmsl_acs_random_v2.py > output.log 2>&1 &
+nohup python multi_prmsl_acs_random_v3.py > output.log 2>&1 &
 ```

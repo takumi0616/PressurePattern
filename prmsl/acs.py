@@ -227,6 +227,12 @@ class ACS:
         self.inactive_steps = np.empty((0,1), dtype=int) # (M x 1)
         self.M = 0          # 現在のクラスタ数
 
+        # --- ログ機能のための追加 ---
+        self.cluster_id_counter = 0  # クラスタにユニークなIDを付与するカウンター
+        self.cluster_ids = np.empty((0,1), dtype=int)  # 各クラスタのユニークIDを管理
+        self.event_log = []  # (type, epoch, data_idx, cluster_id, details)
+        # --- ここまで ---
+
         self.fitted_ = False # モデルが有効なクラスタを持っているか
         self._first_data_processed_for_N = False # Nを決定するために最初のデータが処理されたか
 
@@ -247,6 +253,9 @@ class ACS:
             self.lambdas = np.empty((0, self.N + 1), dtype=float)
         self.Z = np.empty((0,1), dtype=float)
         self.inactive_steps = np.empty((0,1), dtype=int)
+        # --- ログ機能のための追加 ---
+        self.cluster_ids = np.empty((0, 1), dtype=int)
+        # --- ここまで ---
         self.M = 0
         self._first_data_processed_for_N = True
 
@@ -288,12 +297,28 @@ class ACS:
         # Z_j の初期化: Z_j in [0,1] [cite: 133]。
         self.Z = np.full((num_to_initialize, 1), self.initial_Z_val, dtype=float)
         self.inactive_steps = np.zeros((num_to_initialize, 1), dtype=int)
+
+        # --- ログ機能のための追加 ---
+        initial_ids = np.arange(self.cluster_id_counter, self.cluster_id_counter + num_to_initialize).reshape(-1, 1)
+        self.cluster_ids = initial_ids.copy()
+        self.cluster_id_counter += num_to_initialize
+        for i in range(num_to_initialize):
+            self.event_log.append({
+                'event_type': 'INITIAL_BIRTH',
+                'epoch': 0, # 初期生成はエポック0とする
+                'data_idx': -1, # 特定のデータではない
+                'unique_cluster_id': self.cluster_ids[i, 0],
+                'internal_index_at_event': i,
+                'details': f'Initialized with {num_to_initialize} clusters.'
+            })
+        # --- ここまで ---
+
         self.M = num_to_initialize
         
         if self.M > 0:
             self.fitted_ = True # クラスタが初期化されたことを示す
 
-    def _add_new_cluster(self, U_p_row):
+    def _add_new_cluster(self, U_p_row, epoch=None, data_idx=None):
         """
         新しいクラスタを入力パターン U_p_row で初期化し、パラメータ配列に追加する。
         論文の「新しい入力パターンが既存のどのクラスタとも十分に類似していない場合、新しいクラスタが生成される」 [cite: 192] 概念に基づく。
@@ -318,19 +343,47 @@ class ACS:
         
         new_inactive_steps_row = np.zeros((1,1), dtype=int) # 新規クラスタは非活性0からスタート
         self.inactive_steps = np.vstack((self.inactive_steps, new_inactive_steps_row))
+
+        # --- ログ機能のための追加 ---
+        new_unique_id = self.cluster_id_counter
+        self.cluster_ids = np.vstack((self.cluster_ids, np.array([[new_unique_id]])))
+        self.event_log.append({
+            'event_type': 'BIRTH',
+            'epoch': epoch,
+            'data_idx': data_idx,
+            'unique_cluster_id': new_unique_id,
+            'internal_index_at_event': self.M, # 追加前のMが新しいインデックス
+            'details': f'Created by data_idx {data_idx} at epoch {epoch}.'
+        })
+        self.cluster_id_counter += 1
+        # --- ここまで ---
         
         self.M += 1
         if not self.fitted_ and self.M > 0 : # 最初のクラスタが生成された場合
             self.fitted_ = True
         return True
 
-    def _delete_cluster(self, cluster_index_to_delete):
+    def _delete_cluster(self, cluster_index_to_delete, epoch=None, data_idx=None):
         """
         指定されたインデックスのクラスタを削除する。
         論文の「寄生的アトラクタの誘引域が弱まり最終的に消滅する」("basins of attraction for parasitic attractors becomes weaker and eventually disappears") [cite: 132] 概念に基づく。
         """
         if not (0 <= cluster_index_to_delete < self.M):
             return
+        
+        # --- ログ機能のための追加 ---
+        deleted_unique_id = self.cluster_ids[cluster_index_to_delete, 0]
+        deleted_w_vector = self.W[cluster_index_to_delete, :].copy()
+        self.event_log.append({
+            'event_type': 'DEATH',
+            'epoch': epoch,
+            'data_idx': data_idx,
+            'unique_cluster_id': deleted_unique_id,
+            'internal_index_at_event': cluster_index_to_delete,
+            'details': f'Deleted during processing data_idx {data_idx}. Center was at {np.round(deleted_w_vector, 3)}'
+        })
+        self.cluster_ids = np.delete(self.cluster_ids, cluster_index_to_delete, axis=0)
+        # --- ここまで ---
 
         self.W = np.delete(self.W, cluster_index_to_delete, axis=0)
         self.lambdas = np.delete(self.lambdas, cluster_index_to_delete, axis=0)
@@ -345,7 +398,7 @@ class ACS:
         is_circular = self.activation_type == 'circular'
         return _numba_calculate_all_activations(U_p_row, self.W, self.lambdas, self.M, self.N, is_circular)
 
-    def partial_fit(self, U_p):
+    def partial_fit(self, U_p, epoch=None, data_idx=None):
         """
         単一の入力パターン U_p でモデルをオンライン学習する。
         クラスタの動的生成・削除機能を含む。
@@ -358,7 +411,7 @@ class ACS:
 
         # ---- 1. 最初のクラスタ生成 (もしクラスタが存在しない場合) ----
         if self.M == 0:
-            if not self._add_new_cluster(U_p_row): # 最初のクラスタを現在の入力で生成
+            if not self._add_new_cluster(U_p_row, epoch, data_idx): # 最初のクラスタを現在の入力で生成
                 return # 生成失敗 (max_clusters=0など) の場合は学習スキップ
 
         # ---- 2. 全クラスタの活性化値計算 ----
@@ -373,7 +426,7 @@ class ACS:
         # 論文 "if the new input pattern does not resemble any formed clusters, then a new cluster will be generated" [cite: 192]
         new_cluster_added_this_step = False
         if max_activation_before_birth < self.theta_new and self.M < self.max_clusters:
-            if self._add_new_cluster(U_p_row): # 新規クラスタを現在の入力で生成
+            if self._add_new_cluster(U_p_row, epoch, data_idx): # 新規クラスタを現在の入力で生成
                 new_cluster_added_this_step = True
                 X_p = self._calculate_all_activations(U_p_row) # 活性化値を再計算
 
@@ -415,7 +468,7 @@ class ACS:
                 
                 # 見つかったインデックスを降順にソートして削除 (ループ中のインデックスのずれを防ぐため)
                 for j_idx_del in sorted(indices_to_delete, reverse=True):
-                    self._delete_cluster(j_idx_del)
+                    self._delete_cluster(j_idx_del, epoch=epoch, data_idx=data_idx)
 
     def fit(self, X_train, epochs=1):
         """
@@ -439,8 +492,9 @@ class ACS:
             X_shuffled = X_train[indices]
 
             for i in range(n_samples):
+                original_data_idx = indices[i]
                 U_p = X_shuffled[i, :]
-                self.partial_fit(U_p)
+                self.partial_fit(U_p, epoch=(epoch + 1), data_idx=int(original_data_idx))
         
         # fit後、有効なクラスタが存在すれば fitted_ = True とする
         if self.M > 0:
