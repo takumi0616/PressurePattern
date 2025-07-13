@@ -600,7 +600,7 @@ def main_process_logic():
         'num_epochs': [1000], 
         'activation_type': ['elliptical'] # ['circular', 'elliptical']
     }
-    N_TRIALS = 20
+    N_TRIALS = 10000
     fixed_params_for_acs = {'max_clusters': 50, 'initial_clusters': 1, 'lambda_min_val': 1e-7, 'bounds_W': (0, 1)}
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
     print("\n--- 3. 並列ランダムサーチ実行 ---")
