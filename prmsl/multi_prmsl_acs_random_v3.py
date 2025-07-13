@@ -70,21 +70,17 @@ def get_sorted_indices(sort_method, valid_times):
     n_samples = len(valid_times)
     indices = np.arange(n_samples)
 
-    if sort_method in ['normal_sort', 'change_normal_sort']:
-        # 日時昇順でソート（元のデータがソート済みでも安全のため実施）
+    if sort_method in ['normal_sort', 'change_normal_sort']: # 日時昇順でソート（元のデータがソート済みでも安全のため実施）
         return indices[np.argsort(valid_times)]
 
-    elif sort_method in ['month_sort', 'change_month_sort']:
-        # 月、年の順でソート
+    elif sort_method in ['month_sort', 'change_month_sort']: # 月、年の順でソート
         df = pd.DataFrame({'time': valid_times, 'index': indices})
         df['month'] = pd.to_datetime(df['time']).month
-        df['year'] = pd.to_datetime(df['time']).year
-        # 月、その次に年でソート
+        df['year'] = pd.to_datetime(df['time']).year # 月、その次に年でソート
         df_sorted = df.sort_values(by=['month', 'year', 'time'])
         return df_sorted['index'].values
     
-    else:
-        # 万が一未知のソート方法が指定された場合は、デフォルトのランダム順を返す
+    else: # 万が一未知のソート方法が指定された場合は、デフォルトのランダム順を返す
         np.random.shuffle(indices)
         return indices
 
@@ -224,7 +220,7 @@ def calculate_all_metrics_multi_label(preds, y_true_multi, label_encoder):
         'n_clusters': n_pred_clusters,
         'pred_map': pred_map,
         'cm': cm,
-        'cluster_report': cluster_report_df # 💡 変更点：クラスタ詳細レポートを追加
+        'cluster_report': cluster_report_df
     }
 
 # ==============================================================================
@@ -265,8 +261,6 @@ def run_acs_trial(param_values_tuple_with_trial_info,
     try:
         with open(worker_log_path, 'w', encoding='utf-8') as log_file:
             sys.stdout = sys.stderr = log_file
-
-            # ★★★ パラメータをpopするのではなく、getで安全に取得する
             data_input_order = params_combo.get('data_input_order')
             pca_n_components = params_combo.get('pca_n_components')
             include_time_features = params_combo.get('include_time_features')
@@ -282,25 +276,19 @@ def run_acs_trial(param_values_tuple_with_trial_info,
             X_features = np.hstack([X_pca, sin_time_data, cos_time_data]) if include_time_features else X_pca
             X_scaled_data = MinMaxScaler().fit_transform(X_features).astype(np.float64)
             n_features_worker = X_scaled_data.shape[1]
-            
-            # ACSクラスに渡すパラメータを元の辞書からコピーして作成
             params_for_acs = params_combo.copy()
-
-            # 不要なキーを安全に削除
             keys_to_remove_for_acs = [
                 'data_input_order', 'pca_n_components', 'include_time_features', 'num_epochs'
             ]
             for key in keys_to_remove_for_acs:
-                params_for_acs.pop(key, None) # キーが存在しなくてもエラーにならない
-            
-            # ★★★ 簡略化：acs.py側でパラメータを処理するため、ここではそのまま渡す
+                params_for_acs.pop(key, None)
+
             current_run_params = {
                 **fixed_params_dict, 
                 'n_features': n_features_worker, 
                 'random_state': trial_specific_seed,
                 **params_for_acs
             }
-
             print(f"\n--- [Worker] トライアル {trial_count} 開始 ---")
             print(f"[Worker {trial_count}] データ投入順序: {data_input_order}")
             print(f"[Worker {trial_count}] 特徴量: PCA={pca_n_components}, Time={include_time_features}, Total Dim={n_features_worker}")
@@ -327,24 +315,18 @@ def run_acs_trial(param_values_tuple_with_trial_info,
                 print(f"[Worker {trial_count}] Epoch {epoch}/{num_epochs_worker} - Cls: {epoch_metrics['n_clusters']}, "
                       f"Score: {epoch_metrics['composite_score']:.4f}, BAcc: {epoch_metrics['bacc']:.4f}, Acc: {epoch_metrics['accuracy']:.4f}")
 
-    except Exception:
-        # どの段階でエラーが起きてもトレースバックを記録
+    except Exception: # どの段階でエラーが起きてもトレースバックを記録
         result['error_traceback'] = traceback.format_exc()
-        # ログファイルがまだ開いている場合は書き込む
-        if 'log_file' in locals() and not log_file.closed:
+        if 'log_file' in locals() and not log_file.closed: # ログファイルがまだ開いている場合は書き込む
              print(f"--- [Worker] トライアル {trial_count} で致命的なエラー発生 ---\n{result['error_traceback']}", file=log_file)
 
-    finally:
-        # 最後に必ず実行される後処理
+    finally: # 最後に必ず実行される後処理
         result['duration_seconds'] = (datetime.datetime.now() - trial_start_time).total_seconds()
         if acs_model_trial is not None:
             result['event_log'] = acs_model_trial.event_log
-        
-        # 標準出力を元に戻す
+
         sys.stdout = original_stdout
         sys.stderr = original_stderr
-        
-        # 試行終了をコンソールに表示
         print(f"--- [Worker] トライアル {trial_count} 終了 | Time: {result['duration_seconds']:.2f}s | エラー: {'あり' if result['error_traceback'] else 'なし'} ---")
 
         return result
@@ -490,8 +472,7 @@ def plot_cluster_composition(final_preds, y_true_multi, label_encoder, save_path
     # --- 0. 準備 ---
     base_labels = label_encoder.classes_
     n_base_labels = len(base_labels)
-    # -1（未分類）を除外し、実際にデータが割り当てられたクラスタのみを対象とする
-    unique_clusters = sorted([p for p in np.unique(final_preds) if p != -1])
+    unique_clusters = sorted([p for p in np.unique(final_preds) if p != -1]) # -1（未分類）を除外し、実際にデータが割り当てられたクラスタのみを対象とする
     
     if not unique_clusters:
         print(f"[{metric_name.upper()}] 有効なクラスタが予測されなかったため、構成プロットはスキップします。")
@@ -677,13 +658,13 @@ def main_process_logic():
         'initial_lambda_crossterm_val': (-0.5, 0.5),
         'initial_Z_val': (0.01, 1.0), 
         'initial_Z_new_cluster': (0.01, 1.0), 
-        'theta_new': (0.001, 1.0), 
+        'theta_new': (0.001, 1.0),  
         'Z_death_threshold': (0.01, 0.1),
         'death_patience_steps': [n_samples // 32, n_samples // 24, n_samples // 20, n_samples // 16, n_samples // 8, n_samples // 4, n_samples // 2, n_samples], 
         'num_epochs': [1000], 
-        'activation_type': ['circular', 'elliptical'] # ['circular', 'elliptical']
+        'activation_type': ['elliptical'] # ['circular', 'elliptical']
     }
-    N_TRIALS = 4
+    N_TRIALS = 100000
     fixed_params_for_acs = {'max_clusters': 50, 'initial_clusters': 1, 'lambda_min_val': 1e-7, 'bounds_W': (0, 1)}
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
     print("\n--- 3. 並列ランダムサーチ実行 ---")
@@ -744,8 +725,6 @@ def main_process_logic():
         best_random_state = best_result_info['random_state']
         run_output_dir = output_dir / f"best_model_by_{metric_name}"
         os.makedirs(run_output_dir, exist_ok=True)
-
-        # --- ここから追加 ---
         # 試行時のイベントログを保存
         best_event_log = best_result_info['event_log']
         if best_event_log:
@@ -753,7 +732,6 @@ def main_process_logic():
             log_save_path = run_output_dir / "trial_cluster_event_log.csv"
             event_log_df.to_csv(log_save_path, index=False)
             print(f"✅ 試行時のイベントログをCSVに保存しました: {log_save_path.resolve()}")
-        # --- ここまで追加 ---
 
         print("-" * 50)
         print(f"\n--- 最良モデル (基準: {metric_name.upper()}) ---")
@@ -803,38 +781,28 @@ def main_process_logic():
 
         # --- 最終状態のレポートと学習履歴グラフの保存 ---
         final_preds = best_model_instance.predict(X_scaled_data)
-
-        # --- ここから追加 ---
-        # 再学習後のイベントログを保存
         if best_model_instance.event_log:
             refit_event_log_df = pd.DataFrame(best_model_instance.event_log)
             refit_log_save_path = run_output_dir / "refit_cluster_event_log.csv"
             refit_event_log_df.to_csv(refit_log_save_path, index=False)
             print(f"✅ 再学習時のイベントログをCSVに保存しました: {refit_log_save_path.resolve()}")
-        # --- ここまで追加 ---
-        # イベントログの一致検証
+
         trial_log_path = run_output_dir / "trial_cluster_event_log.csv"
         refit_log_path = run_output_dir / "refit_cluster_event_log.csv"
-
         print("\n--- イベントログの一致検証 ---")
         if trial_log_path.exists() and refit_log_path.exists():
             try:
                 df_trial = pd.read_csv(trial_log_path)
                 df_refit = pd.read_csv(refit_log_path)
-
-                # DataFrameが完全に一致するか検証
                 are_logs_identical = df_trial.equals(df_refit)
-
                 if are_logs_identical:
                     print(f"✅ [OK] trial と refit のイベントログは完全に一致しました。再現性が確認されました。")
                 else:
                     print(f"⚠️ [NG] trial と refit のイベントログは一致しませんでした。プログラムの動作に非決定的な要素が含まれている可能性があります。")
-                    # 不一致の場合、より詳細な差分を出力
                     if len(df_trial) != len(df_refit):
                         print(f"   - 行数が異なります: Trial={len(df_trial)}, Refit={len(df_refit)}")
                     else:
                         try:
-                            # 差分の詳細を出力するためのテスト関数
                             pd.testing.assert_frame_equal(df_trial, df_refit, check_dtype=True)
                         except AssertionError as e:
                             print(f"   - 内容に差異があります。差分の詳細:\n{e}")
