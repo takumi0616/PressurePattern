@@ -28,7 +28,7 @@ except ImportError as e:
     print("このスクリプトと同じディレクトリに acs.py ファイルを配置してください。")
     sys.exit(1)
 
-GLOBAL_SEED = 17
+GLOBAL_SEED = 1
 os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
 np.random.seed(GLOBAL_SEED)
 random.seed(GLOBAL_SEED)
@@ -214,82 +214,130 @@ def run_acs_trial(param_values_tuple_with_trial_info,
     (trial_count, params_combo), trial_specific_seed = param_values_tuple_with_trial_info
     worker_log_path = trial_log_dir_path / f"trial_{trial_count}.log"
     original_stdout, original_stderr = sys.stdout, sys.stderr
-    acs_model_trial = None # 変数を関数のトップレベルで初期化
+    acs_model_trial = None
+    
+    # メモリ効率化: 必要最小限のデータのみを返す
     result = {
         'params_combo': {},
-        'history': [],
-        'event_log': [],
+        'history': [],  # 全エポックの履歴を保存（ただし軽量化）
+        'event_log_summary': {},  # イベントログのサマリーのみ
         'error_traceback': 'Initialization failed',
         'duration_seconds': 0,
         'acs_random_state_used': trial_specific_seed,
         'trial_count_from_worker': trial_count
     }
+    
     trial_start_time = datetime.datetime.now()
+    
     try:
         with open(worker_log_path, 'w', encoding='utf-8') as log_file:
             sys.stdout = sys.stderr = log_file
+            
             data_input_order = params_combo.get('data_input_order')
             pca_n_components = params_combo.get('pca_n_components')
             include_time_features = params_combo.get('include_time_features')
             num_epochs_worker = params_combo.get('num_epochs')
             activation_type_worker = params_combo.get('activation_type')
-            result['params_combo'] = params_combo.copy() # resultには元の完全なパラメータを保存
+            
+            result['params_combo'] = params_combo.copy()
             result['error_traceback'] = None
-            X_pca = pca_data_dict[pca_n_components] # 特徴量構築
+            
+            X_pca = pca_data_dict[pca_n_components]
             X_features = np.hstack([X_pca, sin_time_data, cos_time_data]) if include_time_features else X_pca
             X_scaled_data = MinMaxScaler().fit_transform(X_features).astype(np.float64)
             n_features_worker = X_scaled_data.shape[1]
+            
             params_for_acs = params_combo.copy()
             keys_to_remove_for_acs = [
                 'data_input_order', 'pca_n_components', 'include_time_features', 'num_epochs'
             ]
             for key in keys_to_remove_for_acs:
                 params_for_acs.pop(key, None)
-
+            
             current_run_params = {
-                **fixed_params_dict, 
-                'n_features': n_features_worker, 
+                **fixed_params_dict,
+                'n_features': n_features_worker,
                 'random_state': trial_specific_seed,
                 **params_for_acs
             }
+            
             print(f"\n--- [Worker] トライアル {trial_count} 開始 ---")
             print(f"[Worker {trial_count}] データ投入順序: {data_input_order}")
             print(f"[Worker {trial_count}] 特徴量: PCA={pca_n_components}, Time={include_time_features}, Total Dim={n_features_worker}")
             print(f"[Worker {trial_count}] パラメータ: { {k: f'{v:.4f}' if isinstance(v, float) else v for k, v in params_combo.items()} }")
-            np.random.seed(trial_specific_seed) # 乱数状態を明示的に設定（ワーカープロセス内）
+            
+            np.random.seed(trial_specific_seed)
             random.seed(trial_specific_seed)
-            acs_model_trial = ACS(**current_run_params) # モデルの初期化と学習
+            
+            acs_model_trial = ACS(**current_run_params)
             initial_indices = get_sorted_indices(data_input_order, valid_times_worker, random_seed=trial_specific_seed)
+            
             for epoch in range(1, num_epochs_worker + 1):
                 current_indices = initial_indices
                 if 'change' in data_input_order and epoch % 2 == 0:
                     current_indices = initial_indices[::-1]
-
+                
                 for data_idx in current_indices:
                     U_p = X_scaled_data[data_idx, :]
                     acs_model_trial.partial_fit(U_p, epoch=epoch, data_idx=int(data_idx))
-
+                
                 preds = acs_model_trial.predict(X_scaled_data)
                 epoch_metrics = calculate_all_metrics_multi_label(preds, y_data_multi, label_encoder_worker)
                 epoch_metrics['epoch'] = epoch
-                result['history'].append(epoch_metrics)
+                
+                # メモリ効率化: cluster_reportとcmを軽量化
+                lightweight_metrics = {
+                    'epoch': epoch,
+                    'composite_score': epoch_metrics['composite_score'],
+                    'weighted_purity': epoch_metrics['weighted_purity'],
+                    'accuracy': epoch_metrics['accuracy'],
+                    'bacc': epoch_metrics['bacc'],
+                    'ari': epoch_metrics['ari'],
+                    'n_clusters': epoch_metrics['n_clusters'],
+                    # pred_mapとcluster_reportは最後のエポックのみ保存
+                }
+                
+                # 最後のエポックの場合は完全な情報を保存
+                if epoch == num_epochs_worker:
+                    lightweight_metrics['pred_map'] = epoch_metrics['pred_map']
+                    lightweight_metrics['cm'] = epoch_metrics['cm']
+                    lightweight_metrics['cluster_report'] = epoch_metrics['cluster_report']
+                
+                result['history'].append(lightweight_metrics)
+                
                 print(f"[Worker {trial_count}] Epoch {epoch}/{num_epochs_worker} - Cls: {epoch_metrics['n_clusters']}, "
                       f"Score: {epoch_metrics['composite_score']:.4f}, BAcc: {epoch_metrics['bacc']:.4f}, Acc: {epoch_metrics['accuracy']:.4f}")
-
-    except Exception: # どの段階でエラーが起きてもトレースバックを記録
+                      
+    except Exception:
         result['error_traceback'] = traceback.format_exc()
-        if 'log_file' in locals() and not log_file.closed: # ログファイルがまだ開いている場合は書き込む
-             print(f"--- [Worker] トライアル {trial_count} で致命的なエラー発生 ---\n{result['error_traceback']}", file=log_file)
-
-    finally: # 最後に必ず実行される後処理
+        if 'log_file' in locals() and not log_file.closed:
+            print(f"--- [Worker] トライアル {trial_count} で致命的なエラー発生 ---\n{result['error_traceback']}", file=log_file)
+    
+    finally:
         result['duration_seconds'] = (datetime.datetime.now() - trial_start_time).total_seconds()
-        if acs_model_trial is not None:
-            result['event_log'] = acs_model_trial.event_log
-
+        
+        # イベントログのサマリーのみを保存
+        if acs_model_trial is not None and acs_model_trial.event_log:
+            event_types_count = {}
+            for event in acs_model_trial.event_log:
+                event_type = event.get('event_type', 'UNKNOWN')
+                event_types_count[event_type] = event_types_count.get(event_type, 0) + 1
+            
+            result['event_log_summary'] = {
+                'total_events': len(acs_model_trial.event_log),
+                'event_types_count': event_types_count,
+                'final_cluster_count': acs_model_trial.M
+            }
+            
+            # イベントログの完全版はファイルに保存
+            if len(acs_model_trial.event_log) > 0:
+                event_log_path = trial_log_dir_path / f"trial_{trial_count}_events.csv"
+                pd.DataFrame(acs_model_trial.event_log).to_csv(event_log_path, index=False)
+        
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         print(f"--- [Worker] トライアル {trial_count} 終了 | Time: {result['duration_seconds']:.2f}s | エラー: {'あり' if result['error_traceback'] else 'なし'} ---")
-
+        
         return result
         
 def sample_random_params(param_dist, rng=None):
@@ -538,7 +586,7 @@ def main_process_logic():
     print("ACSモデルによる気圧配置パターンの教師なしクラスタリング (複合ラベル・複数指標対応版)")
     print("=" * 80)
     print("\n--- 1. データ準備 ---")
-    pca_dims_to_test = [15, 20, 25]
+    pca_dims_to_test = [20]
     preprocessed_data_cache_file = Path("./preprocessed_prmsl_data_all_labels.pkl")
     if preprocessed_data_cache_file.exists():
         print(f"✅ キャッシュファイルから前処理済みデータを読み込みます...")
@@ -581,9 +629,9 @@ def main_process_logic():
     print(f"✅ データ準備完了。対象サンプル数: {n_samples}, 基本ラベル数: {n_true_clusters}")
     print("\n--- 2. ランダムサーチ設定 ---")
     param_dist = {
-        'data_input_order': ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort'], # ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort']
+        'data_input_order': ['month_sort'], # ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort']
         'pca_n_components': pca_dims_to_test, 
-        'include_time_features': [True, False], # [True, False]
+        'include_time_features': [False], # [True, False]
         'gamma': (0.01, 3.0), 
         'beta': (0.001, 1.0),
         'learning_rate_W': (0.001, 0.1), 
@@ -600,11 +648,11 @@ def main_process_logic():
         'num_epochs': [1000], 
         'activation_type': ['elliptical'] # ['circular', 'elliptical']
     }
-    N_TRIALS = 10000
+    N_TRIALS = 100
     fixed_params_for_acs = {'max_clusters': 50, 'initial_clusters': 1, 'lambda_min_val': 1e-7, 'bounds_W': (0, 1)}
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
     print("\n--- 3. 並列ランダムサーチ実行 ---")
-    num_processes_to_use = max(1, int(os.cpu_count() * 0.9)) if os.cpu_count() else 2
+    num_processes_to_use = max(1, int(os.cpu_count() * 0.95)) if os.cpu_count() else 2
     tasks_for_pool = [] # 各試行用の独立した乱数生成器を作成
     for i in range(N_TRIALS):
         trial_rng = random.Random(GLOBAL_SEED + i + 1)
@@ -621,20 +669,37 @@ def main_process_logic():
     if not all_trial_results: sys.exit("エラー: サーチから結果が返されませんでした。")
     processed_results = []
     for res in all_trial_results:
-        if res['error_traceback'] or not res['history']: continue
+        if res['error_traceback'] or not res['history']:
+            continue
+        
         history_df = pd.DataFrame(res['history'])
         best_by_composite = history_df.loc[history_df['composite_score'].idxmax()]
         best_by_bacc = history_df.loc[history_df['bacc'].idxmax()]
         best_by_accuracy = history_df.loc[history_df['accuracy'].idxmax()]
+        
+        # 最良エポックの完全な情報を取得
+        best_composite_epoch = int(best_by_composite['epoch'])
+        best_bacc_epoch = int(best_by_bacc['epoch'])
+        best_accuracy_epoch = int(best_by_accuracy['epoch'])
+        
+        # 最後のエポックから完全な情報を取得（もし必要なら）
+        last_epoch_data = res['history'][-1] if res['history'] else {}
+        
         processed_results.append({
             'trial_id': res['trial_count_from_worker'],
             'params': res['params_combo'],
             'random_state': res['acs_random_state_used'],
-            'full_history': res['history'],
-            'event_log': res['event_log'],
+            'history_summary': {  # 軽量化: サマリーのみ保存
+                'num_epochs': len(res['history']),
+                'best_composite_epoch': best_composite_epoch,
+                'best_bacc_epoch': best_bacc_epoch,
+                'best_accuracy_epoch': best_accuracy_epoch,
+            },
+            'event_log_summary': res.get('event_log_summary', {}),  # サマリーのみ
             'best_by_composite_score': best_by_composite.to_dict(),
             'best_by_bacc': best_by_bacc.to_dict(),
             'best_by_accuracy': best_by_accuracy.to_dict(),
+            'final_epoch_full_data': last_epoch_data  # 最終エポックの完全データ
         })
 
     if not processed_results: sys.exit("エラー: 有効な結果が得られませんでした。")
@@ -665,12 +730,26 @@ def main_process_logic():
             best_random_state = best_result_info['random_state']
             run_output_dir = output_dir / f"{rank}_model_by_{metric_name}" # ディレクトリ名を1_model_by_*, 2_model_by_*, 3_model_by_*の形式に
             os.makedirs(run_output_dir, exist_ok=True)
-            best_event_log = best_result_info['event_log'] # 試行時のイベントログを保存
-            if best_event_log:
-                event_log_df = pd.DataFrame(best_event_log)
-                log_save_path = run_output_dir / "trial_cluster_event_log.csv"
-                event_log_df.to_csv(log_save_path, index=False)
-                print(f"✅ 試行時のイベントログをCSVに保存しました: {log_save_path.resolve()}")
+            # イベントログはワーカープロセスで既にファイルに保存されているため、
+            # ここではサマリー情報のみを処理する
+            best_event_log_summary = best_result_info.get('event_log_summary', {})
+            if best_event_log_summary:
+                # 元のイベントログファイルが存在する場合はコピー
+                trial_event_log_path = trial_logs_dir / f"trial_{best_trial_id}_events.csv"
+                if trial_event_log_path.exists():
+                    import shutil
+                    dest_path = run_output_dir / "trial_cluster_event_log.csv"
+                    shutil.copy2(trial_event_log_path, dest_path)
+                    print(f"✅ 試行時のイベントログをコピーしました: {dest_path.resolve()}")
+                
+                # サマリー情報を表示
+                print(f"   - イベント総数: {best_event_log_summary.get('total_events', 0)}")
+                print(f"   - 最終クラスタ数: {best_event_log_summary.get('final_cluster_count', 0)}")
+                event_types = best_event_log_summary.get('event_types_count', {})
+                if event_types:
+                    print("   - イベントタイプ別カウント:")
+                    for event_type, count in event_types.items():
+                        print(f"     {event_type}: {count}")
             
             print("-" * 50)
             print(f"\n--- 第{rank}位モデル (基準: {metric_name.upper()}) ---")
