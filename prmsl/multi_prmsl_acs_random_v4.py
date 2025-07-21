@@ -307,6 +307,39 @@ def sample_random_params(param_dist, rng=None):
                 params[key] = round(rng.uniform(value[0], value[1]), 4)
     return params
 
+def create_grid_search_tasks(param_dist):
+    """
+    param_distから全組み合わせを生成し、グリッドサーチ用のタスクリストを作成する。
+    """
+    from itertools import product
+
+    # 各パラメータの選択肢リストを作成
+    param_options = {}
+    for key, value in param_dist.items():
+        if isinstance(value, list):
+            param_options[key] = value
+        else:
+            # タプルなどリストでない値が含まれている場合はグリッドサーチ不可
+            raise ValueError(f"グリッドサーチのためには、全てのパラメータがリスト形式である必要があります。'{key}'がリストではありません。")
+
+    # パラメータ名のリストと、値の組み合わせリストを作成
+    param_names = list(param_options.keys())
+    value_combinations = list(product(*param_options.values()))
+
+    # 全組み合わせの総数を計算
+    total_combinations = len(value_combinations)
+    print(f"✅ 全通り探索（グリッドサーチ）を実行します。総組み合わせ数: {total_combinations}")
+
+    # プール用のタスクリストを作成
+    tasks = []
+    for i, combo_values in enumerate(value_combinations):
+        params = dict(zip(param_names, combo_values))
+        # 各試行にユニークな乱数シードを割り当てる
+        trial_seed = GLOBAL_SEED + i + 1
+        tasks.append(((i + 1, params), trial_seed))
+    
+    return tasks, total_combinations
+
 def plot_energy_contour_for_epoch(model, epoch, save_path,
                                   X_scaled_data_for_eval, X_pca_visual, y_true_multi,
                                   label_encoder, pca_visual_model):
@@ -554,18 +587,18 @@ def main_process_logic():
         'data_input_order': ['normal_sort'], # ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort']
         'pca_n_components': pca_dims_to_test, 
         'include_time_features': [True], # [True, False]
-        'gamma': (0.01, 3.0), 
-        'beta': (0.001, 1.0),
-        'learning_rate_W': (0.001, 0.1), 
-        'learning_rate_lambda': (0.001, 0.1), 
-        'learning_rate_Z': (0.001, 0.1),
-        'initial_lambda_scalar': (0.001, 1.0), 
-        'initial_lambda_vector_val': (0.001, 1.0), 
-        'initial_lambda_crossterm_val': (-0.5, 0.5),
-        'initial_Z_val': (0.01, 1.0), 
-        'initial_Z_new_cluster': (0.01, 1.0), 
-        'theta_new': (0.001, 1.0),  
-        'Z_death_threshold': (0.01, 0.1),
+        'gamma': [1.0, 2.0],   
+        'beta': [0.01, 0.1],  
+        'learning_rate_W': [0.01, 0.1],
+        'learning_rate_lambda': [0.01, 0.1],
+        'learning_rate_Z': [0.01, 0.05, 0.1],
+        'initial_lambda_scalar': [0.01, 0.1, 1.0], 
+        'initial_lambda_vector_val': [0.1], 
+        'initial_lambda_crossterm_val': [-0.1, 0.0, 0.1],
+        'initial_Z_val': [0.25, 0.5, 0.75], 
+        'initial_Z_new_cluster': [0.5, 1.0], 
+        'theta_new': [0.01, 0.05, 0.1],  
+        'Z_death_threshold': [0.01, 0.05, 0.1], 
         'death_patience_steps': [n_samples // 32, n_samples // 20],
         'num_epochs': [3000], 
         'activation_type': ['elliptical'] # ['circular', 'elliptical']
@@ -573,23 +606,42 @@ def main_process_logic():
     N_TRIALS = 100000
     fixed_params_for_acs = {'max_clusters': 45, 'initial_clusters': 1, 'lambda_min_val': 1e-7, 'bounds_W': (0, 1)}
     print(f"ランダムサーチ最大試行回数: {N_TRIALS}")
-    print("\n--- 3. 並列ランダムサーチ実行 ---")
-    num_processes_to_use = max(1, int(os.cpu_count() * 0.95)) if os.cpu_count() else 2
+    print("\n--- 3. 探索タスクの準備と実行 ---")
+    # 全てのパラメータがリスト形式かチェックし、探索方法を決定
+    is_grid_search = all(isinstance(v, list) for v in param_dist.values())
     tasks_for_pool = []
-    for i in range(N_TRIALS):
-        trial_rng = random.Random(GLOBAL_SEED + i + 1)
-        params = sample_random_params(param_dist, rng=trial_rng)
-        tasks_for_pool.append(((i + 1, params), GLOBAL_SEED + i + 1))
-        
+    if is_grid_search:
+        # --- 全通り探索（グリッドサーチ）の場合 ---
+        try:
+            tasks_for_pool, N_TRIALS = create_grid_search_tasks(param_dist)
+            print(f"試行回数（N_TRIALS）を自動設定しました: {N_TRIALS}")
+        except ValueError as e:
+            print(f"エラー: {e}")
+            sys.exit(1)
+    else:
+        # --- ランダムサーチの場合 ---
+        print(f"⚠️ パラメータに範囲指定（タプル形式）が含まれるため、ランダムサーチを実行します。")
+        print(f"ランダムサーチ試行回数: {N_TRIALS}")
+        for i in range(N_TRIALS):
+            trial_rng = random.Random(GLOBAL_SEED + i + 1)
+            params = sample_random_params(param_dist, rng=trial_rng)
+            tasks_for_pool.append(((i + 1, params), GLOBAL_SEED + i + 1))
+
+    num_processes_to_use = max(1, int(os.cpu_count() * 0.95)) if os.cpu_count() else 2
     worker_func_with_fixed_args = partial(run_acs_trial, fixed_params_dict=fixed_params_for_acs, pca_data_dict=precalculated_pca_data, y_data_multi=y_true_multi, f1_season_data=f1_season, f2_season_data=f2_season, trial_log_dir_path=trial_logs_dir, label_encoder_worker=label_encoder, valid_times_worker=valid_times)
-    
     start_search_time = datetime.datetime.now()
     all_trial_results = []
+    if not tasks_for_pool:
+        print("実行するタスクがありません。処理を終了します。")
+        sys.exit(0)
+
+    print(f"使用するプロセス数: {num_processes_to_use}")
     with multiprocessing.Pool(processes=num_processes_to_use) as pool:
-        for result in tqdm(pool.imap_unordered(worker_func_with_fixed_args, tasks_for_pool), total=N_TRIALS, desc="Random Search Progress"):
+        desc_text = "Grid Search Progress" if is_grid_search else "Random Search Progress"
+        for result in tqdm(pool.imap_unordered(worker_func_with_fixed_args, tasks_for_pool), total=len(tasks_for_pool), desc=desc_text):
             all_trial_results.append(result)
+
     print(f"\nランダムサーチ完了。総所要時間: {datetime.datetime.now() - start_search_time}")
-    
     print("\n--- 4. 結果集計 (Macro Recallでベストを選出) ---")
     if not all_trial_results: sys.exit("エラー: サーチから結果が返されませんでした。")
     
