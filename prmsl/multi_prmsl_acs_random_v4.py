@@ -599,7 +599,7 @@ def main_process_logic():
         'initial_Z_new_cluster': [0.5, 1.0], 
         'theta_new': [0.01, 0.05, 0.1],  
         'Z_death_threshold': [0.01, 0.05, 0.1], 
-        'death_patience_steps': [n_samples // 32, n_samples // 20],
+        'death_patience_steps': [n_samples // 20], # normal_sort : n_samples // 20, month_sort : n_samples // 2
         'num_epochs': [3000], 
         'activation_type': ['elliptical'] # ['circular', 'elliptical']
     }
