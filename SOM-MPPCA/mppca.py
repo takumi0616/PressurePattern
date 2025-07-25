@@ -1,3 +1,5 @@
+# src/PressurePattern/SOM-MPPCA/mppca.py
+
 # Translation in python of the Matlab implementation of Mathieu Andreux and
 # Michel Blancard, of the algorithm described in
 # "Mixtures of Probabilistic Principal Component Analysers",
@@ -193,16 +195,26 @@ def mppca_gem(X, pi, mu, W, sigma2, niter):
         
         for c in range(p):
             R_c_sum = np.sum(R[:, c])
-            mu[c, :] = (R[:, c].reshape(N, 1) * X).sum(axis=0) / R_c_sum
+            if R_c_sum == 0: continue # ゼロ除算を避ける
+
+            # ★★★ エラー修正箇所 1 ★★★
+            # R[:, c]は非連続な配列(ビュー)なので、.copy()で連続な配列に変換してからreshapeする
+            R_col_reshaped = R[:, c].copy().reshape(N, 1)
+
+            mu[c, :] = (R_col_reshaped * X).sum(axis=0) / R_c_sum
             
             deviation_from_center = X - mu[c, :].reshape(1, d)
             
-            SW_numerator = (R[:, c].reshape(N, 1) * deviation_from_center).T @ (deviation_from_center @ W[c,:,:])
+            # ★★★ エラー修正箇所 2 ★★★
+            # ここでも同様に.copy()を追加
+            SW_numerator = (R[:, c].copy().reshape(N, 1) * deviation_from_center).T @ (deviation_from_center @ W[c,:,:])
             SW = (1 / (pi[c]*N)) * SW_numerator
             
             Wnew = SW @ np.linalg.inv(sigma2[c]*np.eye(q) + Minv[c, :, :] @ W[c, :, :].T @ SW)
             
-            term1_num = np.sum(R[:, c].reshape(N, 1) * np.power(deviation_from_center, 2))
+            # ★★★ エラー修正箇所 3 ★★★
+            # ここでも同様に.copy()を追加
+            term1_num = np.sum(R[:, c].copy().reshape(N, 1) * np.power(deviation_from_center, 2))
             sigma2[c] = (1/d) * ( term1_num / (N*pi[c]) - np.trace(SW @ Minv[c, :, :] @ Wnew.T))
 
             W[c, :, :] = Wnew
