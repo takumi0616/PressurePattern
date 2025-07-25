@@ -541,8 +541,8 @@ def main_process_logic():
     print("ACSモデルによる気圧配置パターンの教師なしクラスタリング (評価指標: マクロ平均再現率)")
     print("=" * 80)
     print("\n--- 1. データ準備 ---")
-    pca_dims_to_test = [20]
-    preprocessed_data_cache_file = Path("./preprocessed_prmsl_data_all_labels.pkl")
+    pca_dims_to_test = [15, 20, 25]
+    preprocessed_data_cache_file = Path("./preprocessed_prmsl_data_all_labels_small.pkl")
     if preprocessed_data_cache_file.exists():
         print(f"✅ キャッシュファイルから前処理済みデータを読み込みます...")
         data_cache = pd.read_pickle(preprocessed_data_cache_file)
@@ -553,7 +553,7 @@ def main_process_logic():
         )
     else:
         print(f"✅ キャッシュがないため、データを新規生成します...")
-        ds = xr.open_dataset("./prmsl_era5_all_data_seasonal.nc")
+        ds = xr.open_dataset("./prmsl_era5_all_data_seasonal_small.nc")
         ds_period = ds.sel(valid_time=slice('1991-01-01', '2000-12-31'))
         ds_filtered = ds_period
         base_labels = ['1', '2A', '2B', '2C', '2D', '3A', '3B', '3C', '3D', '4A', '4B', '5', '6A', '6B', '6C']
@@ -584,22 +584,22 @@ def main_process_logic():
     print(f"✅ データ準備完了。対象サンプル数: {n_samples}, 基本ラベル数: {n_true_clusters}")
     print("\n--- 2. ランダムサーチ設定 ---")
     param_dist = {
-        'data_input_order': ['normal_sort'], # ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort']
+        'data_input_order': ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort'], # ['normal_sort', 'month_sort', 'change_normal_sort', 'change_month_sort']
         'pca_n_components': pca_dims_to_test, 
-        'include_time_features': [True], # [True, False]
-        'gamma': [1.0, 2.0],   
-        'beta': [0.01, 0.1],  
-        'learning_rate_W': [0.01, 0.1],
-        'learning_rate_lambda': [0.01, 0.1],
-        'learning_rate_Z': [0.01, 0.05, 0.1],
-        'initial_lambda_scalar': [0.01, 0.1, 1.0], 
-        'initial_lambda_vector_val': [0.1], 
-        'initial_lambda_crossterm_val': [-0.1, 0.0, 0.1],
-        'initial_Z_val': [0.25, 0.5, 0.75], 
-        'initial_Z_new_cluster': [0.5, 1.0], 
-        'theta_new': [0.01, 0.05, 0.1],  
-        'Z_death_threshold': [0.01, 0.05, 0.1], 
-        'death_patience_steps': [n_samples // 20], # normal_sort : n_samples // 20 : 183, month_sort : n_samples // 2 : 1827
+        'include_time_features': [True, False], # [True, False]
+        'gamma': (0.01, 3.0), 
+        'beta': (0.001, 1.0),  
+        'learning_rate_W': (0.001, 0.1),
+        'learning_rate_lambda': (0.001, 0.1),
+        'learning_rate_Z': (0.001, 0.1),
+        'initial_lambda_scalar': (0.001, 1.0), 
+        'initial_lambda_vector_val': (0.001, 1.0), 
+        'initial_lambda_crossterm_val': (-0.5, 0.5),
+        'initial_Z_val': (0.01, 1.0), 
+        'initial_Z_new_cluster': (0.01, 1.0), 
+        'theta_new': (0.001, 1.0),  
+        'Z_death_threshold': (0.001, 1.0), 
+        'death_patience_steps': [n_samples // 20, n_samples // 2], # normal_sort : n_samples // 20 : 183, month_sort : n_samples // 2 : 1827
         'num_epochs': [1000], 
         'activation_type': ['elliptical'] # ['circular', 'elliptical']
     }
