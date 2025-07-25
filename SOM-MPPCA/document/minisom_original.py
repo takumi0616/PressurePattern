@@ -2,7 +2,7 @@ from numpy import (array, unravel_index, nditer, linalg, random, subtract, max,
                    power, exp, zeros, ones, arange, outer, meshgrid, dot,
                    logical_and, mean, cov, argsort, linspace,
                    einsum, prod, nan, sqrt, hstack, diff, argmin, multiply,
-                   nanmean, nansum, tile, array_equal, isclose, bincount)
+                   nanmean, nansum, tile, array_equal, isclose)
 from numpy.linalg import norm
 from collections import defaultdict, Counter
 from warnings import warn
@@ -11,9 +11,11 @@ from time import time
 from datetime import timedelta
 import pickle
 import os
-# Numbaをインポート
-import numba
-from numba import jit
+
+# for unit tests
+from numpy.testing import assert_almost_equal, assert_array_almost_equal
+from numpy.testing import assert_array_equal
+import unittest
 
 """
     Minimalistic implementation of the Self Organizing Maps (SOM).
@@ -63,28 +65,10 @@ def _wrap_index__in_verbose(iterations):
         stdout.write(progress)
 
 
-# NumbaのJITデコレータを追加して高速化
-@jit(nopython=True, cache=True)
 def fast_norm(x):
     """Returns norm-2 of a 1-D numpy array.
     """
     return sqrt(dot(x, x.T))
-
-
-# Numba JITコンパイル用のヘルパー関数 (distance_mapのループ部分)
-@jit(nopython=True, cache=True)
-def _distance_map_loop(weights, um, ii, jj):
-    """Numba-accelerated loop for distance_map."""
-    for x in range(weights.shape[0]):
-        for y in range(weights.shape[1]):
-            w_2 = weights[x, y]
-            e = y % 2 == 0  # only used on hexagonal topology
-            for k, (i, j) in enumerate(zip(ii[e], jj[e])):
-                if (x + i >= 0 and x + i < weights.shape[0] and
-                        y + j >= 0 and y + j < weights.shape[1]):
-                    w_1 = weights[x + i, y + j]
-                    um[x, y, k] = fast_norm(w_2 - w_1)
-    return um
 
 
 class MiniSom(object):
@@ -190,8 +174,8 @@ class MiniSom(object):
         self._weights /= linalg.norm(self._weights, axis=-1, keepdims=True)
 
         self._activation_map = zeros((x, y))
-        self._neigx = arange(x, dtype=float)
-        self._neigy = arange(y, dtype=float)
+        self._neigx = arange(x)
+        self._neigy = arange(y)  # used to evaluate the neighborhood function
 
         if topology not in ['hexagonal', 'rectangular']:
             msg = '%s not supported only hexagonal and rectangular available'
@@ -432,11 +416,11 @@ class MiniSom(object):
         """Initializes the weights of the SOM
         picking random samples from data."""
         self._check_input_len(data)
-        # --- ベクトル化による改善 ---
-        map_shape = self._weights.shape[:2]
-        rand_indices = self._random_generator.randint(len(data),
-                                                      size=map_shape)
-        self._weights = array(data)[rand_indices]
+        it = nditer(self._activation_map, flags=['multi_index'])
+        while not it.finished:
+            rand_i = self._random_generator.randint(len(data))
+            self._weights[it.multi_index] = data[rand_i]
+            it.iternext()
 
     def pca_weights_init(self, data):
         """Initializes the weights to span the first two principal components.
@@ -455,22 +439,13 @@ class MiniSom(object):
             msg = 'PCA initialization inappropriate:' + \
                   'One of the dimensions of the map is 1.'
             warn(msg)
-        
-        # --- ベクトル化による改善 ---
-        pc_length, pc_vecs = linalg.eigh(cov(data.T))
+        pc_length, eigvecs = linalg.eig(cov(data))
+        pc = (eigvecs.T @ data)
         pc_order = argsort(-pc_length)
-        pc_vecs = pc_vecs[:, pc_order]
-        
-        mx, my = self._weights.shape[0], self._weights.shape[1]
-        c1 = linspace(-1, 1, mx)[:, None]
-        c2 = linspace(-1, 1, my)
-        
-        pc1 = data.mean(axis=0) + c1 * sqrt(pc_length[pc_order[0]]) * pc_vecs[:, 0]
-        pc2 = c2 * sqrt(pc_length[pc_order[1]]) * pc_vecs[:, 1]
-        
-        # Broadcasting to create the weights
-        self._weights = pc1[:, None, :] + pc2[None, :, :]
-
+        for i, c1 in enumerate(linspace(-1, 1, len(self._neigx))):
+            for j, c2 in enumerate(linspace(-1, 1, len(self._neigy))):
+                self._weights[i, j] = c1*pc[pc_order[0]] + \
+                                      c2*pc[pc_order[1]]
 
     def _check_fixed_points(self, fixed_points, data):
         for k in fixed_points.keys():
@@ -524,8 +499,6 @@ class MiniSom(object):
             the best matching unit.
         """
         self._check_iteration_number(num_iteration)
-        # We use array() here to make sure data is a numpy array
-        data = array(data)
         self._check_input_len(data)
         random_generator = None
         if random_order:
@@ -602,30 +575,38 @@ class MiniSom(object):
             If set to 'sum', the normalization is done
             by the sum of the distances.
         """
+
         if scaling not in ['sum', 'mean']:
             raise ValueError(f'scaling should be either "sum" or "mean" ('
                              f'"{scaling}" not valid)')
-        
-        # --- Numbaによるループ高速化 ---
-        weights = self._weights
-        um = nan * zeros((weights.shape[0], weights.shape[1], 8))
+
+        um = nan * zeros((self._weights.shape[0],
+                          self._weights.shape[1],
+                          8))  # 2 spots more for hexagonal topology
+
+        ii = [[0, -1, -1, -1, 0, 1, 1, 1]]*2
+        jj = [[-1, -1, 0, 1, 1, 1, 0, -1]]*2
 
         if self.topology == 'hexagonal':
-            # Numbaで扱えるようにarrayに変換
-            ii = array([[1, 1, 1, 0, -1, 0], [0, 1, 0, -1, -1, -1]])
-            jj = array([[1, 0, -1, -1, 0, 1], [1, 0, -1, -1, 0, 1]])
-        else: # rectangular
-            ii = array([[0, -1, -1, -1, 0, 1, 1, 1]]*2)
-            jj = array([[-1, -1, 0, 1, 1, 1, 0, -1]]*2)
+            ii = [[1, 1, 1, 0, -1, 0], [0, 1, 0, -1, -1, -1]]
+            jj = [[1, 0, -1, -1, 0, 1], [1, 0, -1, -1, 0, 1]]
 
-        um = _distance_map_loop(weights, um, ii, jj)
-        
+        for x in range(self._weights.shape[0]):
+            for y in range(self._weights.shape[1]):
+                w_2 = self._weights[x, y]
+                e = y % 2 == 0   # only used on hexagonal topology
+                for k, (i, j) in enumerate(zip(ii[e], jj[e])):
+                    if (x+i >= 0 and x+i < self._weights.shape[0] and
+                            y+j >= 0 and y+j < self._weights.shape[1]):
+                        w_1 = self._weights[x+i, y+j]
+                        um[x, y, k] = fast_norm(w_2-w_1)
+
         if scaling == 'mean':
             um = nanmean(um, axis=2)
         if scaling == 'sum':
             um = nansum(um, axis=2)
-            
-        return um / um.max()
+
+        return um/um.max()
 
     def activation_response(self, data):
         """
@@ -633,13 +614,10 @@ class MiniSom(object):
             that the neuron i,j have been winner.
         """
         self._check_input_len(data)
-        # --- ベクトル化による改善 ---
-        map_shape = self._weights.shape[:2]
-        # 全データに対して一括で勝者ニューロンを計算
-        winners_flat = self._distance_from_weights(data).argmin(axis=1)
-        # bincountで各ニューロンが勝者になった回数を集計
-        win_counts = bincount(winners_flat, minlength=prod(map_shape))
-        return win_counts.reshape(map_shape)
+        a = zeros((self._weights.shape[0], self._weights.shape[1]))
+        for x in data:
+            a[self.winner(x)] += 1
+        return a
 
     def _distance_from_weights(self, data):
         """Returns a matrix d where d[i,j] is the euclidean distance between
@@ -663,15 +641,10 @@ class MiniSom(object):
            sum_i, sum_c (neighborhood(c, sigma) * || d_i - w_c ||^2
         """
         distortion = 0
-        # NOTE: このループは各データ点で異なる勝者ニューロンと近傍関数を使うため、
-        #       単純なベクトル化が困難です。Numba化も可能ですが、
-        #       neighborhood関数がPythonオブジェクトであるためnopythonモードが使えず、
-        #       効果が限定的です。元の実装を維持します。
         for d in data:
-            winner_coords = self.winner(d)
-            neighborhood_grid = self.neighborhood(winner_coords, self._sigma)
-            distances = norm(d - self.get_weights(), axis=2)
-            distortion += (neighborhood_grid * distances).sum()
+            distortion += multiply(self.neighborhood(self.winner(d),
+                                                     self._sigma),
+                                   norm(d - self.get_weights(), axis=2)).sum()
         return distortion
 
     def topographic_error(self, data):
@@ -687,40 +660,45 @@ class MiniSom(object):
         If 1, the topology was not preserved for any of the samples."""
         self._check_input_len(data)
         total_neurons = prod(self._activation_map.shape)
-        if total_neurons <= 1:
-            warn('The topographic error is not defined for a map with less than 2 neurons.')
+        if total_neurons == 1:
+            warn('The topographic error is not defined for a 1-by-1 map.')
             return nan
-        
-        # --- ベクトル化による改善 ---
-        # best 2 matching units
-        b2mu_inds = self._distance_from_weights(data).argpartition(2, axis=1)[:, :2]
-        
         if self.topology == 'hexagonal':
-            b2mu_coords = self._get_euclidean_coordinates_from_index(b2mu_inds)
-            # norm of the distance between the two winners for each data point
-            bmu_diff = norm(b2mu_coords[:, 0, :] - b2mu_coords[:, 1, :], axis=1)
-            # isclose(1, ...) is used to check for adjacency in hex grid
-            return (1 - isclose(bmu_diff, 1.0)).mean()
-        else: # rectangular
-            b2mu_x, b2mu_y = unravel_index(b2mu_inds, self._weights.shape[:2])
-            # distance is > 1.42 (approx. sqrt(2)) if not adjacent
-            dx = diff(b2mu_x, axis=1)
-            dy = diff(b2mu_y, axis=1)
-            distance = sqrt(dx**2 + dy**2).flatten()
-            return (distance > 1.42).mean()
+            return self._topographic_error_hexagonal(data)
+        else:
+            return self._topographic_error_rectangular(data)
 
-    def _get_euclidean_coordinates_from_index(self, index_array):
-        """Returns the Euclidean coordinated of neurons from an array of indices."""
-        y_dim = self._weights.shape[1]
-        coords_x = (index_array // y_dim).astype(int)
-        coords_y = (index_array % y_dim).astype(int)
-        
-        # Use advanced indexing on the meshgrids
-        euclidean_x = self._xx.T[coords_x, coords_y]
-        euclidean_y = self._yy.T[coords_x, coords_y]
-        
-        # Stack to get shape (n_samples, n_bmu, 2)
-        return hstack([euclidean_x[..., None], euclidean_y[..., None]]).reshape(index_array.shape[0], index_array.shape[1], 2)
+    def _topographic_error_hexagonal(self, data):
+        """Return the topographic error for hexagonal grid"""
+        b2mu_inds = argsort(self._distance_from_weights(data), axis=1)[:, :2]
+        b2mu_coords = [[self._get_euclidean_coordinates_from_index(bmu[0]),
+                        self._get_euclidean_coordinates_from_index(bmu[1])]
+                       for bmu in b2mu_inds]
+        b2mu_coords = array(b2mu_coords)
+        b2mu_neighbors = [isclose(1, norm(bmu1 - bmu2))
+                          for bmu1, bmu2 in b2mu_coords]
+        te = 1 - mean(b2mu_neighbors)
+        return te
+
+    def _topographic_error_rectangular(self, data):
+        """Return the topographic error for rectangular grid"""
+        t = 1.42
+        # b2mu: best 2 matching units
+        b2mu_inds = argsort(self._distance_from_weights(data), axis=1)[:, :2]
+        b2my_xy = unravel_index(b2mu_inds, self._weights.shape[:2])
+        b2mu_x, b2mu_y = b2my_xy[0], b2my_xy[1]
+        dxdy = hstack([diff(b2mu_x), diff(b2mu_y)])
+        distance = norm(dxdy, axis=1)
+        return (distance > t).mean()
+
+    def _get_euclidean_coordinates_from_index(self, index):
+        """Returns the Euclidean coordinated of a neuron using its
+        index as the input"""
+        if index < 0:
+            return (-1, -1)
+        y = self._weights.shape[1]
+        coords = self.convert_map_to_euclidean((int(index/y), index % y))
+        return coords
 
     def win_map(self, data, return_indices=False):
         """Returns a dictionary wm where wm[(i,j)] is a list with:
@@ -730,13 +708,8 @@ class MiniSom(object):
           position (i,j) if return_indices=True"""
         self._check_input_len(data)
         winmap = defaultdict(list)
-        # --- ベクトル化による改善 ---
-        # 最初に全データの勝者を一括計算
-        winners = self._winners_from_weights(data)
-        data_to_append = arange(len(data)) if return_indices else data
-
-        for i, win_pos in enumerate(winners):
-            winmap[win_pos].append(data_to_append[i])
+        for i, x in enumerate(data):
+            winmap[self.winner(x)].append(i if return_indices else x)
         return winmap
 
     def labels_map(self, data, labels):
@@ -756,18 +729,8 @@ class MiniSom(object):
         if not len(data) == len(labels):
             raise ValueError('data and labels must have the same length.')
         winmap = defaultdict(list)
-        # --- ベクトル化による改善 ---
-        # 最初に全データの勝者を一括計算
-        winners = self._winners_from_weights(data)
-        for win_pos, label in zip(winners, labels):
-            winmap[win_pos].append(label)
-
+        for x, l in zip(data, labels):
+            winmap[self.winner(x)].append(l)
         for position in winmap:
             winmap[position] = Counter(winmap[position])
         return winmap
-        
-    def _winners_from_weights(self, data):
-        """Helper function to return the winner coordinates for all data points."""
-        distances = self._distance_from_weights(data)
-        winner_indices = argmin(distances, axis=1)
-        return [unravel_index(i, self._weights.shape[:2]) for i in winner_indices]
