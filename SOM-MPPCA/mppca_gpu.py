@@ -1,7 +1,7 @@
 # src/PressurePattern/SOM-MPPCA/mppca_gpu.py
 
-# NumPyの代わりにCuPyをインポート
 import cupy as cp
+from tqdm import tqdm # tqdmをインポート
 
 def initialization_kmeans_gpu(X, p, q, variance_level):
     """
@@ -27,12 +27,11 @@ def initialization_kmeans_gpu(X, p, q, variance_level):
     mu = X[init_centers, :]
     clusters = cp.zeros(N, dtype=cp.int32)
     
-    D_old = -2.0
-    D = -1.0
+    D_old = cp.array([-2.0]) # Dと比較するためにCuPy配列に
+    D = cp.array([-1.0])
 
-    while(D_old != D):
-        D_old = D
-
+    # K-meansの反復回数に上限を設ける（無限ループ防止）
+    for _ in range(100): 
         # 各データ点と各クラスタ中心との距離を計算 (ブロードキャストを利用)
         # (N, 1, d) - (1, p, d) -> (N, p, d) -> (N, p)
         distance_square = cp.power(X[:, None, :] - mu[None, :, :], 2).sum(axis=2)
@@ -41,17 +40,25 @@ def initialization_kmeans_gpu(X, p, q, variance_level):
         clusters = cp.argmin(distance_square, axis=1)
 
         # 歪み（distortion）を計算
-        D = cp.sum(distance_square[cp.arange(N), clusters])
+        D_new = cp.sum(distance_square[cp.arange(N), clusters])
+
+        # 収束判定
+        if cp.isclose(D_old, D_new):
+            break
+        D_old = D_new
 
         # 新しいクラスタ中心を計算
-        # bincountを使って各クラスタの合計と要素数を効率的に計算
-        sum_mu = cp.zeros((p, d))
-        # 各クラスタに属するデータ点のインデックスを使って合計を計算
-        # この部分はループを使う方がGPU上では効率的な場合がある
         for c in range(p):
             mask = (clusters == c)
             if cp.any(mask):
                 mu[c, :] = X[mask].mean(axis=0)
+            else:
+                # クラスタが空になった場合、最も遠い点を新しい中心とする
+                # この処理は省略しても良いが、安定性のため
+                dists = distance_square[cp.arange(N), clusters]
+                farthest_point_idx = cp.argmax(dists)
+                mu[c,:] = X[farthest_point_idx]
+
 
     # パラメータの初期化
     pi = cp.zeros(p)
@@ -64,15 +71,14 @@ def initialization_kmeans_gpu(X, p, q, variance_level):
 
     for c in range(p):
         if variance_level != -1.0:
-            W[c, :, :] = variance_level * cp.random.randn(d, q)
-            sigma2[c] = cp.abs((variance_level/10) * cp.random.randn())
+            W[c, :, :] = variance_level * cp.random.randn(d, q, dtype=X.dtype)
+            sigma2[c] = cp.abs((variance_level/10) * cp.random.randn(dtype=X.dtype))
         else:
-            W[c, :, :] = cp.random.randn(d, q)
+            W[c, :, :] = cp.random.randn(d, q, dtype=X.dtype)
             if cluster_counts[c] > 0:
-                # distminから該当クラスタの要素だけを抽出
                 sigma2[c] = cp.sum(distmin[clusters == c]) / (cluster_counts[c] * d)
             else:
-                sigma2[c] = 1.0  # 空クラスタの場合のデフォルト値
+                sigma2[c] = 1.0
 
         pi[c] = cluster_counts[c] / N
 
@@ -82,6 +88,7 @@ def initialization_kmeans_gpu(X, p, q, variance_level):
 def mppca_gem_gpu(X, pi, mu, W, sigma2, niter):
     """
     GPU (CuPy) を使用してMPPCAのGEMアルゴリズムを実行する。
+    進捗表示のためにtqdmを統合。
 
     X, pi, mu, W, sigma2: cupy.ndarray - GPU上の初期パラメータ
 
@@ -96,75 +103,71 @@ def mppca_gem_gpu(X, pi, mu, W, sigma2, niter):
     L = cp.zeros(niter)
 
     # eye（単位行列）を事前に作成
-    eye_q = cp.eye(q)
-    eye_d = cp.eye(d)
+    eye_q = cp.eye(q, dtype=X.dtype)
+    eye_d = cp.eye(d, dtype=X.dtype)
 
-    for i in range(niter):
+    # ★★★ 改善点: tqdmをループに適用 ★★★
+    iterator = tqdm(range(niter), desc="MPPCA Training (GPU)")
+    for i in iterator:
         sigma2hist[:, i] = sigma2
 
         # --- E-Step ---
-        # 行列計算をベクトル化してp次元に沿って一括処理
         M = sigma2[:, None, None] * eye_q + W.transpose(0, 2, 1) @ W
         Minv = cp.linalg.inv(M)
         
-        # C = W @ W.T + sigma2 * I
-        # Woodburyの公式より C_inv = (I - W @ Minv @ W.T) / sigma2
-        # log|C| = (d-q)log(sigma2) + log|M|
         log_det_C = (d - q) * cp.log(sigma2) + cp.linalg.slogdet(M)[1]
 
-        # 各データ点と各クラスタ中心との差分
-        # (N, 1, d) - (1, p, d) -> (N, p, d)
         X_minus_mu = X[:, None, :] - mu[None, :, :]
         
-        # (X-mu).T @ C_inv @ (X-mu) の計算
-        # C_invを直接計算するのはコストが高いので、式を展開して効率化
-        W_Minv = W @ Minv # (p, d, q)
-        W_Minv_WT = W_Minv @ W.transpose(0, 2, 1) # (p, d, d)
+        W_Minv = W @ Minv
+        W_Minv_WT = W_Minv @ W.transpose(0, 2, 1)
         
-        # (X-mu) @ (I - W_Minv_WT)/sigma2 @ (X-mu).T
-        # (p, N, d)
         X_minus_mu_p = X_minus_mu.transpose(1,0,2)
-        # (p, N, d) @ (p, d, d) -> (p, N, d)
         mahalanobis_term = cp.einsum('pni,pij,pnj->pn', X_minus_mu_p, (eye_d - W_Minv_WT), X_minus_mu_p) / sigma2[:,None]
 
-        # logRの計算
         logR = (cp.log(pi) - 0.5 * (d * cp.log(2 * cp.pi) + log_det_C + mahalanobis_term.T))
         
-        # log-sum-expトリックによる正規化
         myMax = cp.max(logR, axis=1, keepdims=True)
         log_sum_exp = myMax + cp.log(cp.sum(cp.exp(logR - myMax), axis=1, keepdims=True))
         
         L[i] = cp.sum(log_sum_exp)
         
-        R = cp.exp(logR - log_sum_exp) # 事後確率 R (N, p)
+        R = cp.exp(logR - log_sum_exp)
 
         # --- M-Step ---
-        R_sum = cp.sum(R, axis=0) # (p,)
+        R_sum = cp.sum(R, axis=0)
         
-        # pi の更新
+        # ゼロ除算を避けるための微小値
+        R_sum = cp.where(R_sum == 0, 1e-9, R_sum)
+        
         pi = R_sum / N
         
-        # mu の更新
-        # (p, N) @ (N, d) -> (p, d)
         mu = (R.T @ X) / R_sum[:, None]
         
-        # 再度中心との差分を計算
         X_minus_mu = X[:, None, :] - mu[None, :, :]
 
-        # Sの計算
-        # (p, N, d) * (N, p, 1) -> (p, N, d)
         S = X_minus_mu.transpose(1,0,2) * R.T[:, :, None]
         S = cp.einsum('pni,pnj->pij', S, X_minus_mu.transpose(1,0,2)) / R_sum[:, None, None]
 
-        # W_new の更新
-        # (p, d, d) @ (p, d, q) @ (p, q, q) -> (p, d, q)
-        W_new = S @ W @ cp.linalg.inv(sigma2[:, None, None] * eye_q + Minv @ W.transpose(0, 2, 1) @ S)
-        
-        # sigma2_new の更新
-        # (p, d, d) @ (p, d, q) @ (p, q, d) -> (p, d, d)
+        try:
+            inv_term = cp.linalg.inv(sigma2[:, None, None] * eye_q + Minv @ W.transpose(0, 2, 1) @ S)
+            W_new = S @ W @ inv_term
+        except cp.linalg.LinAlgError:
+            # 稀に発生する特異行列エラーへの対処
+            tqdm.write(f"Warning: Singular matrix in W_new update at iteration {i}. Using pseudo-inverse.")
+            inv_term = cp.linalg.pinv(sigma2[:, None, None] * eye_q + Minv @ W.transpose(0, 2, 1) @ S)
+            W_new = S @ W @ inv_term
+
         trace_term = cp.trace(W_new.transpose(0, 2, 1) @ S @ W @ Minv, axis1=1, axis2=2)
-        sigma2 = (1/d) * (cp.trace(S, axis1=1, axis2=2) - trace_term)
+        sigma2_new = (1/d) * (cp.trace(S, axis1=1, axis2=2) - trace_term)
+
+        # sigma2が負または非常に小さくなるのを防ぐ
+        sigma2 = cp.maximum(sigma2_new, 1e-9)
 
         W = W_new
+        
+        # tqdmの進捗バーに現在の対数尤度を表示
+        iterator.set_postfix(log_likelihood=f"{L[i].item():.2f}")
+
 
     return pi, mu, W, sigma2, R, L, sigma2hist
