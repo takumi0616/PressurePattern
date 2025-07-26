@@ -1,170 +1,278 @@
-# src/PressurePattern/SOM-MPPCA/mppca_gpu.py
+# src/PressurePattern/SOM-MPPCA/mppca.py
 
-# NumPyの代わりにCuPyをインポート
-import cupy as cp
+# Translation in python of the Matlab implementation of Mathieu Andreux and
+# Michel Blancard, of the algorithm described in
+# "Mixtures of Probabilistic Principal Component Analysers",
+# Michael E. Tipping and Christopher M. Bishop, Neural Computation 11(2),
+# pp 443–482, MIT Press, 1999
 
-def initialization_kmeans_gpu(X, p, q, variance_level):
+import numpy as np
+import numba
+
+# Numbaデコレータを追加して関数をJITコンパイルする
+# 注意: variance_levelを使用する場合、Noneではなく数値を渡してください
+@numba.jit(nopython=True)
+def initialization_kmeans(X, p, q, variance_level):
     """
-    GPU (CuPy) を使用してK-means法による初期化を行う。
+    X : dataset
+    p : number of clusters
+    q : dimension of the latent space
+    variance_level
 
-    X : cupy.ndarray - GPU上のデータセット
-    p : int - クラスタ数
-    q : int - 潜在空間の次元数
-    variance_level: float - 分散のレベル
-
-    戻り値:
-    pi, mu, W, sigma2, clusters - すべてcupy.ndarray
+    pi : proportions of clusters
+    mu : centers of the clusters in the observation space
+    W : latent to observation matricies
+    sigma2 : noise
     """
+
     N, d = X.shape
 
-    # 初期化
-    # CuPyの乱数生成器を使用
-    init_centers = cp.random.randint(0, N, p)
-    # uniqueな中心が選ばれるまで繰り返す
-    while (len(cp.unique(init_centers)) != p):
-        init_centers = cp.random.randint(0, N, p)
+    # initialization
+    # Numbaはnp.random.seedをサポートしていないため、外部で設定が必要
+    init_centers = np.random.randint(0, N, p)
+    # uniqueな中心が選ばれるまで繰り返すロジックは同じ
+    while (len(np.unique(init_centers)) != p):
+        init_centers = np.random.randint(0, N, p)
 
     mu = X[init_centers, :]
-    clusters = cp.zeros(N, dtype=cp.int32)
-    
+    distance_square = np.zeros((N, p))
+    clusters = np.zeros(N, dtype=np.int32)
+
     D_old = -2.0
     D = -1.0
 
     while(D_old != D):
         D_old = D
 
-        # 各データ点と各クラスタ中心との距離を計算 (ブロードキャストを利用)
-        # (N, 1, d) - (1, p, d) -> (N, p, d) -> (N, p)
-        distance_square = cp.power(X[:, None, :] - mu[None, :, :], 2).sum(axis=2)
-
-        # 各データ点が属するクラスタを決定
-        clusters = cp.argmin(distance_square, axis=1)
-
-        # 歪み（distortion）を計算
-        D = cp.sum(distance_square[cp.arange(N), clusters])
-
-        # 新しいクラスタ中心を計算
-        # bincountを使って各クラスタの合計と要素数を効率的に計算
-        sum_mu = cp.zeros((p, d))
-        # 各クラスタに属するデータ点のインデックスを使って合計を計算
-        # この部分はループを使う方がGPU上では効率的な場合がある
+        # assign clusters
         for c in range(p):
-            mask = (clusters == c)
-            if cp.any(mask):
-                mu[c, :] = X[mask].mean(axis=0)
+            # distance_square[:, c] = np.power(X - mu[c, :], 2).sum(1)
+            # 上記の処理をNumbaが最適化しやすいように明示的なループで記述
+            for i in range(N):
+                sum_sq = 0.0
+                for j in range(d):
+                    diff = X[i, j] - mu[c, j]
+                    sum_sq += diff * diff
+                distance_square[i, c] = sum_sq
 
-    # パラメータの初期化
-    pi = cp.zeros(p)
-    W = cp.zeros((p, d, q))
-    sigma2 = cp.zeros(p)
+        for i in range(N):
+            clusters[i] = np.argmin(distance_square[i,:])
 
-    # クラスタごとの統計量を計算
-    cluster_counts = cp.bincount(clusters, minlength=p)
-    distmin = distance_square[cp.arange(N), clusters]
+
+        # compute distortion
+        dist_sum = 0.0
+        for i in range(N):
+            dist_sum += distance_square[i, clusters[i]]
+        D = dist_sum
+        
+        distmin = np.zeros(N)
+        for i in range(N):
+            distmin[i] = distance_square[i, clusters[i]]
+
+        # compute new centers
+        # 元のコード `mu[c, :] = X[clusters == c, :].mean(0)` をNumbaフレンドリーに書き換え
+        sum_mu = np.zeros((p, d))
+        counts = np.zeros(p)
+        for i in range(N):
+            c_idx = clusters[i]
+            sum_mu[c_idx, :] += X[i, :]
+            counts[c_idx] += 1
+        
+        for c in range(p):
+            if counts[c] > 0:
+                mu[c, :] = sum_mu[c, :] / counts[c]
+            # 空のクラスタのケースは元のコードも未定義なため、ここでは何もしない
+
+    # parameter initialization
+    pi = np.zeros(p)
+    W = np.zeros((p, d, q))
+    sigma2 = np.zeros(p)
+
+    # 元の初期化ループをNumbaフレンドリーに書き換え
+    # まずクラスタごとの統計量を計算
+    cluster_counts = np.zeros(p)
+    distmin_sum = np.zeros(p)
+    for i in range(N):
+        c_idx = clusters[i]
+        cluster_counts[c_idx] += 1
+        distmin_sum[c_idx] += distmin[i]
 
     for c in range(p):
-        if variance_level != -1.0:
-            W[c, :, :] = variance_level * cp.random.randn(d, q)
-            sigma2[c] = cp.abs((variance_level/10) * cp.random.randn())
+        if variance_level != -1.0: # variance_levelが指定されているか（Noneの代わりに-1.0等で判定）
+            W[c, :, :] = variance_level * np.random.randn(d, q)
+            sigma2[c] = np.abs((variance_level/10) * np.random.randn())
         else:
-            W[c, :, :] = cp.random.randn(d, q)
+            W[c, :, :] = np.random.randn(d, q)
             if cluster_counts[c] > 0:
-                # distminから該当クラスタの要素だけを抽出
-                sigma2[c] = cp.sum(distmin[clusters == c]) / (cluster_counts[c] * d)
+                sigma2[c] = (distmin_sum[c] / cluster_counts[c]) / d
             else:
-                sigma2[c] = 1.0  # 空クラスタの場合のデフォルト値
+                sigma2[c] = 1.0 # 空クラスタの場合のデフォルト値
 
         pi[c] = cluster_counts[c] / N
 
     return pi, mu, W, sigma2, clusters
 
 
-def mppca_gem_gpu(X, pi, mu, W, sigma2, niter):
-    """
-    GPU (CuPy) を使用してMPPCAのGEMアルゴリズムを実行する。
-
-    X, pi, mu, W, sigma2: cupy.ndarray - GPU上の初期パラメータ
-
-    戻り値:
-    pi, mu, W, sigma2, R, L, sigma2hist - すべてcupy.ndarray
-    """
+# Numbaデコレータを追加. fastmath=Trueでさらに高速化
+@numba.jit(nopython=True, fastmath=True)
+def mppca_gem(X, pi, mu, W, sigma2, niter):
     N, d = X.shape
     p = len(sigma2)
     _, q = W[0].shape
 
-    sigma2hist = cp.zeros((p, niter))
-    L = cp.zeros(niter)
+    sigma2hist = np.zeros((p, niter))
+    M = np.zeros((p, q, q))
+    Minv = np.zeros((p, q, q))
+    # Cinvはサイズが大きいためループ内で生成
+    logR = np.zeros((N, p))
+    R = np.zeros((N, p))
 
-    # eye（単位行列）を事前に作成
-    eye_q = cp.eye(q)
-    eye_d = cp.eye(d)
-
+    L = np.zeros(niter)
+    # print文はNumbaのnopythonモードではサポートされないため削除
     for i in range(niter):
-        sigma2hist[:, i] = sigma2
+        for c in range(p):
+            sigma2hist[c, i] = sigma2[c]
 
-        # --- E-Step ---
-        # 行列計算をベクトル化してp次元に沿って一括処理
-        M = sigma2[:, None, None] * eye_q + W.transpose(0, 2, 1) @ W
-        Minv = cp.linalg.inv(M)
-        
-        # C = W @ W.T + sigma2 * I
-        # Woodburyの公式より C_inv = (I - W @ Minv @ W.T) / sigma2
-        # log|C| = (d-q)log(sigma2) + log|M|
-        log_det_C = (d - q) * cp.log(sigma2) + cp.linalg.slogdet(M)[1]
+            # M
+            M_c = sigma2[c]*np.eye(q) + W[c, :, :].T @ W[c, :, :]
+            M[c, :, :] = M_c
+            Minv[c, :, :] = np.linalg.inv(M_c)
 
-        # 各データ点と各クラスタ中心との差分
-        # (N, 1, d) - (1, p, d) -> (N, p, d)
-        X_minus_mu = X[:, None, :] - mu[None, :, :]
-        
-        # (X-mu).T @ C_inv @ (X-mu) の計算
-        # C_invを直接計算するのはコストが高いので、式を展開して効率化
-        W_Minv = W @ Minv # (p, d, q)
-        W_Minv_WT = W_Minv @ W.transpose(0, 2, 1) # (p, d, d)
-        
-        # (X-mu) @ (I - W_Minv_WT)/sigma2 @ (X-mu).T
-        # (p, N, d)
-        X_minus_mu_p = X_minus_mu.transpose(1,0,2)
-        # (p, N, d) @ (p, d, d) -> (p, N, d)
-        mahalanobis_term = cp.einsum('pni,pij,pnj->pn', X_minus_mu_p, (eye_d - W_Minv_WT), X_minus_mu_p) / sigma2[:,None]
+            # Cinv
+            W_c = W[c, :, :]
+            Minv_c = Minv[c, :, :]
+            Cinv_c = (np.eye(d) - W_c @ Minv_c @ W_c.T) / sigma2[c]
+            
+            # R_ni
+            # 改善点: np.log(np.linalg.det) を np.linalg.slogdet に変更
+            inner_mat = np.eye(d) - W_c @ Minv_c @ W_c.T
+            sign, logdet = np.linalg.slogdet(inner_mat)
+            log_det_term = logdet # signは+1と仮定
 
-        # logRの計算
-        logR = (cp.log(pi) - 0.5 * (d * cp.log(2 * cp.pi) + log_det_C + mahalanobis_term.T))
-        
-        # log-sum-expトリックによる正規化
-        myMax = cp.max(logR, axis=1, keepdims=True)
-        log_sum_exp = myMax + cp.log(cp.sum(cp.exp(logR - myMax), axis=1, keepdims=True))
-        
-        L[i] = cp.sum(log_sum_exp)
-        
-        R = cp.exp(logR - log_sum_exp) # 事後確率 R (N, p)
+            deviation_from_center = X - mu[c, :]
+            
+            # (dev * (dev @ Cinv.T)).sum(1) を効率的に計算
+            quad_term = np.zeros(N)
+            for k in range(N):
+                quad_term[k] = deviation_from_center[k,:] @ Cinv_c @ deviation_from_center[k,:].T
 
-        # --- M-Step ---
-        R_sum = cp.sum(R, axis=0) # (p,)
-        
-        # pi の更新
-        pi = R_sum / N
-        
-        # mu の更新
-        # (p, N) @ (N, d) -> (p, d)
-        mu = (R.T @ X) / R_sum[:, None]
-        
-        # 再度中心との差分を計算
-        X_minus_mu = X[:, None, :] - mu[None, :, :]
+            logR[:, c] = ( np.log(pi[c])
+                + 0.5 * log_det_term
+                - 0.5 * d * np.log(sigma2[c])
+                - 0.5 * quad_term
+                )
 
-        # Sの計算
-        # (p, N, d) * (N, p, 1) -> (p, N, d)
-        S = X_minus_mu.transpose(1,0,2) * R.T[:, :, None]
-        S = cp.einsum('pni,pnj->pij', S, X_minus_mu.transpose(1,0,2)) / R_sum[:, None, None]
-
-        # W_new の更新
-        # (p, d, d) @ (p, d, q) @ (p, q, q) -> (p, d, q)
-        W_new = S @ W @ cp.linalg.inv(sigma2[:, None, None] * eye_q + Minv @ W.transpose(0, 2, 1) @ S)
+        # myMaxの計算とlog-sum-expトリック
+        myMax = np.zeros(N)
+        for k in range(N):
+            myMax[k] = np.max(logR[k, :])
         
-        # sigma2_new の更新
-        # (p, d, d) @ (p, d, q) @ (p, q, d) -> (p, d, d)
-        trace_term = cp.trace(W_new.transpose(0, 2, 1) @ S @ W @ Minv, axis1=1, axis2=2)
-        sigma2 = (1/d) * (cp.trace(S, axis1=1, axis2=2) - trace_term)
+        log_sum_exp = np.zeros(N)
+        for k in range(N):
+            log_sum_exp[k] = myMax[k] + np.log(np.sum(np.exp(logR[k, :] - myMax[k])))
+        
+        L[i] = np.sum(log_sum_exp) - N*d*np.log(2*3.141593)/2.
+        
+        # logRの正規化
+        for k in range(N):
+            logR[k, :] = logR[k, :] - log_sum_exp[k]
+        
+        # piの更新
+        log_pi_sum_exp = np.zeros(p)
+        myMax_pi = np.zeros(p)
+        for c in range(p):
+            myMax_pi[c] = np.max(logR[:, c])
 
-        W = W_new
+        for c in range(p):
+            sum_val = 0.0
+            for k in range(N):
+                sum_val += np.exp(logR[k, c] - myMax_pi[c])
+            log_pi_sum_exp[c] = np.log(sum_val)
+
+        logpi = myMax_pi + log_pi_sum_exp - np.log(N)
+        pi = np.exp(logpi)
+        R = np.exp(logR)
+        
+        for c in range(p):
+            R_c_sum = np.sum(R[:, c])
+            if R_c_sum == 0: continue # ゼロ除算を避ける
+
+            # ★★★ エラー修正箇所 1 ★★★
+            # R[:, c]は非連続な配列(ビュー)なので、.copy()で連続な配列に変換してからreshapeする
+            R_col_reshaped = R[:, c].copy().reshape(N, 1)
+
+            mu[c, :] = (R_col_reshaped * X).sum(axis=0) / R_c_sum
+            
+            deviation_from_center = X - mu[c, :].reshape(1, d)
+            
+            # ★★★ エラー修正箇所 2 ★★★
+            # ここでも同様に.copy()を追加
+            SW_numerator = (R[:, c].copy().reshape(N, 1) * deviation_from_center).T @ (deviation_from_center @ W[c,:,:])
+            SW = (1 / (pi[c]*N)) * SW_numerator
+            
+            Wnew = SW @ np.linalg.inv(sigma2[c]*np.eye(q) + Minv[c, :, :] @ W[c, :, :].T @ SW)
+            
+            # ★★★ エラー修正箇所 3 ★★★
+            # ここでも同様に.copy()を追加
+            term1_num = np.sum(R[:, c].copy().reshape(N, 1) * np.power(deviation_from_center, 2))
+            sigma2[c] = (1/d) * ( term1_num / (N*pi[c]) - np.trace(SW @ Minv[c, :, :] @ Wnew.T))
+
+            W[c, :, :] = Wnew
 
     return pi, mu, W, sigma2, R, L, sigma2hist
+
+
+# Numbaデコレータを追加
+@numba.jit(nopython=True, fastmath=True)
+def mppca_predict(X, pi, mu, W, sigma2):
+    N, d = X.shape
+    p = len(sigma2)
+    _, q = W[0].shape
+
+    M = np.zeros((p, q, q))
+    Minv = np.zeros((p, q, q))
+    logR = np.zeros((N, p))
+    R = np.zeros((N, p))
+
+    for c in range(p):
+        # M
+        M_c = sigma2[c] * np.eye(q) + W[c, :, :].T @ W[c, :, :]
+        Minv_c = np.linalg.inv(M_c)
+
+        # Cinv
+        W_c = W[c, :, :]
+        Cinv_c = (np.eye(d) - W_c @ Minv_c @ W_c.T) / sigma2[c]
+
+        # R_ni
+        # 改善点: np.log(np.linalg.det) を np.linalg.slogdet に変更
+        inner_mat = np.eye(d) - W_c @ Minv_c @ W_c.T
+        sign, logdet = np.linalg.slogdet(inner_mat)
+        log_det_term = logdet # signは+1と仮定
+        
+        deviation_from_center = X - mu[c, :]
+        
+        quad_term = np.zeros(N)
+        for k in range(N):
+            quad_term[k] = deviation_from_center[k,:] @ Cinv_c @ deviation_from_center[k,:].T
+
+        logR[:, c] = ( np.log(pi[c])
+            + 0.5 * log_det_term
+            - 0.5*d*np.log(sigma2[c])
+            - 0.5 * quad_term
+            )
+
+    # log-sum-expトリックによる正規化
+    myMax = np.zeros(N)
+    for k in range(N):
+        myMax[k] = np.max(logR[k, :])
+
+    log_sum_exp = np.zeros(N)
+    for k in range(N):
+        log_sum_exp[k] = myMax[k] + np.log(np.sum(np.exp(logR[k, :] - myMax[k])))
+
+    for k in range(N):
+        logR[k, :] = logR[k, :] - log_sum_exp[k]
+        
+    R = np.exp(logR)
+
+    return R
