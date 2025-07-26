@@ -6,6 +6,7 @@ from numpy import (array, unravel_index, nditer, linalg, random, subtract, max,
 from numpy.linalg import norm
 from collections import defaultdict, Counter
 from warnings import warn
+import warnings
 from sys import stdout
 from time import time
 from datetime import timedelta
@@ -272,7 +273,8 @@ class MiniSom(object):
 
     def winner(self, x):
         self._activate(x)
-        return unravel_index(nanargmin(self._activation_map),
+        # 修正点: 2次元の activation_map を .flatten() で1次元配列に変換する
+        return unravel_index(nanargmin(self._activation_map.flatten()),
                              self._activation_map.shape)
 
     def update(self, x, win, t, max_iteration):
@@ -284,7 +286,8 @@ class MiniSom(object):
 
     def quantization(self, data):
         self._check_input_len(data)
-        winners_coords = nanargmin(self._distance_from_weights(data), axis=1)
+        # 修正点: nanargmin を NumPy の argmin に変更
+        winners_coords = argmin(self._distance_from_weights(data), axis=1)
         return self._weights[unravel_index(winners_coords,
                                            self._weights.shape[:2])]
 
@@ -431,7 +434,8 @@ class MiniSom(object):
     def _winners_from_weights(self, data):
         """Helper function to return the winner coordinates for all data points."""
         distances = self._distance_from_weights(data)
-        winner_indices = nanargmin(distances, axis=1)
+        # 修正点: nanargmin を NumPy の argmin に変更
+        winner_indices = argmin(distances, axis=1)
         return [unravel_index(i, self._weights.shape[:2]) for i in winner_indices]
 
 # nanを無視するargminとnanmaxをJIT化

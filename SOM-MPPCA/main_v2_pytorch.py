@@ -113,6 +113,7 @@ def load_and_preprocess_data(filepath, start_date='1991-01-01', end_date='2000-1
     try:
         with xr.open_dataset(filepath, engine='netcdf4') as ds:
             ds_labeled = ds.sel(valid_time=slice(start_date, end_date))
+            # ★★★ データ読み込み時点でfloat64に統一 ★★★
             msl_data = ds_labeled['msl'].values.astype(np.float64)
             labels = ds_labeled['label'].values.astype(str)
             lat = ds_labeled['latitude'].values
@@ -136,7 +137,8 @@ def load_and_preprocess_data(filepath, start_date='1991-01-01', end_date='2000-1
     data_normalized = (data_reshaped - data_mean) / data_std
     end_time = time.time()
     logging.info(f"データ前処理完了。所要時間: {format_duration(end_time - start_time)}")
-    return data_normalized, labels, lat, lon, data_mean, data_std
+    # 全てfloat64で返すようにする
+    return data_normalized.astype(np.float64), labels, lat, lon, data_mean.astype(np.float64), data_std.astype(np.float64)
 
 # --- 4. モデル実行関数 ---
 
@@ -146,11 +148,11 @@ def run_mppca_pytorch(data_np, p, q, niter):
     logging.info(f"パラメータ: クラスター数(p)={p}, 潜在次元(q)={q}, 反復回数(niter)={niter}")
     start_time = time.time()
 
-    data_t = torch.from_numpy(data_np.astype(np.float32))
+    # ★★★ 修正点 1: PyTorchテンソルにfloat64で変換 ★★★
+    data_t = torch.from_numpy(data_np.astype(np.float64))
 
     logging.info(f"K-meansによる初期化を実行中 ({DEVICE})...")
     
-    # ★★★ 修正点 1: variance_level引数を削除し、デフォルトの挙動に任せる ★★★
     pi_t, mu_t, W_t, sigma2_t, _ = initialization_kmeans_torch(
         data_t, p, q, device=DEVICE
     )
@@ -174,7 +176,6 @@ def run_mppca_pytorch(data_np, p, q, niter):
     logging.info("結果をGPUからCPUに転送し、NumPy配列に変換中...")
     L_cpu = L_t.cpu().numpy()
     if L_cpu is not None and len(L_cpu) > 0:
-        # nanチェックを追加
         final_log_likelihood = L_cpu[-1]
         if np.isnan(final_log_likelihood):
             logging.warning("最終的な対数尤度が'nan'です。モデルが正しく収束しなかった可能性があります。")
@@ -191,6 +192,7 @@ def run_mppca_pytorch(data_np, p, q, niter):
         pickle.dump(mppca_results, f)
     logging.info(f"MPPCAのモデルと結果を '{result_path}' に保存しました。")
     
+    # NumPy配列に変換して返す（この時点でfloat64）
     return R_t.cpu().numpy()
 
 def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
@@ -205,10 +207,8 @@ def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
                   topology=TOPOLOGY_SOM, activation_distance=ACTIVATION_DISTANCE_SOM,
                   random_seed=seed)
     
-    # nanが含まれている場合、ランダムな重み初期化がnanになるのを防ぐ
     if np.isnan(data).any():
         logging.warning("SOMへの入力データにnanが含まれています。SOMの重み初期化と学習に影響する可能性があります。")
-        # nanを0で補完して初期化（PCA初期化はnanがあると失敗するためランダム初期化を安全に実行）
         som.random_weights_init(np.nan_to_num(data))
     else:
         som.random_weights_init(data)
@@ -261,7 +261,7 @@ def evaluate_classification(som, mppca_posterior, original_labels):
     logging.info(f"クラスごとの再現率:\n{recall_scores_str}")
     return macro_recall, node_dominant_label
 
-# --- 6. 可視化関数 (一部保存ファイル名変更、他は変更なし) ---
+# --- 6. 可視化関数 (変更なし) ---
 def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std):
     logging.info("結果の可視化を開始します...")
     start_time = time.time()
@@ -272,7 +272,6 @@ def visualize_results(som, mppca_posterior, original_data, labels, node_dominant
         
     map_x, map_y = som.get_weights().shape[:2]
     
-    # 各種マップの描画と保存 (ファイル名に_pytorchを追加)
     plt.figure(figsize=(10, 10)); plt.pcolor(som.distance_map().T, cmap='bone_r'); plt.colorbar(label='ニューロン間の距離'); plt.title('U-Matrix'); plt.grid(True); plt.savefig(os.path.join(OUTPUT_DIR, 'u_matrix_pytorch.png'), dpi=300); plt.close()
     logging.info("U-Matrixを保存しました。")
     
@@ -329,9 +328,6 @@ def main():
     # 1: データ読み込みと前処理
     data_normalized, labels, lat, lon, data_mean, data_std = load_and_preprocess_data(DATA_FILE_PATH)
     
-    # SOMで利用するため、逆標準化前のデータを保持
-    data_reshaped_original = (data_normalized * data_std) + data_mean
-
     # 2: MPPCAの実行 (PyTorch)
     mppca_posterior = run_mppca_pytorch(data_normalized, P_CLUSTERS, Q_LATENT_DIM, N_ITER_MPPCA)
 
@@ -342,7 +338,8 @@ def main():
     _, node_dominant_label = evaluate_classification(som, mppca_posterior, labels)
     
     # 5: 可視化
-    visualize_results(som, mppca_posterior, data_reshaped_original, labels, node_dominant_label, lat, lon, data_mean, data_std)
+    # 元データを渡す必要があるので、逆標準化は可視化関数内で行う
+    visualize_results(som, mppca_posterior, data_normalized, labels, node_dominant_label, lat, lon, data_mean, data_std)
     
     main_end_time = time.time()
     logging.info("======= すべての処理が完了しました =======")

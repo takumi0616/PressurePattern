@@ -9,6 +9,8 @@
 
 import torch
 import math
+from tqdm import tqdm
+
 
 def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
     """
@@ -59,9 +61,10 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
                 mu[c] = cluster_points.mean(0)
 
     # Initialize MPPCA parameters based on k-means results
-    pi = torch.zeros(p, device=device)
-    W = torch.zeros((p, d, q), device=device)
-    sigma2 = torch.zeros(p, device=device)
+    # ★★★ 修正点 2: テンソル生成時にdtypeを入力データ(X)に合わせる ★★★
+    pi = torch.zeros(p, device=device, dtype=X.dtype)
+    W = torch.zeros((p, d, q), device=device, dtype=X.dtype)
+    sigma2 = torch.zeros(p, device=device, dtype=X.dtype)
 
     for c in range(p):
         cluster_mask = (clusters == c)
@@ -69,20 +72,19 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
         
         if num_points == 0:
             # Handle empty clusters if they occur
-            pi[c] = 1e-9 # small probability
-            W[c, :, :] = torch.randn(d, q, device=device) * (variance_level if variance_level is not None else 0.1)
-            sigma2[c] = torch.tensor(variance_level if variance_level is not None else 1.0, device=device)
+            pi[c] = 1e-9
+            W[c, :, :] = torch.randn(d, q, device=device, dtype=X.dtype) * (variance_level if variance_level is not None else 0.1)
+            sigma2[c] = torch.tensor(variance_level if variance_level is not None else 1.0, device=device, dtype=X.dtype)
             continue
 
         pi[c] = num_points / N
 
         if variance_level is not None:
-            W[c, :, :] = variance_level * torch.randn(d, q, device=device)
-            sigma2[c] = torch.abs((variance_level / 10) * torch.randn(1, device=device))
+            W[c, :, :] = variance_level * torch.randn(d, q, device=device, dtype=X.dtype)
+            sigma2[c] = torch.abs((variance_level / 10) * torch.randn(1, device=device, dtype=X.dtype))
         else:
-            W[c, :, :] = torch.randn(d, q, device=device)
-            # Initialize sigma2 as the mean variance of the data in the cluster
-            sigma2[c] = (distmin[cluster_mask].mean() / d) + 1e-6 # 微小な値を加えてゼロになるのを防ぐ
+            W[c, :, :] = torch.randn(d, q, device=device, dtype=X.dtype)
+            sigma2[c] = (distmin[cluster_mask].mean() / d) + 1e-6
 
     return pi, mu, W, sigma2, clusters
 
@@ -90,43 +92,31 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
 def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
     """
     Performs the Generalized Expectation-Maximization (GEM) algorithm for MPPCA.
-
-    Args:
-        X (torch.Tensor): The dataset of shape (N, d).
-        pi, mu, W, sigma2: Initial parameters from initialization.
-        niter (int): Number of iterations.
-        batch_size (int): Size of minibatches for processing large datasets.
-        device (str): The device to run computations on ('cpu' or 'cuda').
-
-    Returns:
-        tuple: (pi, mu, W, sigma2, R, L, sigma2hist)
-            - pi, mu, W, sigma2: The trained model parameters.
-            - R (torch.Tensor): Final responsibility matrix, shape (N, p).
-            - L (torch.Tensor): Log-likelihood history, shape (niter,).
-            - sigma2hist (torch.Tensor): History of sigma2 values, shape (p, niter).
     """
     N, d = X.shape
     p, _, q = W.shape
     
-    # ★★★ 修正点 2: ゼロ除算防止のための微小値 ★★★
     epsilon = 1e-9
 
     # Move all parameters to the specified device
-    X = X.to(device)
-    pi, mu, W, sigma2 = pi.to(device), mu.to(device), W.to(device), sigma2.to(device)
+    # ★★★ 修正点 3: 渡されたパラメータもdtypeを統一 ★★★
+    X = X.to(device, dtype=torch.float64)
+    pi = pi.to(device, dtype=torch.float64)
+    mu = mu.to(device, dtype=torch.float64)
+    W = W.to(device, dtype=torch.float64)
+    sigma2 = sigma2.to(device, dtype=torch.float64)
 
-    sigma2hist = torch.zeros((p, niter), device=device)
-    L = torch.zeros(niter, device=device)
-    I_q = torch.eye(q, device=device)
+    # ★★★ 修正点 4: 内部で生成するテンソルもdtypeを統一 ★★★
+    sigma2hist = torch.zeros((p, niter), device=device, dtype=X.dtype)
+    L = torch.zeros(niter, device=device, dtype=X.dtype)
+    I_q = torch.eye(q, device=device, dtype=X.dtype)
 
-    # tqdmで進捗表示
     pbar = tqdm(range(niter), desc="GEM Algorithm Progress")
     for i in pbar:
-        # print('.', end='') # tqdmを使うのでコメントアウト
         sigma2hist[:, i] = sigma2
 
         # --- E-step (Expectation) ---
-        logR = torch.zeros((N, p), device=device)
+        logR = torch.zeros((N, p), device=device, dtype=X.dtype)
         
         W_T = W.transpose(-2, -1)
         M = sigma2.view(p, 1, 1) * I_q + torch.bmm(W_T, W)
@@ -134,8 +124,7 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         try:
             M_inv = torch.linalg.inv(M)
         except torch.linalg.LinAlgError:
-            # 逆行列が計算できない場合、対角に微小値を加えて正則化
-            M_inv = torch.linalg.inv(M + torch.eye(q, device=device) * epsilon)
+            M_inv = torch.linalg.inv(M + torch.eye(q, device=device, dtype=X.dtype) * epsilon)
 
         log_det_C_inv_half = 0.5 * (torch.linalg.slogdet(M_inv).logabsdet - d * torch.log(sigma2) + q * torch.log(sigma2))
 
@@ -159,9 +148,8 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
 
         # Log-likelihood calculation
         myMax = torch.max(logR, axis=1, keepdim=True).values
-        # nan/infチェック
         if torch.isinf(myMax).any() or torch.isnan(myMax).any():
-             L[i] = torch.tensor(float('nan'))
+             L[i] = torch.tensor(float('nan'), dtype=X.dtype)
         else:
             logR_stable = logR - myMax
             L[i] = (myMax.squeeze() + torch.log(torch.exp(logR_stable).sum(axis=1) + epsilon)).sum()
@@ -172,10 +160,8 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         # Normalize logR to get R (posterior probabilities)
         logR -= (myMax + torch.log(torch.exp(logR - myMax).sum(axis=1, keepdim=True) + epsilon))
         R = torch.exp(logR)
-        # nanやinfが発生した場合、処理を中断
         if torch.isnan(R).any() or torch.isinf(R).any():
             print("\nWarning: Responsibilities contain nan/inf. Stopping training.")
-            # 残りのLをnanで埋める
             L[i:] = float('nan')
             break
             
@@ -186,12 +172,12 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         # Update pi
         pi = R_sum / N
 
-        # Update mu (using einsum for weighted average)
+        # Update mu
         mu = torch.einsum('np,nd->pd', R, X) / R_sum_stable.unsqueeze(1)
 
         # Update W and sigma2
-        S_W_numerator = torch.zeros((p, d, q), device=device)
-        term2_numerator = torch.zeros(p, device=device)
+        S_W_numerator = torch.zeros((p, d, q), device=device, dtype=X.dtype)
+        term2_numerator = torch.zeros(p, device=device, dtype=X.dtype)
         
         for batch_start in range(0, N, batch_size):
             batch_end = min(batch_start + batch_size, N)
@@ -212,7 +198,7 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
             inner_term = sigma2.view(p, 1, 1) * I_q + torch.bmm(torch.bmm(M_inv, W_T), S_W)
             inner_inv = torch.linalg.inv(inner_term)
         except torch.linalg.LinAlgError:
-            inner_term_regularized = inner_term + torch.eye(q, device=device) * epsilon
+            inner_term_regularized = inner_term + torch.eye(q, device=device, dtype=X.dtype) * epsilon
             inner_inv = torch.linalg.inv(inner_term_regularized)
             
         W_new = torch.bmm(S_W, inner_inv)
@@ -225,5 +211,7 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         
         W = W_new
 
+    pbar.close()
+    
     print("\nDone.")
     return pi, mu, W, sigma2, R, L, sigma2hist
