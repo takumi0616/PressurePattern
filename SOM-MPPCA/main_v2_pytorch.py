@@ -79,7 +79,7 @@ DATA_FILE_PATH = './prmsl_era5_all_data_seasonal_small.nc'
 P_CLUSTERS = 100
 Q_LATENT_DIM = 2
 N_ITER_MPPCA = 10 # テスト時は短く、本番では長く設定 (例: 100)
-MPPCA_BATCH_SIZE = 1024  # ★★★ MPPCA用のバッチサイズを追加 ★★★
+MPPCA_BATCH_SIZE = 1024
 
 
 # MiniSom
@@ -146,18 +146,17 @@ def run_mppca_pytorch(data_np, p, q, niter):
     logging.info(f"パラメータ: クラスター数(p)={p}, 潜在次元(q)={q}, 反復回数(niter)={niter}")
     start_time = time.time()
 
-    # [修正点 1] NumPy配列をPyTorchテンソルに変換
     data_t = torch.from_numpy(data_np.astype(np.float32))
 
     logging.info(f"K-meansによる初期化を実行中 ({DEVICE})...")
-    # [修正点 2] PyTorchテンソルを関数に渡す
+    
+    # ★★★ 修正点 1: variance_level引数を削除し、デフォルトの挙動に任せる ★★★
     pi_t, mu_t, W_t, sigma2_t, _ = initialization_kmeans_torch(
-        data_t, p, q, variance_level=-1.0, device=DEVICE
+        data_t, p, q, device=DEVICE
     )
     logging.info("K-means初期化完了。")
 
     logging.info(f"GEMアルゴリズムによる訓練を実行中 ({DEVICE})...")
-    # [修正点 3] 初期パラメータをテンソルのまま渡し、引数を正しく指定
     pi_t, mu_t, W_t, sigma2_t, R_t, L_t, _ = mppca_gem_torch(
         X=data_t,
         pi=pi_t, 
@@ -165,18 +164,22 @@ def run_mppca_pytorch(data_np, p, q, niter):
         W=W_t, 
         sigma2=sigma2_t,
         niter=niter,
-        batch_size=MPPCA_BATCH_SIZE, # グローバル設定で定義したバッチサイズを使用
+        batch_size=MPPCA_BATCH_SIZE,
         device=DEVICE
     )
 
     end_time = time.time()
     logging.info(f"MPPCA訓練完了。所要時間: {format_duration(end_time - start_time)}")
     
-    # 後続の処理 (SOM) はNumPyを期待するため、CPUに戻してNumPy配列に変換
     logging.info("結果をGPUからCPUに転送し、NumPy配列に変換中...")
     L_cpu = L_t.cpu().numpy()
     if L_cpu is not None and len(L_cpu) > 0:
-        logging.info(f"最終的な対数尤度: {L_cpu[-1]:.4f}")
+        # nanチェックを追加
+        final_log_likelihood = L_cpu[-1]
+        if np.isnan(final_log_likelihood):
+            logging.warning("最終的な対数尤度が'nan'です。モデルが正しく収束しなかった可能性があります。")
+        else:
+            logging.info(f"最終的な対数尤度: {final_log_likelihood:.4f}")
 
     mppca_results = {
         'pi': pi_t.cpu().numpy(), 'mu': mu_t.cpu().numpy(), 'W': W_t.cpu().numpy(),
@@ -201,11 +204,16 @@ def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
                   neighborhood_function=NEIGHBORHOOD_FUNCTION_SOM,
                   topology=TOPOLOGY_SOM, activation_distance=ACTIVATION_DISTANCE_SOM,
                   random_seed=seed)
-    som.random_weights_init(data)
     
+    # nanが含まれている場合、ランダムな重み初期化がnanになるのを防ぐ
+    if np.isnan(data).any():
+        logging.warning("SOMへの入力データにnanが含まれています。SOMの重み初期化と学習に影響する可能性があります。")
+        # nanを0で補完して初期化（PCA初期化はnanがあると失敗するためランダム初期化を安全に実行）
+        som.random_weights_init(np.nan_to_num(data))
+    else:
+        som.random_weights_init(data)
+
     logging.info("SOM訓練中 (進捗表示あり)...")
-    # minisom.pyのtrainはtqdmを内部で使っていない場合、verbose=Trueで進捗表示
-    # main_v1.pyの実装に合わせる
     som.train(data, n_iter, verbose=True, random_order=True)
     
     end_time = time.time()
@@ -222,6 +230,11 @@ def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
 def evaluate_classification(som, mppca_posterior, original_labels):
     logging.info("分類性能の評価を開始します (マクロ平均再現率)...")
     start_time = time.time()
+    
+    if np.isnan(mppca_posterior).any():
+        logging.error("MPPCAの事後確率にnanが含まれているため、評価をスキップします。")
+        return 0.0, {}
+
     parsed_true_labels = [parse_label(l) for l in original_labels]
     mlb = MultiLabelBinarizer(classes=BASE_LABELS)
     y_true = mlb.fit_transform(parsed_true_labels)
@@ -252,6 +265,11 @@ def evaluate_classification(som, mppca_posterior, original_labels):
 def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std):
     logging.info("結果の可視化を開始します...")
     start_time = time.time()
+    
+    if np.isnan(mppca_posterior).any():
+        logging.error("MPPCAの事後確率にnanが含まれているため、可視化をスキップします。")
+        return
+        
     map_x, map_y = som.get_weights().shape[:2]
     
     # 各種マップの描画と保存 (ファイル名に_pytorchを追加)
@@ -312,10 +330,9 @@ def main():
     data_normalized, labels, lat, lon, data_mean, data_std = load_and_preprocess_data(DATA_FILE_PATH)
     
     # SOMで利用するため、逆標準化前のデータを保持
-    data_reshaped_original = data_normalized * data_std + data_mean
+    data_reshaped_original = (data_normalized * data_std) + data_mean
 
     # 2: MPPCAの実行 (PyTorch)
-    # NumPy配列を渡して、NumPy配列を受け取る
     mppca_posterior = run_mppca_pytorch(data_normalized, P_CLUSTERS, Q_LATENT_DIM, N_ITER_MPPCA)
 
     # 3: SOMの実行 (CPU, NumPy)

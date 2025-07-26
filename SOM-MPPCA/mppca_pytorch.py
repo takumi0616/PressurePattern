@@ -33,7 +33,7 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
     X = X.to(device)
 
     # Randomly select initial cluster centers without replacement
-    indices = torch.randperm(N)[:p]
+    indices = torch.randperm(N, device=device)[:p]
     mu = X[indices]
 
     clusters = torch.zeros(N, dtype=torch.long, device=device)
@@ -49,7 +49,7 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
         clusters = torch.argmin(distance_square, axis=1)
 
         # Compute distortion (sum of squared distances to the assigned center)
-        distmin = distance_square[torch.arange(N), clusters]
+        distmin = distance_square[torch.arange(N, device=device), clusters]
         D = distmin.sum().item()
 
         # Update centers to be the mean of the points in each cluster
@@ -70,13 +70,13 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
         if num_points == 0:
             # Handle empty clusters if they occur
             pi[c] = 1e-9 # small probability
-            W[c, :, :] = torch.randn(d, q, device=device) * (variance_level if variance_level else 0.1)
-            sigma2[c] = torch.tensor(variance_level if variance_level else 1.0, device=device)
+            W[c, :, :] = torch.randn(d, q, device=device) * (variance_level if variance_level is not None else 0.1)
+            sigma2[c] = torch.tensor(variance_level if variance_level is not None else 1.0, device=device)
             continue
 
         pi[c] = num_points / N
 
-        if variance_level:
+        if variance_level is not None:
             W[c, :, :] = variance_level * torch.randn(d, q, device=device)
             sigma2[c] = torch.abs((variance_level / 10) * torch.randn(1, device=device))
         else:
@@ -107,6 +107,9 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
     """
     N, d = X.shape
     p, _, q = W.shape
+    
+    # ★★★ 修正点 2: ゼロ除算防止のための微小値 ★★★
+    epsilon = 1e-9
 
     # Move all parameters to the specified device
     X = X.to(device)
@@ -114,71 +117,79 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
 
     sigma2hist = torch.zeros((p, niter), device=device)
     L = torch.zeros(niter, device=device)
-    I_d = torch.eye(d, device=device)
     I_q = torch.eye(q, device=device)
 
-    for i in range(niter):
-        print('.', end='')
+    # tqdmで進捗表示
+    pbar = tqdm(range(niter), desc="GEM Algorithm Progress")
+    for i in pbar:
+        # print('.', end='') # tqdmを使うのでコメントアウト
         sigma2hist[:, i] = sigma2
 
         # --- E-step (Expectation) ---
-        # This step is batched to handle large N without memory overflow
         logR = torch.zeros((N, p), device=device)
         
-        # Precompute values that are constant for all batches
         W_T = W.transpose(-2, -1)
         M = sigma2.view(p, 1, 1) * I_q + torch.bmm(W_T, W)
-        M_inv = torch.linalg.inv(M)
         
-        # Use slogdet for numerical stability: log(det(C)) = log(det(sigma2*I_d - W M_inv W_T))
-        # This simplifies to: d*log(sigma2) + log(det(M_inv)) + log(det(sigma2*I_q))
-        # log |C_c|^{-1/2} = -0.5 * (d * log(sigma2_c) + logdet(M_c) - q*log(sigma2_c))
-        # Using C_c^{-1} = (I - W_c M_c^{-1} W_c^T) / sigma2_c
+        try:
+            M_inv = torch.linalg.inv(M)
+        except torch.linalg.LinAlgError:
+            # 逆行列が計算できない場合、対角に微小値を加えて正則化
+            M_inv = torch.linalg.inv(M + torch.eye(q, device=device) * epsilon)
+
         log_det_C_inv_half = 0.5 * (torch.linalg.slogdet(M_inv).logabsdet - d * torch.log(sigma2) + q * torch.log(sigma2))
 
         for batch_start in range(0, N, batch_size):
             batch_end = min(batch_start + batch_size, N)
             X_batch = X[batch_start:batch_end]
             
-            deviation = X_batch.unsqueeze(0) - mu.unsqueeze(1)  # Shape: (p, batch_N, d)
+            deviation = X_batch.unsqueeze(0) - mu.unsqueeze(1)
             
-            # Efficiently compute the quadratic form for all p clusters at once
-            # (x-mu)^T C_inv (x-mu) using einsum
-            # C_inv = (I - W M_inv W_T) / sigma2
             M_inv_W_T = torch.bmm(M_inv, W_T)
-            temp = torch.bmm(deviation, W) # Shape: (p, batch_N, q)
-            temp = torch.bmm(temp, M_inv_W_T) # Shape: (p, batch_N, d)
+            temp = torch.bmm(deviation, W)
+            temp = torch.bmm(temp, M_inv_W_T)
             
-            # quadratic_form = sum over d of (deviation * (deviation @ C_inv)) / sigma2
             quadratic_form = (torch.sum(deviation**2, dim=-1) - torch.sum(deviation * temp, dim=-1)) / sigma2.view(p, 1)
 
-            # Calculate log-responsibilities for the batch
             logR[batch_start:batch_end, :] = (
                 torch.log(pi)
                 + log_det_C_inv_half
                 - 0.5 * quadratic_form.T
             )
 
-        # Log-likelihood calculation (log-sum-exp trick for numerical stability)
+        # Log-likelihood calculation
         myMax = torch.max(logR, axis=1, keepdim=True).values
-        L[i] = (myMax.squeeze() + torch.log(torch.exp(logR - myMax).sum(axis=1))).sum()
-        L[i] -= N * d * math.log(2 * math.pi) / 2.
+        # nan/infチェック
+        if torch.isinf(myMax).any() or torch.isnan(myMax).any():
+             L[i] = torch.tensor(float('nan'))
+        else:
+            logR_stable = logR - myMax
+            L[i] = (myMax.squeeze() + torch.log(torch.exp(logR_stable).sum(axis=1) + epsilon)).sum()
+            L[i] -= N * d * math.log(2 * math.pi) / 2.
+        
+        pbar.set_postfix(log_likelihood=f"{L[i].item():.4f}")
 
         # Normalize logR to get R (posterior probabilities)
-        logR -= (myMax + torch.log(torch.exp(logR - myMax).sum(axis=1, keepdim=True)))
+        logR -= (myMax + torch.log(torch.exp(logR - myMax).sum(axis=1, keepdim=True) + epsilon))
         R = torch.exp(logR)
-
+        # nanやinfが発生した場合、処理を中断
+        if torch.isnan(R).any() or torch.isinf(R).any():
+            print("\nWarning: Responsibilities contain nan/inf. Stopping training.")
+            # 残りのLをnanで埋める
+            L[i:] = float('nan')
+            break
+            
         # --- M-step (Maximization) ---
-        R_sum = R.sum(axis=0)  # Shape: (p,)
+        R_sum = R.sum(axis=0)
+        R_sum_stable = R_sum + epsilon
 
         # Update pi
         pi = R_sum / N
 
         # Update mu (using einsum for weighted average)
-        mu = torch.einsum('np,nd->pd', R, X) / R_sum.unsqueeze(1)
+        mu = torch.einsum('np,nd->pd', R, X) / R_sum_stable.unsqueeze(1)
 
         # Update W and sigma2
-        # Accumulate sums over batches to save memory
         S_W_numerator = torch.zeros((p, d, q), device=device)
         term2_numerator = torch.zeros(p, device=device)
         
@@ -187,89 +198,32 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
             X_batch = X[batch_start:batch_end]
             R_batch = R[batch_start:batch_end]
             
-            deviation = X_batch.unsqueeze(0) - mu.unsqueeze(1) # Shape: (p, batch_N, d)
+            deviation = X_batch.unsqueeze(0) - mu.unsqueeze(1)
             
-            # Accumulate S_W = sum_n(R_nc * (x_n-mu_c)(x_n-mu_c)^T) W_c
-            # (R.T * dev).T @ (dev @ W)
-            R_dev_T = (R_batch.T.unsqueeze(-1) * deviation).transpose(-2, -1) # Shape: (p, d, batch_N)
-            dev_W = torch.bmm(deviation, W) # Shape: (p, batch_N, q)
+            R_dev_T = (R_batch.T.unsqueeze(-1) * deviation).transpose(-2, -1)
+            dev_W = torch.bmm(deviation, W)
             S_W_numerator += torch.bmm(R_dev_T, dev_W)
             
-            # Accumulate sum_n(R_nc * ||x_n - mu_c||^2)
             term2_numerator += torch.einsum('np,pnd->p', R_batch, deviation**2)
 
-        S_W = S_W_numerator / R_sum.view(p, 1, 1)
+        S_W = S_W_numerator / R_sum_stable.view(p, 1, 1)
         
-        # W_new = S_W (sigma2_old * I + M_inv_old W_old^T S_W)^{-1}
-        # Vectorized update for W for all p clusters
-        inner_inv = torch.linalg.inv(sigma2.view(p, 1, 1) * I_q + torch.bmm(torch.bmm(M_inv, W_T), S_W))
+        try:
+            inner_term = sigma2.view(p, 1, 1) * I_q + torch.bmm(torch.bmm(M_inv, W_T), S_W)
+            inner_inv = torch.linalg.inv(inner_term)
+        except torch.linalg.LinAlgError:
+            inner_term_regularized = inner_term + torch.eye(q, device=device) * epsilon
+            inner_inv = torch.linalg.inv(inner_term_regularized)
+            
         W_new = torch.bmm(S_W, inner_inv)
 
-        # Update sigma2
-        # sigma2_new = (1/d) * [ (1/N_c) * sum(R_nc ||x_n-mu_c||^2) - Tr(W_new^T S_W M_inv) ]
-        trace_term = torch.einsum('pdq,pqi->pdi', S_W, M_inv) # S_W @ M_inv
-        trace_term = torch.einsum('pji,pij->p', W_new.transpose(-2,-1), trace_term) # trace(W_new.T @ term)
+        trace_term = torch.einsum('pdq,pqi->pdi', S_W, M_inv)
+        trace_term = torch.einsum('pji,pij->p', W_new.transpose(-2,-1), trace_term)
 
-        sigma2 = (1 / d) * ( (term2_numerator / R_sum) - trace_term )
-        sigma2 = torch.clamp(sigma2, min=1e-6)
+        sigma2 = (1 / d) * ( (term2_numerator / R_sum_stable) - trace_term )
+        sigma2 = torch.clamp(sigma2, min=epsilon)
         
         W = W_new
 
     print("\nDone.")
     return pi, mu, W, sigma2, R, L, sigma2hist
-
-
-def mppca_predict_torch(X, pi, mu, W, sigma2, batch_size=1024, device='cpu'):
-    """
-    Predicts cluster responsibilities for new data using a trained MPPCA model.
-
-    Args:
-        X (torch.Tensor): The new data of shape (N, d).
-        pi, mu, W, sigma2: The trained model parameters.
-        batch_size (int): Size of minibatches for processing large datasets.
-        device (str): The device to run computations on ('cpu' or 'cuda').
-
-    Returns:
-        torch.Tensor: The responsibility matrix R of shape (N, p).
-    """
-    N, d = X.shape
-    p, _, q = W.shape
-
-    # Move all parameters to the specified device
-    X = X.to(device)
-    pi, mu, W, sigma2 = pi.to(device), mu.to(device), W.to(device), sigma2.to(device)
-
-    # This function is essentially a batched E-step from the training function.
-    logR = torch.zeros((N, p), device=device)
-    I_d = torch.eye(d, device=device)
-    I_q = torch.eye(q, device=device)
-
-    # Precompute values that are constant for all batches
-    W_T = W.transpose(-2, -1)
-    M = sigma2.view(p, 1, 1) * I_q + torch.bmm(W_T, W)
-    M_inv = torch.linalg.inv(M)
-    log_det_C_inv_half = 0.5 * (torch.linalg.slogdet(M_inv).logabsdet - d * torch.log(sigma2) + q * torch.log(sigma2))
-    
-    for batch_start in range(0, N, batch_size):
-        batch_end = min(batch_start + batch_size, N)
-        X_batch = X[batch_start:batch_end]
-        
-        deviation = X_batch.unsqueeze(0) - mu.unsqueeze(1)
-        
-        M_inv_W_T = torch.bmm(M_inv, W_T)
-        temp = torch.bmm(deviation, W)
-        temp = torch.bmm(temp, M_inv_W_T)
-        quadratic_form = (torch.sum(deviation**2, dim=-1) - torch.sum(deviation * temp, dim=-1)) / sigma2.view(p, 1)
-
-        logR[batch_start:batch_end, :] = (
-            torch.log(pi)
-            + log_det_C_inv_half
-            - 0.5 * quadratic_form.T
-        )
-
-    # Normalize logR to get R (posterior probabilities)
-    myMax = torch.max(logR, axis=1, keepdim=True).values
-    logR -= (myMax + torch.log(torch.exp(logR - myMax).sum(axis=1, keepdim=True)))
-    R = torch.exp(logR)
-
-    return R
