@@ -48,6 +48,11 @@ nc/era5_msl/
 
 *.png
 
+*.pdf
+
 *.csv
 
 *.pkl
+
+!SOM-MPPCA/document/*.txt
+!SOM-MPPCA/document/*.pdf
