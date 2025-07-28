@@ -76,14 +76,14 @@ DATA_FILE_PATH = './prmsl_era5_all_data_seasonal_small.nc'
 
 # モデルパラメータ
 # MPPCA
-P_CLUSTERS = 100
+P_CLUSTERS = 49 # 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361
 Q_LATENT_DIM = 2
-N_ITER_MPPCA = 10000 # テスト時は短く、本番では長く設定 (例: 100)
+N_ITER_MPPCA = 1000 # テスト時は短く、本番では長く設定 (例: 100)
 MPPCA_BATCH_SIZE = 1024
 
 
 # MiniSom
-MAP_X, MAP_Y = 10, 10
+MAP_X, MAP_Y = 7, 7
 SIGMA_SOM = 3.0
 LEARNING_RATE_SOM = 1.0
 NEIGHBORHOOD_FUNCTION_SOM = 'gaussian'
@@ -147,10 +147,7 @@ def run_mppca_pytorch(data_np, p, q, niter):
     logging.info("MPPCAの訓練を開始します (PyTorch版)...")
     logging.info(f"パラメータ: クラスター数(p)={p}, 潜在次元(q)={q}, 反復回数(niter)={niter}")
     start_time = time.time()
-
-    # ★★★ 修正点 1: PyTorchテンソルにfloat64で変換 ★★★
     data_t = torch.from_numpy(data_np.astype(np.float64))
-
     logging.info(f"K-meansによる初期化を実行中 ({DEVICE})...")
     
     pi_t, mu_t, W_t, sigma2_t, _ = initialization_kmeans_torch(
@@ -192,8 +189,7 @@ def run_mppca_pytorch(data_np, p, q, niter):
         pickle.dump(mppca_results, f)
     logging.info(f"MPPCAのモデルと結果を '{result_path}' に保存しました。")
     
-    # NumPy配列に変換して返す（この時点でfloat64）
-    return R_t.cpu().numpy()
+    return R_t.cpu().numpy(), L_cpu
 
 def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
     """MiniSomを訓練し、訓練済みモデルを返す (変更なし)"""
@@ -261,10 +257,38 @@ def evaluate_classification(som, mppca_posterior, original_labels):
     logging.info(f"クラスごとの再現率:\n{recall_scores_str}")
     return macro_recall, node_dominant_label
 
-# --- 6. 可視化関数 (変更なし) ---
-def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std):
+# --- 6. 可視化関数 ---
+def plot_log_likelihood(log_likelihood_history):
+    """MPPCAの対数尤度の収束グラフをプロットして保存する"""
+    logging.info("対数尤度の収束グラフを作成中...")
+    plt.figure(figsize=(10, 6))
+    
+    # 履歴にnanが含まれている場合、それらを除外してプロット
+    valid_indices = ~np.isnan(log_likelihood_history)
+    if not np.any(valid_indices):
+        logging.warning("有効な対数尤度データがないため、収束グラフは作成されません。")
+        plt.close()
+        return
+        
+    iterations = np.arange(len(log_likelihood_history))[valid_indices]
+    valid_likelihoods = log_likelihood_history[valid_indices]
+
+    plt.plot(iterations, valid_likelihoods)
+    plt.title('MPPCA 対数尤度の収束履歴')
+    plt.xlabel('イテレーション (Iteration)')
+    plt.ylabel('対数尤度 (Log-Likelihood)')
+    plt.grid(True)
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'log_likelihood_convergence_pytorch.png')
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    logging.info(f"対数尤度グラフを '{save_path}' に保存しました。")
+
+def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history):
     logging.info("結果の可視化を開始します...")
     start_time = time.time()
+
+    plot_log_likelihood(log_likelihood_history)
     
     if np.isnan(mppca_posterior).any():
         logging.error("MPPCAの事後確率にnanが含まれているため、可視化をスキップします。")
@@ -319,30 +343,30 @@ def visualize_results(som, mppca_posterior, original_data, labels, node_dominant
     logging.info(f"可視化完了。所要時間: {format_duration(end_time - start_time)}")
 
 
-# --- 7. メイン実行ブロック ---
-def main():
-    """メインの処理フロー"""
-    main_start_time = time.time()
-    logging.info("======= 研究プログラムを開始します (PyTorch版) =======")
+# --- 7. メイン実行ブロック --- 
+def main(): 
+    """メインの処理フロー""" 
+    main_start_time = time.time() 
+    logging.info("======= 研究プログラムを開始します (PyTorch版) =======") 
 
-    # 1: データ読み込みと前処理
-    data_normalized, labels, lat, lon, data_mean, data_std = load_and_preprocess_data(DATA_FILE_PATH)
+    # 1: データ読み込みと前処理 
+    data_normalized, labels, lat, lon, data_mean, data_std = load_and_preprocess_data(DATA_FILE_PATH) 
     
-    # 2: MPPCAの実行 (PyTorch)
-    mppca_posterior = run_mppca_pytorch(data_normalized, P_CLUSTERS, Q_LATENT_DIM, N_ITER_MPPCA)
+    # 2: MPPCAの実行 (PyTorch) 
+    mppca_posterior, log_likelihood_history = run_mppca_pytorch(data_normalized, P_CLUSTERS, Q_LATENT_DIM, N_ITER_MPPCA) 
 
-    # 3: SOMの実行 (CPU, NumPy)
-    som = run_som(mppca_posterior, MAP_X, MAP_Y, P_CLUSTERS, SIGMA_SOM, LEARNING_RATE_SOM, N_ITER_SOM, GLOBAL_SEED)
+    # 3: SOMの実行 (CPU, NumPy) 
+    som = run_som(mppca_posterior, MAP_X, MAP_Y, P_CLUSTERS, SIGMA_SOM, LEARNING_RATE_SOM, N_ITER_SOM, GLOBAL_SEED) 
     
-    # 4: 評価
-    _, node_dominant_label = evaluate_classification(som, mppca_posterior, labels)
+    # 4: 評価 
+    _, node_dominant_label = evaluate_classification(som, mppca_posterior, labels) 
     
-    # 5: 可視化
-    # 元データを渡す必要があるので、逆標準化は可視化関数内で行う
-    visualize_results(som, mppca_posterior, data_normalized, labels, node_dominant_label, lat, lon, data_mean, data_std)
+    # 5: 可視化 
+    # 元データを渡す必要があるので、逆標準化は可視化関数内で行う 
+    visualize_results(som, mppca_posterior, data_normalized, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history) 
     
-    main_end_time = time.time()
-    logging.info("======= すべての処理が完了しました =======")
+    main_end_time = time.time() 
+    logging.info("======= すべての処理が完了しました =======") 
     logging.info(f"総実行時間: {format_duration(main_end_time - main_start_time)}")
 
 
