@@ -4141,10 +4141,10 @@ def main():
     メイン実行関数。
     """
     # --- 設定 ---
-    target_dir = './nc/era5_msl'
+    target_dir = './nc/era5_msl_small'
     start_year = 1940
     end_year = 2024
-    output_filename = "prmsl_era5_all_data_seasonal.nc"
+    output_filename = "prmsl_era5_all_data_seasonal_small.nc"
 
     # =========================================================================
     # Phase 1: ファイルの網羅性チェック

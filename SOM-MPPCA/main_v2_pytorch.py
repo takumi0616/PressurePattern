@@ -78,7 +78,7 @@ DATA_FILE_PATH = './prmsl_era5_all_data_seasonal_small.nc'
 # MPPCA
 P_CLUSTERS = 100
 Q_LATENT_DIM = 2
-N_ITER_MPPCA = 10 # テスト時は短く、本番では長く設定 (例: 100)
+N_ITER_MPPCA = 10000 # テスト時は短く、本番では長く設定 (例: 100)
 MPPCA_BATCH_SIZE = 1024
 
 
@@ -89,7 +89,7 @@ LEARNING_RATE_SOM = 1.0
 NEIGHBORHOOD_FUNCTION_SOM = 'gaussian'
 TOPOLOGY_SOM = 'rectangular'
 ACTIVATION_DISTANCE_SOM = 'euclidean'
-N_ITER_SOM = 10 # SOMの学習イテレーション
+N_ITER_SOM = 100000 # SOMの学習イテレーション
 
 # 基本となる気圧配置パターンのラベル
 BASE_LABELS = [

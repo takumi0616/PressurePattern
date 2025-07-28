@@ -119,7 +119,7 @@ def main():
     診断結果は最後にまとめて表示する。
     """
     # --- 設定 ---
-    target_dir = './nc/era5_msl'
+    target_dir = './nc/era5_msl_small'
     start_year = 1940
     end_year = 2024
 

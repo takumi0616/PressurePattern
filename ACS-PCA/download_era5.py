@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 # --- 出力ディレクトリ ---
 # このディレクトリに年ごとのNetCDFファイルが保存されます
-OUTPUT_DIR = "./nc/era5_msl"
+OUTPUT_DIR = "./nc/era5_msl_small"
 
 # --- ダウンロードしたい年リスト ---
 # 1940年から2024年まで（2025年はまだデータが完全ではないため除外推奨）
@@ -27,7 +27,7 @@ BASE_REQUEST = {
     ],
     "time": "00:00",  # 取得する時間（UTC）。ここでは毎日00:00のデータを取得
     "area": [
-        55, 115, 15, 155  # [North, West, South, East] - 日本周辺 small版[45, 125, 25, 145]
+        45, 125, 25, 145  # [North, West, South, East] - 日本周辺 small版[45, 125, 25, 145]
     ],
     "format": "netcdf", # ★改善点: 'data_format'ではなく'format'が正しいパラメータ名
 }
