@@ -357,6 +357,61 @@ class MiniSom(object):
         if verbose:
             print(f'\n quantization error: {q_error}')
 
+    def train_batch(self, data, num_iteration, verbose=False, log_interval=1000):
+        """
+        バッチ学習を用いてSOMを訓練します。
+        
+        :param data: NxD のNumpy配列。Nはサンプル数、Dは特徴次元数。
+        :param num_iteration: 学習の反復回数。
+        :param verbose: 進捗を表示するかどうか。
+        :param log_interval: 量子化誤差を記録する間隔。
+        :return: 量子化誤差の履歴リスト。
+        """
+        self._check_iteration_number(num_iteration)
+        self._check_input_len(data)
+
+        quantization_errors = [] # 誤差を記録するリストを初期化
+
+        # verboseがTrueの場合、tqdmによるプログレスバーを表示
+        iterations = _build_iteration_indexes(len(data), num_iteration,
+                                                verbose=verbose, use_epochs=False)
+
+        for i in iterations:
+            # 学習率と近傍半径を更新
+            eta = self._learning_rate_decay_function(self._learning_rate, i, num_iteration)
+            sig = self._sigma_decay_function(self._sigma, i, num_iteration)
+
+            # E-step: 各データに最も近いノード（勝者ノード）を見つける
+            win_map = self.win_map(data)
+
+            # M-step: 重みを更新する
+            numerator = zeros(self._weights.shape)
+            denominator = zeros(self._weights.shape[:2])
+
+            # バッチ更新のための分子と分母を計算
+            for win_pos, data_points in win_map.items():
+                h = self.neighborhood(win_pos, sig)
+                numerator += h[:, :, None] * mean(data_points, axis=0)
+                denominator += h
+            
+            # 重みを更新
+            self._weights = numerator / (denominator[:, :, None] + 1e-9)
+            
+            # 指定された間隔で量子化誤差を記録
+            if i % log_interval == 0:
+                q_error = self.quantization_error(data)
+                quantization_errors.append(q_error)
+                # tqdmの進捗バーに現在の誤差を表示
+                if verbose and hasattr(iterations, 'set_postfix'):
+                    iterations.set_postfix(q_error=f"{q_error:.5f}")
+
+        if verbose:
+            q_error = self.quantization_error(data)
+            print(f'\n final quantization error: {q_error}')
+        
+        # 量子化誤差の履歴を返す
+        return quantization_errors
+
 
     def distance_map(self, scaling='sum'):
         if scaling not in ['sum', 'mean']:

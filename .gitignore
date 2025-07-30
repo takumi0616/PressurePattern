@@ -54,5 +54,7 @@ nc/era5_msl/
 
 *.pkl
 
+*.pt
+
 !SOM-MPPCA/document/*.txt
 !SOM-MPPCA/document/*.pdf

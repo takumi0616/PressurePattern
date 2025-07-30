@@ -78,7 +78,7 @@ DATA_FILE_PATH = './prmsl_era5_all_data_seasonal_small.nc'
 # MPPCA
 P_CLUSTERS = 49 # 25, 36, 49, 64, 81, 100, 121, 144, 169, 196, 225, 256, 289, 324, 361
 Q_LATENT_DIM = 2
-N_ITER_MPPCA = 1000 # テスト時は短く、本番では長く設定 (例: 100)
+N_ITER_MPPCA = 500 # テスト時は短く、本番では長く設定 (例: 100)
 MPPCA_BATCH_SIZE = 1024
 
 
@@ -89,7 +89,7 @@ LEARNING_RATE_SOM = 1.0
 NEIGHBORHOOD_FUNCTION_SOM = 'gaussian'
 TOPOLOGY_SOM = 'rectangular'
 ACTIVATION_DISTANCE_SOM = 'euclidean'
-N_ITER_SOM = 100000 # SOMの学習イテレーション
+N_ITER_SOM = 10000000 # SOMの学習イテレーション
 
 # 基本となる気圧配置パターンのラベル
 BASE_LABELS = [
@@ -210,7 +210,7 @@ def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
         som.random_weights_init(data)
 
     logging.info("SOM訓練中 (進捗表示あり)...")
-    som.train(data, n_iter, verbose=True, random_order=True)
+    q_error_history = som.train_batch(data, n_iter, verbose=True)
     
     end_time = time.time()
     logging.info(f"SOM訓練完了。所要時間: {format_duration(end_time - start_time)}")
@@ -220,7 +220,7 @@ def run_som(data, map_x, map_y, input_len, sigma, lr, n_iter, seed):
         pickle.dump(som, f)
     logging.info(f"SOMモデルを '{model_path}' に保存しました。")
     
-    return som
+    return som, q_error_history
 
 # --- 5. 評価・分析関数 (変更なし) ---
 def evaluate_classification(som, mppca_posterior, original_labels):
@@ -284,11 +284,29 @@ def plot_log_likelihood(log_likelihood_history):
     plt.close()
     logging.info(f"対数尤度グラフを '{save_path}' に保存しました。")
 
-def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history):
+def plot_quantization_error(q_error_history, log_interval):
+    """SOMの量子化誤差の収束グラフをプロットして保存する"""
+    logging.info("SOM量子化誤差の収束グラフを作成中...")
+    plt.figure(figsize=(10, 6))
+    
+    iterations = np.arange(len(q_error_history)) * log_interval
+    plt.plot(iterations, q_error_history)
+    plt.title('SOM 量子化誤差の収束履歴')
+    plt.xlabel('イテレーション (Iteration)')
+    plt.ylabel('量子化誤差 (Quantization Error)')
+    plt.grid(True)
+    plt.tight_layout()
+    save_path = os.path.join(OUTPUT_DIR, 'som_quantization_error_pytorch.png')
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    logging.info(f"SOM量子化誤差グラフを '{save_path}' に保存しました。")
+
+def visualize_results(som, mppca_posterior, original_data, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history, q_error_history):
     logging.info("結果の可視化を開始します...")
     start_time = time.time()
 
     plot_log_likelihood(log_likelihood_history)
+    plot_quantization_error(q_error_history, log_interval=1000) # minisom.pyのlog_intervalと値を合わせる
     
     if np.isnan(mppca_posterior).any():
         logging.error("MPPCAの事後確率にnanが含まれているため、可視化をスキップします。")
@@ -356,14 +374,14 @@ def main():
     mppca_posterior, log_likelihood_history = run_mppca_pytorch(data_normalized, P_CLUSTERS, Q_LATENT_DIM, N_ITER_MPPCA) 
 
     # 3: SOMの実行 (CPU, NumPy) 
-    som = run_som(mppca_posterior, MAP_X, MAP_Y, P_CLUSTERS, SIGMA_SOM, LEARNING_RATE_SOM, N_ITER_SOM, GLOBAL_SEED) 
+    som, q_error_history = run_som(mppca_posterior, MAP_X, MAP_Y, P_CLUSTERS, SIGMA_SOM, LEARNING_RATE_SOM, N_ITER_SOM, GLOBAL_SEED) 
     
     # 4: 評価 
     _, node_dominant_label = evaluate_classification(som, mppca_posterior, labels) 
     
     # 5: 可視化 
     # 元データを渡す必要があるので、逆標準化は可視化関数内で行う 
-    visualize_results(som, mppca_posterior, data_normalized, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history) 
+    visualize_results(som, mppca_posterior, data_normalized, labels, node_dominant_label, lat, lon, data_mean, data_std, log_likelihood_history, q_error_history) 
     
     main_end_time = time.time() 
     logging.info("======= すべての処理が完了しました =======") 
