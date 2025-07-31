@@ -12,6 +12,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 import seaborn as sns
+import random 
 
 # 修正されたMPPCAスクリプトをインポート
 from mppca_pytorch import initialization_kmeans_torch, mppca_gem_torch
