@@ -20,10 +20,16 @@ START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'
 
 # MPPCAモデルのパラメータ
-P_CLUSTERS = 15          # クラスター数
-Q_LATENT_DIM = 2         # 潜在変数の次元（2次元に削減）
-N_ITERATIONS = 50        # EMアルゴリズムの反復回数
-BATCH_SIZE = 1024        # バッチサイズ
+P_CLUSTERS = 4        # クラスター数 (ラベル数に合わせて15に設定)
+Q_LATENT_DIM = 20         # 潜在変数の次元（2次元に削減）
+N_ITERATIONS = 500       # EMアルゴリズムの反復回数
+BATCH_SIZE = 512        # バッチサイズ
+
+# 基本ラベルリスト
+BASE_LABELS = [
+    '1', '2A', '2B', '2C', '2D', '3A', '3B', '3C', '3D',
+    '4A', '4B', '5', '6A', '6B', '6C'
+]
 
 # --- ロギングと結果ディレクトリの設定 ---
 os.makedirs(RESULT_DIR, exist_ok=True)
@@ -33,21 +39,98 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # --- データ読み込みと前処理 ---
 def load_and_prepare_data(filepath, start_date, end_date):
+    """データとラベルを読み込み、前処理を行う"""
     logging.info(f"データファイル '{filepath}' を読み込んでいます...")
-    ds = xr.open_dataset(filepath)
+    try:
+        ds = xr.open_dataset(filepath)
+    except FileNotFoundError:
+        logging.error(f"データファイルが見つかりません: {filepath}"); return None, None, None, None, None
+        
     data_period = ds.sel(valid_time=slice(start_date, end_date))
+    
     if data_period.valid_time.size == 0:
-        logging.error("指定された期間にデータが見つかりませんでした。"); return None, None, None, None
+        logging.error("指定された期間にデータが見つかりませんでした。"); return None, None, None, None, None
+    
+    # ラベルデータを読み込む
+    if 'label' in data_period.variables:
+        # xarrayのデータはバイト列の場合があるので、デコードする
+        labels = [l.decode('utf-8') if isinstance(l, bytes) else str(l) for l in data_period['label'].values]
+        logging.info("ラベルデータを読み込みました。")
+    else:
+        logging.warning("'label'変数がデータファイルに見つかりませんでした。ラベル分析はスキップされます。")
+        labels = None
+
     msl_data = data_period['msl']
     if msl_data.isnull().any():
         logging.warning("データに欠損値 (NaN) が見つかりました。データ全体の平均値で補完します。")
         msl_data = msl_data.fillna(msl_data.mean().item())
+        
     n_samples, d_lat, d_lon = msl_data.shape[0], msl_data.shape[1], msl_data.shape[2]
     logging.info(f"データ形状: {n_samples}サンプル, {d_lat*d_lon}次元 ({d_lat}x{d_lon})")
     flattened_data = msl_data.values.reshape(n_samples, d_lat * d_lon)
-    return torch.from_numpy(flattened_data), d_lat, d_lon, data_period.valid_time.values
+    
+    return torch.from_numpy(flattened_data), d_lat, d_lon, data_period.valid_time.values, labels
 
-# --- 計算・可視化関数 ---
+# --- 計算・可視化・分析関数 ---
+
+def analyze_kmeans_clusters(clusters, labels, time_stamps, p):
+    """
+    k-meansのクラスタリング結果を、既存ラベルと月別分布の観点から分析し、ログに出力する。
+    """
+    logging.info("\n--- k-meansクラスタリング結果の総合分析 ---")
+    clusters_np = clusters.cpu().numpy()
+    
+    for i in range(p):
+        indices = np.where(clusters_np == i)[0]
+        num_samples_in_cluster = len(indices)
+
+        logging.info(f"\n[k-meansクラスタ {i+1}]")
+        logging.info(f"  - データポイント数: {num_samples_in_cluster}")
+
+        if num_samples_in_cluster == 0:
+            continue
+
+        # --- ラベル構成の分析 (既存の機能) ---
+        if labels is not None:
+            # (既存のラベル分析コードはここに移動)
+            label_counts = {label: 0 for label in BASE_LABELS}; total_label_counts = 0
+            cluster_labels = [labels[j] for j in indices]
+            for label_str in cluster_labels:
+                sub_labels = label_str.split('+') if '+' in label_str else (label_str.split('-') if '-' in label_str else [label_str])
+                for sub_label in sub_labels:
+                    sub_label = sub_label.strip()
+                    if sub_label in label_counts:
+                        label_counts[sub_label] += 1; total_label_counts += 1
+            if total_label_counts > 0:
+                logging.info("  - ラベル構成 (カウント数順):")
+                sorted_labels = sorted(label_counts.items(), key=lambda item: item[1], reverse=True)
+                for label, count in sorted_labels:
+                    if count > 0: logging.info(f"    - {label:<4}: {count:4d} 件 ({(count / total_label_counts) * 100:5.1f}%)")
+            else:
+                logging.info("  - このクラスタには既知のラベルを持つデータがありませんでした。")
+        else:
+            logging.info("  - ラベル情報がないため、ラベル構成の分析はスキップします。")
+            
+        # ★★★【追加機能】月別分布の分析 ★★★
+        cluster_time_stamps = time_stamps[indices]
+        # pandasを使ってタイムスタンプから月を抽出
+        months = pd.to_datetime(cluster_time_stamps).month
+        month_counts = {m: 0 for m in range(1, 13)}
+        # 各月の出現回数をカウント
+        unique_months, counts = np.unique(months, return_counts=True)
+        for month_val, count in zip(unique_months, counts):
+            month_counts[month_val] = count
+
+        logging.info("  - 月別分布:")
+        for month_val in range(1, 13):
+            count = month_counts[month_val]
+            percentage = (count / num_samples_in_cluster) * 100 if num_samples_in_cluster > 0 else 0
+            # ログに見やすいように簡易的なバーを追加
+            bar = '■' * int(percentage / 4) 
+            logging.info(f"    - {month_val:2d}月: {count:4d}件 ({percentage:5.1f}%) {bar}")
+
+    logging.info("\n--- 総合分析終了 ---")
+
 def calculate_latent_coords(X, R, mu, W, sigma2, device):
     p, d, q = W.shape; N, _ = X.shape
     cluster_assignments = torch.argmax(R, dim=1)
@@ -116,17 +199,48 @@ def plot_reconstructions(X, mu, W, latent_coords, cluster_assignments, d_lat, d_
 
 # --- メイン処理 ---
 if __name__ == '__main__':
+    # ★★★【修正箇所】ここから ★★★
     logging.info("--- MPPCA検証プログラム開始 ---")
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'; logging.info(f"使用デバイス: {device.upper()}")
-    X_original_dtype, d_lat, d_lon, time_stamps = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE)
+
+    # --- 実験条件のログ出力 ---
+    logging.info("==================================================")
+    logging.info("               実験条件サマリー")
+    logging.info("==================================================")
+    logging.info(f"入力データファイル: {DATA_FILE}")
+    logging.info(f"結果出力ディレクトリ: {RESULT_DIR}")
+    logging.info(f"ログファイル: {log_path}")
+    logging.info("--------------------------------------------------")
+    logging.info(f"データ対象期間: {START_DATE} から {END_DATE}")
+    logging.info("--------------------------------------------------")
+    logging.info("MPPCAモデル パラメータ:")
+    logging.info(f"  - クラスター数 (P_CLUSTERS): {P_CLUSTERS}")
+    logging.info(f"  - 潜在変数の次元 (Q_LATENT_DIM): {Q_LATENT_DIM}")
+    logging.info(f"  - EMアルゴリズム反復回数 (N_ITERATIONS): {N_ITERATIONS}")
+    logging.info(f"  - バッチサイズ (BATCH_SIZE): {BATCH_SIZE}")
+    logging.info("--------------------------------------------------")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logging.info(f"使用デバイス: {device.upper()}")
+    logging.info("==================================================\n")
+    # ★★★【修正箇所】ここまで ★★★
+
+    X_original_dtype, d_lat, d_lon, time_stamps, labels = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE)
 
     if X_original_dtype is not None:
         X = X_original_dtype.to(device, dtype=torch.float64)
-        logging.info("k-meansによる初期化を開始..."); pi, mu, W, sigma2, _ = initialization_kmeans_torch(X, P_CLUSTERS, Q_LATENT_DIM, device=device)
-        logging.info(f"初期化完了。pi:{pi.shape}, mu:{mu.shape}, W:{W.shape}, sigma2:{sigma2.shape}")
-        logging.info("MPPCAモデルの学習 (GEMアルゴリズム) を開始..."); pi, mu, W, sigma2, R, L, _ = mppca_gem_torch(X, pi, mu, W, sigma2, N_ITERATIONS, batch_size=BATCH_SIZE, device=device)
+        
+        logging.info("k-meansによる初期化を開始..."); 
+        pi, mu, W, sigma2, kmeans_clusters = initialization_kmeans_torch(X, P_CLUSTERS, Q_LATENT_DIM, device=device)
+        
+        if labels is not None:
+            analyze_kmeans_clusters(kmeans_clusters, labels, time_stamps, P_CLUSTERS)
+
+        logging.info(f"k-means初期化完了。pi:{pi.shape}, mu:{mu.shape}, W:{W.shape}, sigma2:{sigma2.shape}")
+        logging.info("MPPCAモデルの学習 (GEMアルゴリズ) を開始..."); 
+        pi, mu, W, sigma2, R, L, _ = mppca_gem_torch(X, pi, mu, W, sigma2, N_ITERATIONS, batch_size=BATCH_SIZE, device=device)
         logging.info(f"学習完了。最終的な対数尤度: {L[-1].item() if not torch.isnan(L[-1]) else 'NaN'}")
-        model_path = os.path.join(RESULT_DIR, 'mppca_model.pt'); torch.save({'pi': pi, 'mu': mu, 'W': W, 'sigma2': sigma2, 'R': R}, model_path)
+        
+        model_path = os.path.join(RESULT_DIR, 'mppca_model.pt'); 
+        torch.save({'pi': pi, 'mu': mu, 'W': W, 'sigma2': sigma2, 'R': R, 'd_lat': d_lat, 'd_lon': d_lon}, model_path)
         logging.info(f"学習済みモデルを保存: {model_path}")
 
         logging.info("--- 結果の可視化と分析を開始 ---")
@@ -147,9 +261,9 @@ if __name__ == '__main__':
             prob_vector_str = ", ".join([f"{p:.4f}" for p in r_i.cpu().numpy()])
             logging.info(f"  - 全クラスターへの所属確率ベクトル [R_i]: [{prob_vector_str}]")
             
-            # ★★★【追加機能】全15個の潜在空間での座標を表示 ★★★
+            # 全15個の潜在空間での座標を表示
             all_coords_i = calculate_all_latent_coords_for_sample(X[i], mu, W, sigma2, device)
-            logging.info("  - 全15個の潜在空間での座標:")
+            logging.info(f"  - 全{P_CLUSTERS}個の潜在空間での座標:")
             for c in range(P_CLUSTERS):
                 coord_c = all_coords_i[c].cpu().numpy()
                 logging.info(f"    - Cluster {c+1:>2} の場合: [{coord_c[0]:9.4f}, {coord_c[1]:9.4f}]")
