@@ -16,6 +16,31 @@ import seaborn as sns
 # 修正されたMPPCAスクリプトをインポート
 from mppca_pytorch import initialization_kmeans_torch, mppca_gem_torch
 
+GLOBAL_SEED = 42 # シード値は任意の整数でOK
+
+def set_global_seed(seed):
+    """
+    全てのライブラリの乱数シードを固定し、再現性を高める。
+    """
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 複数のGPUを使用する場合
+
+    # PyTorchの決定論的アルゴリズムを有効にする
+    # これにより、GPU上での計算の再現性が向上するが、
+    # パフォーマンスが若干低下する場合がある。
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # より新しいPyTorchバージョンでは、こちらの方が強力
+    # 一部の操作が決定論的アルゴリズムを持っていない場合にエラーを発生させる
+    # torch.use_deterministic_algorithms(True) 
+    
+    logging.info(f"グローバルシード {seed} を設定し、決定論的動作を有効にしました。")
+
 # --- 設定項目 ---
 # ファイルパスとディレクトリ
 DATA_FILE = './prmsl_era5_all_data_seasonal_small.nc' 
@@ -264,6 +289,8 @@ def plot_reconstructions(X, mu, W, latent_coords, cluster_assignments, lat_coord
 # --- メイン処理 ---
 if __name__ == '__main__':
     logging.info("--- MPPCA検証プログラム開始 ---")
+    # プログラム開始時にグローバルシードを設定
+    set_global_seed(GLOBAL_SEED)
     logging.info("=================================================="); logging.info("               実験条件サマリー"); logging.info("==================================================")
     logging.info(f"入力データファイル: {DATA_FILE}"); logging.info(f"結果出力ディレクトリ: {RESULT_DIR}"); logging.info(f"ログファイル: {log_path}")
     logging.info("--------------------------------------------------"); logging.info(f"データ対象期間: {START_DATE} から {END_DATE}")
