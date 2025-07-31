@@ -1,3 +1,5 @@
+# /home/takumi/docker_miniconda/src/PressurePattern/SOM-MPPCA/mppca_check.py
+
 import os
 import logging
 import torch
@@ -11,7 +13,7 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 import seaborn as sns
 
-# 提供されたMPPCAスクリプトをインポート
+# 修正されたMPPCAスクリプトをインポート
 from mppca_pytorch import initialization_kmeans_torch, mppca_gem_torch
 
 # --- 設定項目 ---
@@ -27,7 +29,7 @@ END_DATE = '2000-12-31'
 P_CLUSTERS = 4
 Q_LATENT_DIM = 20
 N_ITERATIONS = 500
-BATCH_SIZE = 512
+BATCH_SIZE = 1024
 
 # 基本ラベルリスト
 BASE_LABELS = [
@@ -75,7 +77,18 @@ def load_and_prepare_data(filepath, start_date, end_date):
 
 # --- 計算・可視化・分析関数 ---
 
+def format_coord_vector(vector, precision=4):
+    """潜在空間の座標ベクトルを整形して複数行の文字列として返す"""
+    # 10要素ごとに改行を入れる
+    return np.array2string(
+        vector,
+        formatter={'float_kind': lambda x: f"{x:.{precision}f}"},
+        separator=', ',
+        max_line_width=100  # 1行あたりの最大文字数
+    )
+
 def analyze_kmeans_clusters(clusters, labels, time_stamps, p):
+    """k-meansクラスタリングの結果を分析し、ラベルや月別分布などを表示する"""
     logging.info("\n--- k-meansクラスタリング結果の総合分析 ---")
     clusters_np = clusters.cpu().numpy()
     for i in range(p):
@@ -105,6 +118,7 @@ def analyze_kmeans_clusters(clusters, labels, time_stamps, p):
     logging.info("\n--- 総合分析終了 ---")
 
 def calculate_latent_coords(X, R, mu, W, sigma2, device):
+    """各データポイントが所属する主クラスタにおける潜在空間座標を計算する"""
     p, d, q = W.shape; N, _ = X.shape; cluster_assignments = torch.argmax(R, dim=1)
     latent_coords = torch.zeros(N, q, device=device, dtype=X.dtype)
     W_T = W.transpose(-2, -1); I_q = torch.eye(q, device=device, dtype=X.dtype)
@@ -119,6 +133,7 @@ def calculate_latent_coords(X, R, mu, W, sigma2, device):
     return latent_coords, cluster_assignments
 
 def calculate_all_latent_coords_for_sample(X_sample, mu, W, sigma2, device):
+    """単一のデータポイントについて、全てのクラスタにおける潜在空間座標を計算する"""
     p, d, q = W.shape; all_coords = torch.zeros(p, q, device=device, dtype=X_sample.dtype)
     W_T = W.transpose(-2, -1); I_q = torch.eye(q, device=device, dtype=X_sample.dtype)
     for i in range(p):
@@ -129,7 +144,17 @@ def calculate_all_latent_coords_for_sample(X_sample, mu, W, sigma2, device):
     return all_coords
 
 def plot_log_likelihood(log_L, save_path):
-    plt.figure(figsize=(10, 6)); plt.plot(log_L.cpu().numpy()); plt.title('Log-Likelihood Convergence')
+    """対数尤度の収束グラフをプロットして保存する"""
+    log_L_np = log_L.cpu().numpy()
+    # NaNやinfをプロットから除外する
+    finite_vals = np.isfinite(log_L_np)
+    if not np.any(finite_vals):
+        logging.warning("対数尤度の値がすべて無効なため、グラフを生成できません。")
+        return
+        
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.arange(len(log_L_np))[finite_vals], log_L_np[finite_vals])
+    plt.title('Log-Likelihood Convergence')
     plt.xlabel('Iteration'); plt.ylabel('Log-Likelihood'); plt.grid(True); plt.savefig(save_path); plt.close()
     logging.info(f"対数尤度グラフを保存: {save_path}")
 
@@ -139,9 +164,8 @@ def plot_average_patterns(mu, lat_coords, lon_coords, data_mean, save_path):
     n_cols = 5
     n_rows = (p + n_cols - 1) // n_cols if p > 0 else 1
 
-    # 描画設定
     cmap = sns.color_palette("RdBu_r", as_cmap=True)
-    pressure_vmin, pressure_vmax = -12, 12  # hPa単位の偏差
+    pressure_vmin, pressure_vmax = -12, 12
     pressure_levels = np.linspace(pressure_vmin, pressure_vmax, 25)
     pressure_norm = Normalize(vmin=pressure_vmin, vmax=pressure_vmax)
     
@@ -180,15 +204,16 @@ def plot_average_patterns(mu, lat_coords, lon_coords, data_mean, save_path):
     logging.info(f"平均パターン画像を保存: {save_path}")
 
 def plot_latent_space(latent_coords, cluster_assignments, p, save_path):
+    """潜在空間の分布を2次元で可視化して保存する（最初の2次元のみ使用）"""
     latent_coords_np = latent_coords.cpu().numpy(); cluster_assignments_np = cluster_assignments.cpu().numpy()
     plt.figure(figsize=(12, 10)); scatter = plt.scatter(latent_coords_np[:, 0], latent_coords_np[:, 1], c=cluster_assignments_np, cmap='tab20', alpha=0.6, s=10)
-    plt.title('Latent Space Visualization'); plt.xlabel('Latent Dimension 1'); plt.ylabel('Latent Dimension 2')
+    plt.title('Latent Space Visualization (First 2 Dimensions)'); plt.xlabel('Latent Dimension 1'); plt.ylabel('Latent Dimension 2')
     plt.legend(handles=scatter.legend_elements()[0], labels=[f'Cluster {i+1}' for i in range(p)], bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.grid(True); plt.tight_layout(rect=[0, 0, 0.85, 1]); plt.savefig(save_path); plt.close()
     logging.info(f"潜在空間プロットを保存: {save_path}")
 
 def plot_reconstructions(X, mu, W, latent_coords, cluster_assignments, lat_coords, lon_coords, data_mean, time_stamps, n_samples, save_path):
-    """元のデータ、平均パターン、再構成データを地図上に偏差として比較プロット"""
+    """元のデータ、平均パターン、再構成データを地図上に偏差として比較プロットする"""
     fig, axes = plt.subplots(
         n_samples, 3, figsize=(10, 3 * n_samples),
         subplot_kw={"projection": ccrs.PlateCarree()}
@@ -251,17 +276,27 @@ if __name__ == '__main__':
     X_original_dtype, lat_coords, lon_coords, time_stamps, labels = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE)
 
     if X_original_dtype is not None:
+        # ---【重要】数値安定性のために倍精度(float64)を使用 ---
+        # 高次元データや反復計算では、単精度(float32)では計算誤差が蓄積し、
+        # 発散の原因となるため、倍精度に変換して計算を行います。
         X = X_original_dtype.to(device, dtype=torch.float64)
         data_mean = X.mean(0) # 全データの平均を計算
         
-        logging.info("k-meansによる初期化を開始..."); pi, mu, W, sigma2, kmeans_clusters = initialization_kmeans_torch(X, P_CLUSTERS, Q_LATENT_DIM, device=device)
+        logging.info("k-meansによる初期化を開始..."); 
+        pi, mu, W, sigma2, kmeans_clusters = initialization_kmeans_torch(X, P_CLUSTERS, Q_LATENT_DIM, device=device)
         if labels is not None: analyze_kmeans_clusters(kmeans_clusters, labels, time_stamps, P_CLUSTERS)
         logging.info(f"k-means初期化完了。pi:{pi.shape}, mu:{mu.shape}, W:{W.shape}, sigma2:{sigma2.shape}")
         
-        logging.info("MPPCAモデルの学習 (GEMアルゴリズム) を開始..."); pi, mu, W, sigma2, R, L, _ = mppca_gem_torch(X, pi, mu, W, sigma2, N_ITERATIONS, batch_size=BATCH_SIZE, device=device)
-        logging.info(f"学習完了。最終的な対数尤度: {L[-1].item() if not torch.isnan(L[-1]) else 'NaN'}")
+        logging.info("MPPCAモデルの学習 (GEMアルゴリズム) を開始..."); 
+        # パラメータも入力データXと同じデバイスとデータ型に統一して渡す
+        pi, mu, W, sigma2 = pi.to(X.device, X.dtype), mu.to(X.device, X.dtype), W.to(X.device, X.dtype), sigma2.to(X.device, X.dtype)
+        pi, mu, W, sigma2, R, L, _ = mppca_gem_torch(X, pi, mu, W, sigma2, N_ITERATIONS, batch_size=BATCH_SIZE, device=device)
         
-        model_path = os.path.join(RESULT_DIR, 'mppca_model.pt'); torch.save({'pi': pi, 'mu': mu, 'W': W, 'sigma2': sigma2, 'R': R, 'lat': lat_coords, 'lon': lon_coords, 'data_mean': data_mean}, model_path)
+        final_log_L = L[-1].item() if torch.isfinite(L[-1]) else 'NaN'
+        logging.info(f"学習完了。最終的な対数尤度: {final_log_L}")
+        
+        model_path = os.path.join(RESULT_DIR, 'mppca_model.pt'); 
+        torch.save({'pi': pi, 'mu': mu, 'W': W, 'sigma2': sigma2, 'R': R, 'lat': lat_coords, 'lon': lon_coords, 'data_mean': data_mean}, model_path)
         logging.info(f"学習済みモデルを保存: {model_path}")
 
         logging.info("--- 結果の可視化と分析を開始 ---")
@@ -271,21 +306,28 @@ if __name__ == '__main__':
         plot_latent_space(latent_coords, cluster_assignments, P_CLUSTERS, os.path.join(RESULT_DIR, 'latent_space.png'))
 
         logging.info("--- 個々のデータに着目した結果の分析 ---")
-        N_SAMPLES_TO_ANALYZE = 5; logging.info(f"最初の{N_SAMPLES_TO_ANALYZE}個のサンプルについて、詳細な結果を表示します。")
-        for i in range(N_SAMPLES_TO_ANALYZE):
+        N_SAMPLES_TO_ANALYZE = 5
+        logging.info(f"最初の{N_SAMPLES_TO_ANALYZE}個のサンプルについて、詳細な結果を表示します。")
+        for i in range(min(N_SAMPLES_TO_ANALYZE, len(X))):
             date_str = pd.to_datetime(str(time_stamps[i])).strftime('%Y-%m-%d'); r_i = R[i]
             assigned_cluster = cluster_assignments[i].item(); max_prob = r_i[assigned_cluster].item()
             latent_coords_i = latent_coords[i].cpu().numpy()
+            
             logging.info(f"\n[サンプル {i+1} ({date_str})]")
             logging.info(f"  - 最も可能性の高いクラスター: {assigned_cluster + 1} (確率: {max_prob:.4f})")
-            logging.info(f"  - (主)潜在空間での座標: [{latent_coords_i[0]:.4f}, {latent_coords_i[1]:.4f}]")
+            
+            latent_coords_str = format_coord_vector(latent_coords_i)
+            logging.info(f"  - (主)潜在空間での座標 (次元数: {len(latent_coords_i)}):\n {latent_coords_str}")
+
             prob_vector_str = ", ".join([f"{p:.4f}" for p in r_i.cpu().numpy()])
             logging.info(f"  - 全クラスターへの所属確率ベクトル [R_i]: [{prob_vector_str}]")
+            
             all_coords_i = calculate_all_latent_coords_for_sample(X[i], mu, W, sigma2, device)
             logging.info(f"  - 全{P_CLUSTERS}個の潜在空間での座標:")
             for c in range(P_CLUSTERS):
                 coord_c = all_coords_i[c].cpu().numpy()
-                logging.info(f"    - Cluster {c+1:>2} の場合: [{coord_c[0]:9.4f}, {coord_c[1]:9.4f}]")
+                coord_c_str = format_coord_vector(coord_c)
+                logging.info(f"    - Cluster {c+1:>2} の場合:\n {coord_c_str}")
 
         plot_reconstructions(X, mu, W, latent_coords, cluster_assignments, lat_coords, lon_coords, data_mean, time_stamps, N_SAMPLES_TO_ANALYZE, os.path.join(RESULT_DIR, 'reconstructions.png'))
         logging.info(f"すべての結果は '{RESULT_DIR}' ディレクトリに保存されました。")
