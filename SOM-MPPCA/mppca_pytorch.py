@@ -84,7 +84,7 @@ def initialization_kmeans_torch(X, p, q, variance_level=None, device='cpu'):
             sigma2[c] = torch.abs((variance_level / 10) * torch.randn(1, device=device, dtype=X.dtype))
         else:
             W[c, :, :] = torch.randn(d, q, device=device, dtype=X.dtype)
-            sigma2[c] = (distmin[cluster_mask].mean() / d) + 1e-6
+            sigma2[c] = (distmin[cluster_mask].mean() / d) + 1e-3 
 
     return pi, mu, W, sigma2, clusters
 
@@ -96,7 +96,7 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
     N, d = X.shape
     p, _, q = W.shape
     
-    epsilon = 1e-9
+    epsilon = 1e-6
 
     # Move all parameters to the specified device
     # ★★★ 修正点 3: 渡されたパラメータもdtypeを統一 ★★★
@@ -126,7 +126,8 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         except torch.linalg.LinAlgError:
             M_inv = torch.linalg.inv(M + torch.eye(q, device=device, dtype=X.dtype) * epsilon)
 
-        log_det_C_inv_half = 0.5 * (torch.linalg.slogdet(M_inv).logabsdet - d * torch.log(sigma2) + q * torch.log(sigma2))
+        log_det_M = torch.linalg.slogdet(M).logabsdet
+        log_det_C_inv_half = -0.5 * (log_det_M + (d - q) * torch.log(sigma2))
 
         for batch_start in range(0, N, batch_size):
             batch_end = min(batch_start + batch_size, N)
@@ -149,10 +150,12 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         # Log-likelihood calculation
         myMax = torch.max(logR, axis=1, keepdim=True).values
         if torch.isinf(myMax).any() or torch.isnan(myMax).any():
-             L[i] = torch.tensor(float('nan'), dtype=X.dtype)
+            L[i] = L[i-1] if i > 0 else torch.tensor(-1e10, dtype=X.dtype)
         else:
             logR_stable = logR - myMax
-            L[i] = (myMax.squeeze() + torch.log(torch.exp(logR_stable).sum(axis=1) + epsilon)).sum()
+            # より安定なlogsumexp計算
+            log_sum_exp = torch.logsumexp(logR_stable, dim=1)
+            L[i] = (myMax.squeeze() + log_sum_exp).sum()
             L[i] -= N * d * math.log(2 * math.pi) / 2.
         
         pbar.set_postfix(log_likelihood=f"{L[i].item():.4f}")
