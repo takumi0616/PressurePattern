@@ -27,7 +27,7 @@ BASE_REQUEST = {
     ],
     "time": "00:00",  # 取得する時間（UTC）。ここでは毎日00:00のデータを取得
     "area": [
-        45, 125, 25, 145  # [North, West, South, East] - 日本周辺 small版[45, 125, 25, 145] mormal版[55, 115, 15, 155]
+        45, 125, 25, 145  # [North, West, South, East] - 日本周辺 small版[45, 125, 25, 145] normal版[55, 115, 15, 155]
     ],
     "format": "netcdf", # ★改善点: 'data_format'ではなく'format'が正しいパラメータ名
 }
