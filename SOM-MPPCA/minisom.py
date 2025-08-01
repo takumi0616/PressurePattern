@@ -12,7 +12,6 @@ from time import time
 from datetime import timedelta
 import pickle
 import os
-# Numbaをインポート
 import numba
 from numba import jit
 

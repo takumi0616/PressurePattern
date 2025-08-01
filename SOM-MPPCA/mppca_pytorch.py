@@ -1,5 +1,3 @@
-# /home/takumi/docker_miniconda/src/PressurePattern/SOM-MPPCA/mppca_pytorch.py
-
 import torch
 import math
 from tqdm import tqdm

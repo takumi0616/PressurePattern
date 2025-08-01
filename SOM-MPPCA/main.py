@@ -1,5 +1,3 @@
-# /home/takumi/docker_miniconda/src/PressurePattern/SOM-MPPCA/mppca_check.py
-
 import os
 import logging
 import torch
@@ -13,11 +11,8 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 import seaborn as sns
 import random 
-
-# 修正されたMPPCAスクリプトをインポート
 from mppca_pytorch import initialization_kmeans_torch, mppca_gem_torch
-
-GLOBAL_SEED = 42 # シード値は任意の整数でOK
+GLOBAL_SEED = 42
 
 def set_global_seed(seed):
     """
@@ -28,18 +23,9 @@ def set_global_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # 複数のGPUを使用する場合
-
-    # PyTorchの決定論的アルゴリズムを有効にする
-    # これにより、GPU上での計算の再現性が向上するが、
-    # パフォーマンスが若干低下する場合がある。
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-    # より新しいPyTorchバージョンでは、こちらの方が強力
-    # 一部の操作が決定論的アルゴリズムを持っていない場合にエラーを発生させる
-    # torch.use_deterministic_algorithms(True) 
-    
     logging.info(f"グローバルシード {seed} を設定し、決定論的動作を有効にしました。")
 
 # --- 設定項目 ---
