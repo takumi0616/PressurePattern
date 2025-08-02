@@ -313,7 +313,7 @@ class MiniSom(object):
         c1 = linspace(-1, 1, mx)[:, None]
         c2 = linspace(-1, 1, my)
         pc1 = data.mean(axis=0) + c1 * sqrt(pc_length[pc_order[0]]) * pc_vecs[:, 0]
-        pc2 = c2 * sqrt(pc_length[pc_order[1]]) * pc_vecs[:, 1]
+        pc2 = c2[:, None] * sqrt(pc_length[pc_order[1]]) * pc_vecs[:, 1]
         self._weights = pc1[:, None, :] + pc2[None, :, :]
 
     def train(self, data, num_iteration,

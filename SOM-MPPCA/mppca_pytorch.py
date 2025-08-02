@@ -118,7 +118,7 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
             log_det_M = torch.linalg.slogdet(M).logabsdet
         except torch.linalg.LinAlgError:
             # If M is singular, add a small identity matrix for regularization
-            M_inv = torch.linalg.inv(M + torch.eye(q, device=device, dtype=X.dtype) * 1e-6)
+            M_inv = torch.linalg.inv(M + torch.eye(q, device=device, dtype=X.dtype) * 1e-5) 
             log_det_M = torch.linalg.slogdet(M + torch.eye(q, device=device, dtype=X.dtype) * 1e-6).logabsdet
 
         # Pre-calculate the log determinant term of the inverse covariance
