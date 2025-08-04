@@ -83,7 +83,7 @@ DEFAULT_PARAMS = {
     # MPPCA
     'p_clusters': 49,
     'q_latent_dim': 2,
-    'n_iter_mppca': 500,
+    'n_iter_mppca': 1000,
     'mppca_batch_size': 1024,
     # PCA
     'n_components': 20,
@@ -92,7 +92,7 @@ DEFAULT_PARAMS = {
     'map_y': 7,
     'sigma_som': 3.0,
     'learning_rate_som': 1.0,
-    'n_iter_som': 1000000, # バッチ学習のため、以前より少ないイテレーションで収束
+    'n_iter_som': 100000, # バッチ学習のため、以前より少ないイテレーションで収束
 }
 
 # ==============================================================================
@@ -350,6 +350,15 @@ def visualize_results(results, output_dir):
     plot_quantization_error(results['q_error_history'], results['params']['n_iter_som'], output_dir)
     plot_som_maps(results['som'], results['data_for_som'], results['node_dominant_label'], output_dir)
 
+    # 1. SOMの各ノードの平均気圧配置パターンをプロット
+    plot_som_node_average_patterns(results, output_dir)
+
+    # 2. 学習データの分布ヒートマップ（全体およびラベルごと）をプロット
+    plot_som_label_distribution_maps(results, output_dir)
+    
+    # 3. 各ノードの季節・月ごとの分布をプロット
+    plot_som_seasonal_distribution(results, output_dir)
+
     # --- 手法別の可視化 ---
     if results['params']['method'] == 'MPPCA':
         plot_log_likelihood(results['mppca_results']['L'], output_dir)
@@ -497,6 +506,209 @@ def plot_reconstructions(results, output_dir, n_samples=5):
     # 元データ、再構成データ、(MPPCAなら平均パターンも)を逆標準化してプロット
     # cartopyを使って地図上に描画
     pass # この部分はmain.pyのロジックを参考に実装します
+
+def plot_som_node_average_patterns(results, output_dir):
+    """
+    1. 平均海面気圧パターン (MeanSeaLevelPressurePatterns.png)
+    目的: SOMの各ノードが、具体的にどのような気圧配置を代表しているのかを視覚的に確認する。
+    """
+    logging.info("SOMノードごとの平均気圧パターンのプロットを開始...")
+    
+    som = results['som']
+    data_normalized = results['data_normalized']
+    data_for_som = results['data_for_som']
+    lat, lon = results['lat'], results['lon']
+    data_mean, data_std = results['data_mean'], results['data_std']
+    
+    map_x, map_y = som.get_weights().shape[:2]
+    
+    # ノードごとにデータインデックスを収集
+    win_map_indices = som.win_map(data_for_som, return_indices=True)
+    
+    # 各ノードの平均パターンとデータ数を計算
+    mean_patterns = np.full((map_x, map_y, data_normalized.shape[1]), np.nan)
+    node_counts = np.zeros((map_x, map_y), dtype=int)
+    
+    for (i, j), indices_list in win_map_indices.items():
+        if indices_list:
+            # 標準化された元のデータから平均を計算
+            mean_pattern = data_normalized[indices_list].mean(axis=0)
+            mean_patterns[i, j, :] = mean_pattern
+            node_counts[i, j] = len(indices_list)
+
+    # プロットの準備
+    cmap = sns.color_palette("RdBu_r", as_cmap=True)
+    norm = Normalize(vmin=-2.5, vmax=2.5) # 標準化データの偏差なのでレンジを調整
+
+    fig, axes = plt.subplots(
+        nrows=map_y, ncols=map_x,
+        figsize=(map_x * 4, map_y * 4),
+        subplot_kw={'projection': ccrs.PlateCarree()}
+    )
+    
+    # MiniSomの座標は(x, y)なので、Matplotlibの(row, col)に合わせるために転置して反転
+    axes = axes.T[::-1, :]
+
+    fig.subplots_adjust(wspace=0.06, hspace=0.06)
+
+    for i in range(map_x):
+        for j in range(map_y):
+            ax = axes[i, j]
+            mean_pattern_norm = mean_patterns[i, j, :]
+            
+            if not np.isnan(mean_pattern_norm).all():
+                # 標準化された偏差パターンをプロット
+                pattern_2d = mean_pattern_norm.reshape(len(lat), len(lon))
+                
+                cont = ax.contourf(lon, lat, pattern_2d, levels=21, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
+                ax.contour(lon, lat, pattern_2d, levels=21, colors='k', linewidths=0.5, transform=ccrs.PlateCarree())
+                ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black')
+                
+                count = node_counts[i, j]
+                ax.text(0.05, 0.9, f'({i},{j})\nN={count}', transform=ax.transAxes, fontsize=14, color='black', ha='left', va='top', bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+            else:
+                ax.axis('off')
+            
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+    fig.colorbar(cont, cax=cbar_ax, label='Normalized Pressure Anomaly (Std. Dev.)')
+
+    plt.suptitle('SOM Node Average Pressure Patterns', fontsize=16)
+    fig.subplots_adjust(top=0.95, right=0.90)
+    plt.savefig(os.path.join(output_dir, 'MeanSeaLevelPressurePatterns.png'), dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_som_label_distribution_maps(results, output_dir):
+    """
+    2. 学習データ分布ヒートマップ & 3. 各タイプの割合ヒートマップ
+    目的: データ数とラベルの分布、ノードの純度を可視化する。
+    """
+    logging.info("SOM上のデータ数とラベル分布のヒートマップ作成を開始...")
+    
+    som = results['som']
+    data_for_som = results['data_for_som']
+    original_labels = results['labels']
+    all_possible_labels = sorted(list(set(l for ol in original_labels for l in parse_label(ol))))
+
+    map_x, map_y = som.get_weights().shape[:2]
+
+    # --- データ収集 ---
+    win_map_indices = som.win_map(data_for_som, return_indices=True)
+    node_total_counts = np.zeros((map_x, map_y), dtype=int)
+    # ラベルごとのカウントを格納する辞書
+    node_label_counts = {label: np.zeros((map_x, map_y), dtype=int) for label in all_possible_labels}
+
+    parsed_labels = [parse_label(l) for l in original_labels]
+
+    for (i, j), indices in win_map_indices.items():
+        node_total_counts[i, j] = len(indices)
+        if not indices: continue
+        
+        labels_in_node = [label for idx in indices for label in parsed_labels[idx]]
+        label_counts = Counter(labels_in_node)
+        
+        for label, count in label_counts.items():
+            if label in node_label_counts:
+                node_label_counts[label][i, j] += count
+    
+    # --- 1. 全データのヒートマップ (TrainMap) ---
+    plt.figure(figsize=(10, 8))
+    plt.title('Data Count on SOM (TrainMap)')
+    # MiniSomの(x,y)とimshowの(row,col)を合わせるため転置
+    sns.heatmap(node_total_counts.T, annot=True, fmt='d', cmap='viridis')
+    plt.xlabel('Node X-index')
+    plt.ylabel('Node Y-index')
+    plt.savefig(os.path.join(output_dir, 'TrainMap.png'), dpi=300)
+    plt.close()
+
+    # --- 2. ラベルごとのデータ数ヒートマップ (*TypeMap) ---
+    for label in all_possible_labels:
+        plt.figure(figsize=(10, 8))
+        plt.title(f'Data Count for Label "{label}" (*TypeMap)')
+        sns.heatmap(node_label_counts[label].T, annot=True, fmt='d', cmap='Reds')
+        plt.xlabel('Node X-index')
+        plt.ylabel('Node Y-index')
+        plt.savefig(os.path.join(output_dir, f'{label}TypeMap.png'), dpi=300)
+        plt.close()
+
+    # --- 3. ラベルごとの割合ヒートマップ (*TypeProportionMap) ---
+    # np.nan_to_numで0除算を回避
+    node_proportions = {label: np.nan_to_num(counts / node_total_counts) for label, counts in node_label_counts.items()}
+    
+    for label in all_possible_labels:
+        plt.figure(figsize=(10, 8))
+        plt.title(f'Proportion of Label "{label}" (*TypeProportionMap)')
+        sns.heatmap(node_proportions[label].T, annot=True, fmt='.2f', cmap='coolwarm', vmin=0, vmax=1)
+        plt.xlabel('Node X-index')
+        plt.ylabel('Node Y-index')
+        plt.savefig(os.path.join(output_dir, f'{label}TypeProportionMap.png'), dpi=300)
+        plt.close()
+
+
+def plot_som_seasonal_distribution(results, output_dir):
+    """
+    5. 月・季節の分布図 (NodeMonthDistribution.png)
+    目的: 各ノードの季節性・月ごとの集中度を可視化する。
+    """
+    logging.info("SOMノードの季節・月ごとの分布図の作成を開始...")
+    
+    som = results['som']
+    data_for_som = results['data_for_som']
+    valid_time = results['valid_time']
+    map_x, map_y = som.get_weights().shape[:2]
+    
+    # --- マッピング定義 ---
+    month_to_season = {m:s for s, months in {'冬': [12, 1, 2], '春': [3, 4, 5], '夏': [6, 7, 8], '秋': [9, 10, 11]}.items() for m in months}
+    seasons = ["春", "夏", "秋", "冬"]
+    season_colors = {"春": "#FFE4E1", "夏": "#FFC1C1", "秋": "#F5DEB3", "冬": "#ADD8E6", "": "white"}
+    
+    # --- データ収集 ---
+    win_map_indices = som.win_map(data_for_som, return_indices=True)
+    dates = pd.to_datetime(valid_time)
+    
+    # --- プロット ---
+    fig, axes = plt.subplots(nrows=map_y, ncols=map_x, figsize=(map_x * 1.5, map_y * 1.5))
+    axes = axes.T # (x,y)座標系に合わせる
+
+    for i in range(map_x):
+        for j in range(map_y):
+            ax = axes[i, j]
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values(): spine.set_visible(False)
+
+            indices = win_map_indices.get((i, j), [])
+            total_dates = len(indices)
+
+            if total_dates == 0:
+                ax.set_facecolor('white')
+                continue
+
+            node_dates = dates[indices]
+            
+            # 季節と月のカウント
+            season_counts = Counter(d.month_name() for d in node_dates)
+            month_counts = Counter(d.month for d in node_dates)
+            
+            # 最も多い季節
+            max_season = Counter(month_to_season[d.month] for d in node_dates).most_common(1)[0][0]
+            ax.set_facecolor(season_colors.get(max_season, "white"))
+
+            # 上位3つの月
+            top_months = month_counts.most_common(3)
+            
+            # テキスト表示
+            text = f"({i},{j}) N={total_dates}\n{max_season}\n"
+            text += "\n".join([f"{pd.to_datetime(f'2000-{m}-01').strftime('%b')}: {c/total_dates:.0%}" for m, c in top_months])
+            
+            ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=6, transform=ax.transAxes)
+
+    plt.suptitle('Seasonal & Monthly Distribution on SOM Nodes', fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(os.path.join(output_dir, 'NodeMonthDistribution.png'), dpi=300)
+    plt.close(fig)
 
 # ==============================================================================
 # --- 7. メイン実行ブロック ---

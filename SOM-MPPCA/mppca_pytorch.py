@@ -211,47 +211,54 @@ def mppca_gem_torch(X, pi, mu, W, sigma2, niter, batch_size=1024, device='cpu'):
         trace_term = torch.einsum('pji,pij->p', W_new.transpose(-2,-1), trace_term)
 
         sigma2_new = (1 / d) * ( (term2_numerator / R_sum_stable) - trace_term )
-        
+        sigma2_new = torch.clamp(sigma2_new, min=epsilon)
+
         W = W_new
         sigma2 = sigma2_new
 
-        # --- ▼▼▼【重要】クラスター崩壊防止と再初期化 ▼▼▼ ---
-        # If a cluster's responsibility (pi) becomes too small, it has "collapsed".
-        # We re-initialize it to give it a chance to capture a new part of the data.
-        pi_floor = 1.0 / (N * 10) # Define a minimum responsibility threshold
+        # --- ▼▼▼【重要】クラスター崩壊防止と再初期化ロジック【ここから】▼▼▼ ---
+        # 混合係数piが極端に小さくなったクラスターは「崩壊した」とみなす
+        # 閾値pi_floorを定義（例：全データ数の1/10の確率よりも小さい場合）
+        pi_floor = 1.0 / (N * 10) 
         dead_clusters_mask = (pi < pi_floor)
 
+        # 崩壊したクラスターが1つでも存在する場合
         if torch.any(dead_clusters_mask):
-            # Find the average variance of healthy clusters for a sensible initialization
+            # 健全なクラスターの平均的な分散を計算し、再初期化の参考にする
             healthy_sigma2_mean = sigma2[~dead_clusters_mask].mean()
             if not torch.isfinite(healthy_sigma2_mean):
-                healthy_sigma2_mean = torch.var(X) # Fallback if all clusters are dead
+                # 全クラスターが崩壊した場合のフォールバック
+                healthy_sigma2_mean = torch.var(X) 
 
+            # 崩壊したクラスターのインデックスを取得してループ処理
             for c_idx in torch.where(dead_clusters_mask)[0]:
-                print(f"\nINFO: Re-initializing collapsed cluster {c_idx.item()} at iteration {i}.")
-                # 1. Re-initialize mu to a random data point
+                print(f"\nINFO: 崩壊したクラスター {c_idx.item()} をイテレーション {i} で再初期化します。")
+                
+                # 1. 平均(mu)をランダムなデータ点で再初期化
                 random_idx = torch.randint(0, N, (1,)).item()
                 mu[c_idx] = X[random_idx]
                 
-                # 2. Re-initialize W with small random values
+                # 2. 因子負荷量(W)を小さな乱数値で再初期化
                 W[c_idx] = torch.randn_like(W[c_idx]) * 0.1
                 
-                # 3. Reset the noise variance to a sensible value
+                # 3. ノイズ分散(sigma2)を健全なクラスターの平均値でリセット
                 sigma2[c_idx] = healthy_sigma2_mean
                 
-                # 4. Give the cluster a small amount of "life" by taking from the richest cluster
+                # 4. 混合係数(pi)を、最も裕福なクラスターから少しだけ"盗んで"与える
+                #    これにより、再初期化されたクラスターが再び学習に参加する機会を得る
                 if torch.any(~dead_clusters_mask):
                     richest_cluster_idx = torch.argmax(pi)
-                    stolen_pi = min(pi[richest_cluster_idx] * 0.1, 0.01) # Steal up to 1%
+                    # 最大でも1%か、裕福なクラスターの10%の小さい方を奪う
+                    stolen_pi = min(pi[richest_cluster_idx] * 0.1, 0.01) 
                     pi[c_idx] += stolen_pi
                     pi[richest_cluster_idx] -= stolen_pi
 
-            # Re-normalize pi after adjustment
+            # piの合計が1になるように再正規化
             pi = torch.clamp(pi, min=epsilon)
             pi /= pi.sum()
-        # --- ▲▲▲ 修正ここまで ▲▲▲ ---
+        # --- ▲▲▲【ここまで】▲▲▲ ---
 
-        # Finally, ensure sigma2 does not become negative or zero
+        # 最後に、sigma2が負またはゼロになるのを防ぐ
         sigma2 = torch.clamp(sigma2, min=epsilon)
 
     pbar.close()
