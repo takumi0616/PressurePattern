@@ -44,8 +44,8 @@ EXPERIMENTS = [
     # --- normalデータセット, map_size=7x7 ---
     # {'name': 'MPPCA_p15_q20_normal_7x7', 'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 15, 'q_latent_dim': 20, 'map_x': 7, 'map_y': 7},
     # {'name': 'MPPCA_p6_q20_normal_7x7',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 6,  'q_latent_dim': 20, 'map_x': 7, 'map_y': 7},
-    {'name': 'MPPCA_p4_q20_normal_7x7',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 4,  'q_latent_dim': 20, 'map_x': 7, 'map_y': 7},
-    {'name': 'PCA_d20_normal_7x7',       'data_key': 'normal', 'method': 'PCA',   'n_components': 20, 'map_x': 7, 'map_y': 7},
+    # {'name': 'MPPCA_p4_q20_normal_7x7',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 4,  'q_latent_dim': 20, 'map_x': 7, 'map_y': 7},
+    # {'name': 'PCA_d20_normal_7x7',       'data_key': 'normal', 'method': 'PCA',   'n_components': 20, 'map_x': 7, 'map_y': 7},
     # {'name': 'PCA_d80_normal_7x7',       'data_key': 'normal', 'method': 'PCA',   'n_components': 80, 'map_x': 7, 'map_y': 7},
     # {'name': 'PCA_d120_normal_7x7',      'data_key': 'normal', 'method': 'PCA',   'n_components': 120, 'map_x': 7, 'map_y': 7},
 
@@ -68,8 +68,8 @@ EXPERIMENTS = [
     # --- normalデータセット, map_size=10x10 ---
     # {'name': 'MPPCA_p15_q20_normal_10x10', 'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 15, 'q_latent_dim': 20, 'map_x': 10, 'map_y': 10},
     # {'name': 'MPPCA_p6_q20_normal_10x10',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 6,  'q_latent_dim': 20, 'map_x': 10, 'map_y': 10},
-    {'name': 'MPPCA_p4_q20_normal_10x10',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 4,  'q_latent_dim': 20, 'map_x': 10, 'map_y': 10},
-    {'name': 'PCA_d20_normal_10x10',       'data_key': 'normal', 'method': 'PCA',   'n_components': 20, 'map_x': 10, 'map_y': 10},
+    # {'name': 'MPPCA_p4_q20_normal_10x10',  'data_key': 'normal', 'method': 'MPPCA', 'p_clusters': 4,  'q_latent_dim': 20, 'map_x': 10, 'map_y': 10},
+    # {'name': 'PCA_d20_normal_10x10',       'data_key': 'normal', 'method': 'PCA',   'n_components': 20, 'map_x': 10, 'map_y': 10},
     # {'name': 'PCA_d80_normal_10x10',       'data_key': 'normal', 'method': 'PCA',   'n_components': 80, 'map_x': 10, 'map_y': 10},
     # {'name': 'PCA_d120_normal_10x10',      'data_key': 'normal', 'method': 'PCA',   'n_components': 120, 'map_x': 10, 'map_y': 10},
 

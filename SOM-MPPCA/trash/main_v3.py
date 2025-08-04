@@ -142,15 +142,6 @@ def setup_logger(log_dir, exp_name):
     )
     return logging.getLogger()
 
-def format_coord_vector(vector, precision=4):
-    """潜在空間の座標ベクトルを整形して複数行の文字列として返す"""
-    return np.array2string(
-        vector,
-        formatter={'float_kind': lambda x: f"{x:.{precision}f}"},
-        separator=', ',
-        max_line_width=100
-    )
-    
 # ==============================================================================
 # --- 3. データ処理 ---
 # ==============================================================================
@@ -202,32 +193,6 @@ def load_and_preprocess_data(filepath, start_date, end_date):
 # --- 4. 次元削減モデル ---
 # ==============================================================================
 
-def calculate_all_latent_coords(X, mu, W, sigma2, device):
-    """各データポイントについて、全てのクラスタにおける潜在空間座標を計算し、連結する"""
-    p, d, q = W.shape
-    N, _ = X.shape
-    all_coords_list = []
-    
-    W_T = W.transpose(-2, -1)
-    I_q = torch.eye(q, device=device, dtype=X.dtype)
-    
-    logging.info(f"全{p}個の潜在空間における座標を計算中...")
-    for i in tqdm(range(p), desc="Calculating all latent coords"):
-        mu_c, W_c, W_T_c, sigma2_c = mu[i], W[i], W_T[i], sigma2[i]
-        M_c = sigma2_c * I_q + W_T_c @ W_c
-        M_inv_c = torch.linalg.inv(M_c)
-        
-        deviation = X - mu_c
-        # (N, d) @ (d, q) -> (N, q)
-        coords = (deviation @ W_c @ M_inv_c.T)
-        all_coords_list.append(coords)
-        
-    # (N, q)のテンソルがp個入ったリストを、(N, p*q)の単一テンソルに連結
-    concatenated_coords = torch.cat(all_coords_list, dim=1)
-    logging.info(f"潜在空間座標の連結完了。最終的な次元: {concatenated_coords.shape}")
-    
-    return concatenated_coords
-
 def run_mppca(data_np, params, device, output_dir):
     """MPPCAモデルをPyTorchで訓練し、結果を返す。"""
     logging.info("--- MPPCAの実行を開始 ---")
@@ -255,13 +220,9 @@ def run_mppca(data_np, params, device, output_dir):
     else:
         logging.warning("最終的な対数尤度が'nan'または無効です。")
         
-    # --- 全ての潜在空間における座標を計算 ---
-    all_latent_coords = calculate_all_latent_coords(data_t, mu, W, sigma2, device)
-
     mppca_results = {
         'pi': pi.cpu().numpy(), 'mu': mu.cpu().numpy(), 'W': W.cpu().numpy(),
         'sigma2': sigma2.cpu().numpy(), 'R': R.cpu().numpy(), 'L': L_cpu,
-        'all_latent_coords': all_latent_coords.cpu().numpy(), # ★★★ 新規追加 ★★★
         'params': params
     }
     result_path = os.path.join(output_dir, 'mppca_model.pkl')
@@ -269,8 +230,8 @@ def run_mppca(data_np, params, device, output_dir):
         pickle.dump(mppca_results, f)
     logging.info(f"MPPCA結果を '{result_path}' に保存しました。")
     
-    # SOMへの入力として連結された潜在座標を返す
-    return all_latent_coords.cpu().numpy(), mppca_results
+    # SOMへの入力として事後確率 R を返す
+    return R.cpu().numpy(), mppca_results
 
 def run_pca(data_np, params, output_dir):
     """PCAを実行し、結果を返す。"""
@@ -280,6 +241,7 @@ def run_pca(data_np, params, output_dir):
     start_time = time.time()
     
     pca = PCA(n_components=n_components, random_state=GLOBAL_SEED)
+    # PCAで次元削減したデータ (主成分スコア)
     pca_scores = pca.fit_transform(data_np)
     
     end_time = time.time()
@@ -296,43 +258,8 @@ def run_pca(data_np, params, output_dir):
         pickle.dump(pca_results, f)
     logging.info(f"PCA結果を '{result_path}' に保存しました。")
     
+    # SOMへの入力として主成分スコアを返す
     return pca_scores, pca_results
-
-def log_mppca_sample_details(R_np, all_latent_coords_np, time_stamps, params, n_samples=5):
-    """MPPCAの結果について、個々のサンプルの詳細をログに出力する"""
-    logging.info("--- 個々のデータに着目したMPPCA結果の分析 ---")
-    if n_samples == 0: return
-    
-    logging.info(f"最初の{min(n_samples, len(R_np))}個のサンプルについて、詳細な結果を表示します。")
-    
-    p = params['p_clusters']
-    q = params['q_latent_dim']
-    
-    cluster_assignments = np.argmax(R_np, axis=1)
-
-    for i in range(min(n_samples, len(R_np))):
-        date_str = pd.to_datetime(str(time_stamps[i])).strftime('%Y-%m-%d')
-        r_i = R_np[i]
-        assigned_cluster = cluster_assignments[i]
-        max_prob = r_i[assigned_cluster]
-        
-        logging.info(f"\n[サンプル {i+1} ({date_str})]")
-        logging.info(f"  - 最も可能性の高いクラスター: {assigned_cluster + 1} (確率: {max_prob:.4f})")
-        
-        # 主潜在空間の座標を抽出
-        main_latent_coords_i = all_latent_coords_np[i, assigned_cluster*q : (assigned_cluster+1)*q]
-        latent_coords_str = format_coord_vector(main_latent_coords_i)
-        logging.info(f"  - (主)潜在空間での座標 (次元数: {q}):\n {latent_coords_str}")
-
-        prob_vector_str = ", ".join([f"{prob:.4f}" for prob in r_i])
-        logging.info(f"  - 全クラスターへの所属確率ベクトル [R_i]: [{prob_vector_str}]")
-        
-        logging.info(f"  - 全{p}個の潜在空間での座標:")
-        for c in range(p):
-            # 連結されたベクトルから該当クラスタの座標部分をスライス
-            coord_c = all_latent_coords_np[i, c*q : (c+1)*q]
-            coord_c_str = format_coord_vector(coord_c)
-            logging.info(f"    - Cluster {c+1:>2} の場合:\n {coord_c_str}")
 
 # ==============================================================================
 # --- 5. SOM & 評価 ---
@@ -361,23 +288,30 @@ def run_som(data_for_som, original_labels, params, output_dir):
     else:
         som.pca_weights_init(data_for_som)
     
+    # --- ベストモデル選択と履歴保存のための変数 ---
     best_recall = -1.0
     best_som_weights = None
     recall_history = []
     iterations_history = []
     log_interval = max(1, n_iter // 100)
 
+    # --- コールバック関数定義 ---
     def evaluation_and_save_callback(som_instance, current_iter):
         nonlocal best_recall, best_som_weights
+        
+        # 現在のSOMの重みで評価
         macro_recall, _ = evaluate_classification(som_instance, data_for_som, original_labels, verbose=False)
         recall_history.append(macro_recall)
         iterations_history.append(current_iter)
         
+        # tqdmの進捗バーに現在の再現率を表示
         if hasattr(som_instance.tqdm_pbar, 'set_postfix'):
-            current_postfix = som_instance.tqdm_pbar.postfix or ""
-            q_error_str = current_postfix.split(',')[0]
-            som_instance.tqdm_pbar.set_postfix_str(f"{q_error_str}, recall={macro_recall:.4f}")
+            som_instance.tqdm_pbar.set_postfix(
+                q_error=f"{som_instance.tqdm_pbar.postfix.split('q_error=')[-1].strip()}", 
+                recall=f"{macro_recall:.4f}"
+            )
 
+        # ベストモデルの重みを更新
         if macro_recall > best_recall:
             best_recall = macro_recall
             best_som_weights = som_instance.get_weights().copy()
@@ -388,6 +322,7 @@ def run_som(data_for_som, original_labels, params, output_dir):
                                       log_interval=log_interval,
                                       evaluation_callback=evaluation_and_save_callback)
     
+    # 学習後、最も良かった重みを最終モデルに設定
     if best_som_weights is not None:
         som._weights = best_som_weights
         logging.info(f"最終モデルを、最も再現率の高かったモデル ({best_recall:.4f}) に設定しました。")
@@ -397,14 +332,20 @@ def run_som(data_for_som, original_labels, params, output_dir):
     end_time = time.time()
     logging.info(f"SOM訓練完了。所要時間: {format_duration(end_time - start_time)}")
     
+    # 最終モデルを保存
     model_path = os.path.join(output_dir, 'som_model.pkl')
-    if hasattr(som, 'tqdm_pbar'): del som.tqdm_pbar
+
+    if hasattr(som, 'tqdm_pbar'):
+        del som.tqdm_pbar
+
     with open(model_path, 'wb') as f:
         pickle.dump(som, f)
     logging.info(f"SOMベストモデルを '{model_path}' に保存しました。")
     
+    # 評価履歴と量子化誤差の履歴を返す
     recall_data = (iterations_history, recall_history)
     return som, q_error_history, recall_data
+
 
 def evaluate_classification(som, data_for_som, original_labels, verbose=True):
     """マクロ平均再現率を用いて分類性能を評価する。"""
@@ -416,6 +357,7 @@ def evaluate_classification(som, data_for_som, original_labels, verbose=True):
         logging.error("SOMへの入力データにnanが含まれており、評価をスキップします。")
         return 0.0, {}
 
+    # 1. 各ノードの優勢ラベルを決定
     parsed_true_labels = [parse_label(l) for l in original_labels]
     win_map_indices = som.win_map(data_for_som, return_indices=True)
     node_dominant_label = {}
@@ -426,9 +368,11 @@ def evaluate_classification(som, data_for_som, original_labels, verbose=True):
         most_common = Counter(labels_in_node).most_common(1)
         node_dominant_label[pos] = most_common[0][0]
 
+    # 2. 各データポイントの予測ラベルを決定
     winners = [som.winner(x) for x in data_for_som]
     predicted_single_labels = [node_dominant_label.get(w) for w in winners]
     
+    # 3. 再現率を計算
     mlb = MultiLabelBinarizer(classes=BASE_LABELS)
     y_true = mlb.fit_transform(parsed_true_labels)
     y_pred = mlb.transform([[l] if l else [] for l in predicted_single_labels])
@@ -453,14 +397,24 @@ def visualize_results(results, output_dir):
     logging.info("--- 結果の可視化を開始 ---")
     start_time = time.time()
 
+    # --- 共通の可視化 ---
     plot_quantization_error(results['q_error_history'], results['params']['n_iter_som'], output_dir)
     plot_som_maps(results['som'], results['data_for_som'], results['node_dominant_label'], output_dir)
+    # ★★★ 新規追加: 再現率の収束グラフ ★★★
     plot_recall_convergence(results['recall_data'], output_dir)
+
+    # 1. SOMの各ノードの平均気圧配置パターンをプロット
     plot_som_node_average_patterns(results, output_dir)
+
+    # 2. 学習データの分布ヒートマップ（全体およびラベルごと）をプロット
     plot_som_label_distribution_maps(results, output_dir)
+    
+    # 3. 各ノードの季節・月ごとの分布をプロット
     plot_som_seasonal_distribution(results, output_dir)
 
+    # --- 手法別の可視化 ---
     if results['params']['method'] == 'MPPCA':
+        # ★★★ 修正: 対数尤度プロット関数の呼び出し ★★★
         plot_log_likelihood(results['mppca_results']['L'], output_dir)
         plot_mppca_average_patterns(results, output_dir)
         plot_latent_space(results, output_dir)
@@ -474,28 +428,45 @@ def visualize_results(results, output_dir):
     logging.info(f"可視化完了。所要時間: {format_duration(end_time - start_time)}")
 
 def plot_log_likelihood(log_likelihood, output_dir):
-    """MPPCAの対数尤度の収束グラフをプロット。"""
+    """
+    MPPCAの対数尤度の収束グラフをプロット。
+    外れ値を検出し、描画スケールを調整し、外れ値の位置に赤線を引く。
+    """
     plt.figure(figsize=(10, 6))
+    
+    # NaNやinfでない有限な値のみを対象にする
     ll_finite = log_likelihood[np.isfinite(log_likelihood)]
-    if len(ll_finite) < 10:
+    if len(ll_finite) < 10: # データが少なすぎる場合は従来の方法でプロット
         logging.warning("有効な対数尤度データが少なすぎるため、外れ値処理をスキップします。")
         plt.plot(log_likelihood)
     else:
+        # 外れ値検出 (IQR法)
+        # 学習初期の変動を除外して、安定期の分布から閾値を計算
         stable_start_idx = int(len(ll_finite) * 0.1)
         ll_stable = ll_finite[stable_start_idx:]
-        q1, q3 = np.percentile(ll_stable, 25), np.percentile(ll_stable, 75)
+        q1 = np.percentile(ll_stable, 25)
+        q3 = np.percentile(ll_stable, 75)
         iqr = q3 - q1
+        # 「すごい大きな数字」を検出するため、上限のみ設定
         upper_bound = q3 + 3.0 * iqr 
+
+        # 描画用のデータを作成 (外れ値はnanでマスク)
         ll_plot = np.copy(log_likelihood)
         outlier_indices = np.where(ll_plot > upper_bound)[0]
         ll_plot[outlier_indices] = np.nan
+        
+        # 正常値のみでプロット
         plt.plot(np.arange(len(ll_plot)), ll_plot, label='対数尤度 (正常範囲)')
+        
+        # 外れ値があった位置に赤の破線を引く
         if len(outlier_indices) > 0:
             logging.info(f"{len(outlier_indices)}個の対数尤度の外れ値を検出しました。")
             for i, idx in enumerate(outlier_indices):
+                # 凡例が重複しないようにラベルを設定
                 label = '外れ値検出位置' if i == 0 else ""
                 plt.axvline(x=idx, color='r', linestyle='--', linewidth=1, label=label)
-            plt.legend()
+        
+        plt.legend()
 
     plt.title('MPPCA 対数尤度の収束履歴')
     plt.xlabel('イテレーション'); plt.ylabel('対数尤度'); plt.grid(True)
@@ -524,45 +495,54 @@ def plot_recall_convergence(recall_data, output_dir):
 
     plt.figure(figsize=(10, 6))
     plt.plot(iterations, recall_history, marker='.', linestyle='-', markersize=4)
-    if recall_history:
-        best_recall_idx = np.argmax(recall_history)
-        plt.scatter(iterations[best_recall_idx], recall_history[best_recall_idx],
-                    color='red', s=100, zorder=5, label=f'Best Recall: {recall_history[best_recall_idx]:.4f}')
+    best_recall_idx = np.argmax(recall_history)
+    plt.scatter(iterations[best_recall_idx], recall_history[best_recall_idx],
+                color='red', s=100, zorder=5, label=f'Best Recall: {recall_history[best_recall_idx]:.4f}')
     
     plt.title('SOM学習過程におけるマクロ平均再現率の変化')
-    plt.xlabel('イテレーション'); plt.ylabel('マクロ平均再現率')
-    plt.grid(True); plt.legend(); plt.ylim(bottom=0); plt.tight_layout()
+    plt.xlabel('イテレーション')
+    plt.ylabel('マクロ平均再現率 (Macro Average Recall)')
+    plt.grid(True)
+    plt.legend()
+    plt.ylim(bottom=0) # 再現率は0未満にならない
+    plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'recall_convergence.png'), dpi=300)
     plt.close()
+
 
 def plot_som_maps(som, data_for_som, node_dominant_label, output_dir):
     """U-Matrix, ヒットマップ, 勝者総取りマップ等をプロット。"""
     map_x, map_y = som.get_weights().shape[:2]
     
+    # U-Matrix
     plt.figure(figsize=(10, 10)); plt.pcolor(som.distance_map().T, cmap='bone_r'); plt.colorbar(label='ニューロン間の距離'); plt.title('U-Matrix'); plt.grid(True); plt.savefig(os.path.join(output_dir, 'som_u_matrix.png'), dpi=300); plt.close()
-    
+
+    # Hit Map
     frequencies = som.activation_response(data_for_som)
     plt.figure(figsize=(10, 10)); plt.pcolor(frequencies.T, cmap='viridis'); plt.colorbar(label='勝者となった回数'); plt.title('ヒットマップ'); plt.grid(True); plt.savefig(os.path.join(output_dir, 'som_hit_map.png'), dpi=300); plt.close()
 
+    # Winner-takes-all Map
     plt.figure(figsize=(12, 10)); label_map = np.full((map_x, map_y), -1, dtype=int); label_names = {label: i for i, label in enumerate(BASE_LABELS)};
     for pos, label in node_dominant_label.items():
-        if label: label_map[pos[0], pos[1]] = label_names.get(label, -1)
+        if label: label_map[pos[0], pos[1]] = label_names[label]
     cmap = plt.get_cmap('tab20', len(BASE_LABELS)); plt.pcolor(label_map.T, cmap=cmap, vmin=-0.5, vmax=len(BASE_LABELS)-0.5); cbar = plt.colorbar(ticks=np.arange(len(BASE_LABELS))); cbar.ax.set_yticklabels(BASE_LABELS); plt.title('勝者総取りマップ'); plt.grid(True); plt.savefig(os.path.join(output_dir, 'som_winner_takes_all_map.png'), dpi=300); plt.close()
 
 def plot_mppca_average_patterns(results, output_dir):
     """MPPCAで学習された平均気圧配置パターンを地図上にプロット。"""
     mu = results['mppca_results']['mu']
-    lat, lon, data_mean, data_std = results['lat'], results['lon'], results['data_mean'], results['data_std']
+    lat, lon, data_mean = results['lat'], results['lon'], results['data_mean']
     p, _ = mu.shape
-    n_cols = min(5, p); n_rows = (p + n_cols - 1) // n_cols
+    n_cols = min(5, p)
+    n_rows = (p + n_cols - 1) // n_cols
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3), subplot_kw={"projection": ccrs.PlateCarree()})
     axes = np.atleast_1d(axes).flatten()
     
     for i in range(p):
         ax = axes[i]
-        mean_pattern_hpa = (mu[i] * data_std + data_mean) / 100.0
-        mean_anomaly_hpa = mean_pattern_hpa - (data_mean.mean() / 100.0)
+        # 標準化を戻してから平均を引くことで「偏差」を計算
+        mean_pattern_hpa = (mu[i] * results['data_std'] + data_mean) / 100.0
+        mean_anomaly_hpa = mean_pattern_hpa - (data_mean.mean() / 100.0) # 全体平均からの偏差
         pattern_2d = mean_anomaly_hpa.reshape(len(lat), len(lon))
         
         norm = Normalize(vmin=-12, vmax=12)
@@ -582,8 +562,9 @@ def plot_pca_components_as_patterns(results, output_dir):
     """PCAの主成分を気圧配置パターンとして地図上にプロット。"""
     pca = results['pca_results']['model']
     lat, lon = results['lat'], results['lon']
-    n_components = min(10, pca.n_components_)
-    n_cols = min(5, n_components); n_rows = (n_components + n_cols - 1) // n_cols
+    n_components = min(10, pca.n_components_) # 上位10個まで表示
+    n_cols = min(5, n_components)
+    n_rows = (n_components + n_cols - 1) // n_cols
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3), subplot_kw={"projection": ccrs.PlateCarree()})
     axes = np.atleast_1d(axes).flatten()
@@ -607,163 +588,231 @@ def plot_pca_components_as_patterns(results, output_dir):
 def plot_latent_space(results, output_dir):
     """次元削減後の潜在空間の分布をプロット。"""
     data = results['data_for_som']
+    if data.shape[1] < 2:
+        logging.warning("潜在次元が2未満のため、潜在空間プロットはスキップします。")
+        return
+        
     som = results['som']
-    params = results['params']
-
-    if params['method'] == 'PCA':
-        if data.shape[1] < 2:
-            logging.warning("潜在次元が2未満のため、潜在空間プロットはスキップします。")
-            return
-        
-        winners = [som.winner(x) for x in data]
-        colors = [f"C{w[0] * som._weights.shape[1] + w[1]}" for w in winners]
-        
-        plt.figure(figsize=(10, 8))
-        plt.scatter(data[:, 0], data[:, 1], c=colors, alpha=0.5)
-        plt.title('Latent Space Visualization (First 2 PCA Dimensions)')
-        plt.xlabel('Principal Component 1'); plt.ylabel('Principal Component 2'); plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'latent_space.png'), dpi=300)
-        plt.close()
+    winners = [som.winner(x) for x in data]
+    # ノード位置を色にマッピング
+    colors = [f"C{w[0] * som._weights.shape[1] + w[1]}" for w in winners]
     
-    elif params['method'] == 'MPPCA':
-        R = results['mppca_results']['R']
-        all_latent_coords = results['mppca_results']['all_latent_coords']
-        cluster_assignments = np.argmax(R, axis=1)
-        
-        p = params['p_clusters']
-        q = params['q_latent_dim']
-        
-        if q < 2:
-            logging.warning("潜在次元が2未満のため、MPPCA潜在空間プロットはスキップします。")
-            return
-
-        # 主潜在空間の座標を抽出
-        main_coords = np.zeros((len(data), q))
-        for i in range(len(data)):
-            c = cluster_assignments[i]
-            main_coords[i] = all_latent_coords[i, c*q:(c+1)*q]
-            
-        plt.figure(figsize=(12, 10))
-        scatter = plt.scatter(main_coords[:, 0], main_coords[:, 1], c=cluster_assignments, cmap='tab20', alpha=0.6, s=10)
-        plt.title('Latent Space Visualization (Main clusters, first 2 dims)')
-        plt.xlabel('Latent Dimension 1'); plt.ylabel('Latent Dimension 2')
-        plt.legend(handles=scatter.legend_elements()[0], labels=[f'Cluster {i+1}' for i in range(p)], bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.grid(True); plt.tight_layout(rect=[0, 0, 0.85, 1])
-        plt.savefig(os.path.join(output_dir, 'latent_space.png'), dpi=300)
-        plt.close()
+    plt.figure(figsize=(10, 8))
+    plt.scatter(data[:, 0], data[:, 1], c=colors, alpha=0.5)
+    plt.title('Latent Space Visualization (First 2 Dimensions)')
+    plt.xlabel('Dimension 1'); plt.ylabel('Dimension 2'); plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'latent_space.png'), dpi=300)
+    plt.close()
 
 def plot_reconstructions(results, output_dir, n_samples=5):
     """元のデータと再構成データを比較プロット。"""
+    # ... この関数の実装は長くなるため、骨子のみ示します ...
     logging.info(f"{n_samples}個のサンプルで再構成を比較します。")
-    if n_samples == 0: return
-
-    # ... (この関数の実装は省略します) ...
-    pass
+    # `results`から必要な情報を取得 (data_normalized, lat, lon, data_mean, data_std, etc.)
+    # methodに応じて再構成ロジックを分岐
+    # MPPCA: x_rec = W[c] @ z + mu[c]
+    # PCA: x_rec = pca.inverse_transform(scores)
+    # 元データ、再構成データ、(MPPCAなら平均パターンも)を逆標準化してプロット
+    # cartopyを使って地図上に描画
+    pass # この部分はmain.pyのロジックを参考に実装します
 
 def plot_som_node_average_patterns(results, output_dir):
-    """SOMの各ノードが代表する平均的な気圧配置パターンをプロット"""
+    """
+    1. 平均海面気圧パターン (MeanSeaLevelPressurePatterns.png)
+    目的: SOMの各ノードが、具体的にどのような気圧配置を代表しているのかを視覚的に確認する。
+    """
     logging.info("SOMノードごとの平均気圧パターンのプロットを開始...")
     
     som = results['som']
     data_normalized = results['data_normalized']
     data_for_som = results['data_for_som']
     lat, lon = results['lat'], results['lon']
+    data_mean, data_std = results['data_mean'], results['data_std']
     
     map_x, map_y = som.get_weights().shape[:2]
+    
+    # ノードごとにデータインデックスを収集
     win_map_indices = som.win_map(data_for_som, return_indices=True)
     
+    # 各ノードの平均パターンとデータ数を計算
     mean_patterns = np.full((map_x, map_y, data_normalized.shape[1]), np.nan)
     node_counts = np.zeros((map_x, map_y), dtype=int)
     
     for (i, j), indices_list in win_map_indices.items():
         if indices_list:
-            mean_patterns[i, j, :] = data_normalized[indices_list].mean(axis=0)
+            # 標準化された元のデータから平均を計算
+            mean_pattern = data_normalized[indices_list].mean(axis=0)
+            mean_patterns[i, j, :] = mean_pattern
             node_counts[i, j] = len(indices_list)
 
+    # プロットの準備
     cmap = sns.color_palette("RdBu_r", as_cmap=True)
-    norm = Normalize(vmin=-2.5, vmax=2.5)
+    norm = Normalize(vmin=-2.5, vmax=2.5) # 標準化データの偏差なのでレンジを調整
 
-    fig, axes = plt.subplots(nrows=map_y, ncols=map_x, figsize=(map_x*3, map_y*3), subplot_kw={'projection': ccrs.PlateCarree()})
+    fig, axes = plt.subplots(
+        nrows=map_y, ncols=map_x,
+        figsize=(map_x * 4, map_y * 4),
+        subplot_kw={'projection': ccrs.PlateCarree()}
+    )
+    
+    # MiniSomの座標は(x, y)なので、Matplotlibの(row, col)に合わせるために転置して反転
     axes = axes.T[::-1, :]
+
     fig.subplots_adjust(wspace=0.06, hspace=0.06)
 
     for i in range(map_x):
         for j in range(map_y):
             ax = axes[i, j]
-            if not np.isnan(mean_patterns[i, j, :]).all():
-                pattern_2d = mean_patterns[i, j, :].reshape(len(lat), len(lon))
+            mean_pattern_norm = mean_patterns[i, j, :]
+            
+            if not np.isnan(mean_pattern_norm).all():
+                # 標準化された偏差パターンをプロット
+                pattern_2d = mean_pattern_norm.reshape(len(lat), len(lon))
+                
                 cont = ax.contourf(lon, lat, pattern_2d, levels=21, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
                 ax.contour(lon, lat, pattern_2d, levels=21, colors='k', linewidths=0.5, transform=ccrs.PlateCarree())
                 ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black')
-                ax.text(0.05, 0.9, f'({i},{j})\nN={node_counts[i,j]}', transform=ax.transAxes, fontsize=10, bbox=dict(facecolor='white', alpha=0.6))
+                
+                count = node_counts[i, j]
+                ax.text(0.05, 0.9, f'({i},{j})\nN={count}', transform=ax.transAxes, fontsize=14, color='black', ha='left', va='top', bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
             else:
                 ax.axis('off')
-            ax.set_xticks([]); ax.set_yticks([])
+            
+            ax.set_xticks([])
+            ax.set_yticks([])
 
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
     fig.colorbar(cont, cax=cbar_ax, label='Normalized Pressure Anomaly (Std. Dev.)')
+
     plt.suptitle('SOM Node Average Pressure Patterns', fontsize=16)
     fig.subplots_adjust(top=0.95, right=0.90)
-    plt.savefig(os.path.join(output_dir, 'MeanSeaLevelPressurePatterns.png'), dpi=300)
+    plt.savefig(os.path.join(output_dir, 'MeanSeaLevelPressurePatterns.png'), dpi=300, bbox_inches='tight')
     plt.close(fig)
 
+
 def plot_som_label_distribution_maps(results, output_dir):
-    """SOM上のデータ数とラベル分布のヒートマップを作成"""
+    """
+    2. 学習データ分布ヒートマップ & 3. 各タイプの割合ヒートマップ
+    目的: データ数とラベルの分布、ノードの純度を可視化する。
+    """
     logging.info("SOM上のデータ数とラベル分布のヒートマップ作成を開始...")
     
-    som = results['som']; data_for_som = results['data_for_som']; original_labels = results['labels']
+    som = results['som']
+    data_for_som = results['data_for_som']
+    original_labels = results['labels']
     all_possible_labels = sorted(list(set(l for ol in original_labels for l in parse_label(ol))))
+
     map_x, map_y = som.get_weights().shape[:2]
 
+    # --- データ収集 ---
     win_map_indices = som.win_map(data_for_som, return_indices=True)
     node_total_counts = np.zeros((map_x, map_y), dtype=int)
+    # ラベルごとのカウントを格納する辞書
     node_label_counts = {label: np.zeros((map_x, map_y), dtype=int) for label in all_possible_labels}
+
     parsed_labels = [parse_label(l) for l in original_labels]
 
     for (i, j), indices in win_map_indices.items():
         node_total_counts[i, j] = len(indices)
         if not indices: continue
+        
         labels_in_node = [label for idx in indices for label in parsed_labels[idx]]
         label_counts = Counter(labels_in_node)
+        
         for label, count in label_counts.items():
-            if label in node_label_counts: node_label_counts[label][i, j] += count
+            if label in node_label_counts:
+                node_label_counts[label][i, j] += count
     
-    plt.figure(figsize=(10, 8)); plt.title('Data Count on SOM (TrainMap)'); sns.heatmap(node_total_counts.T, annot=True, fmt='d', cmap='viridis'); plt.savefig(os.path.join(output_dir, 'TrainMap.png'), dpi=300); plt.close()
+    # --- 1. 全データのヒートマップ (TrainMap) ---
+    plt.figure(figsize=(10, 8))
+    plt.title('Data Count on SOM (TrainMap)')
+    # MiniSomの(x,y)とimshowの(row,col)を合わせるため転置
+    sns.heatmap(node_total_counts.T, annot=True, fmt='d', cmap='viridis')
+    plt.xlabel('Node X-index')
+    plt.ylabel('Node Y-index')
+    plt.savefig(os.path.join(output_dir, 'TrainMap.png'), dpi=300)
+    plt.close()
 
+    # --- 2. ラベルごとのデータ数ヒートマップ (*TypeMap) ---
     for label in all_possible_labels:
-        plt.figure(figsize=(10, 8)); plt.title(f'Data Count for Label "{label}" (*TypeMap)'); sns.heatmap(node_label_counts[label].T, annot=True, fmt='d', cmap='Reds'); plt.savefig(os.path.join(output_dir, f'{label}TypeMap.png'), dpi=300); plt.close()
+        plt.figure(figsize=(10, 8))
+        plt.title(f'Data Count for Label "{label}" (*TypeMap)')
+        sns.heatmap(node_label_counts[label].T, annot=True, fmt='d', cmap='Reds')
+        plt.xlabel('Node X-index')
+        plt.ylabel('Node Y-index')
+        plt.savefig(os.path.join(output_dir, f'{label}TypeMap.png'), dpi=300)
+        plt.close()
 
+    # --- 3. ラベルごとの割合ヒートマップ (*TypeProportionMap) ---
+    # np.nan_to_numで0除算を回避
     node_proportions = {label: np.nan_to_num(counts / node_total_counts) for label, counts in node_label_counts.items()}
+    
     for label in all_possible_labels:
-        plt.figure(figsize=(10, 8)); plt.title(f'Proportion of Label "{label}" (*TypeProportionMap)'); sns.heatmap(node_proportions[label].T, annot=True, fmt='.2f', cmap='coolwarm', vmin=0, vmax=1); plt.savefig(os.path.join(output_dir, f'{label}TypeProportionMap.png'), dpi=300); plt.close()
+        plt.figure(figsize=(10, 8))
+        plt.title(f'Proportion of Label "{label}" (*TypeProportionMap)')
+        sns.heatmap(node_proportions[label].T, annot=True, fmt='.2f', cmap='coolwarm', vmin=0, vmax=1)
+        plt.xlabel('Node X-index')
+        plt.ylabel('Node Y-index')
+        plt.savefig(os.path.join(output_dir, f'{label}TypeProportionMap.png'), dpi=300)
+        plt.close()
+
 
 def plot_som_seasonal_distribution(results, output_dir):
-    """SOMノードの季節・月ごとの分布図を作成"""
+    """
+    5. 月・季節の分布図 (NodeMonthDistribution.png)
+    目的: 各ノードの季節性・月ごとの集中度を可視化する。
+    """
     logging.info("SOMノードの季節・月ごとの分布図の作成を開始...")
     
-    som = results['som']; data_for_som = results['data_for_som']; valid_time = results['valid_time']
+    som = results['som']
+    data_for_som = results['data_for_som']
+    valid_time = results['valid_time']
     map_x, map_y = som.get_weights().shape[:2]
     
+    # --- マッピング定義 ---
     month_to_season = {m:s for s, months in {'冬': [12, 1, 2], '春': [3, 4, 5], '夏': [6, 7, 8], '秋': [9, 10, 11]}.items() for m in months}
+    seasons = ["春", "夏", "秋", "冬"]
     season_colors = {"春": "#FFE4E1", "夏": "#FFC1C1", "秋": "#F5DEB3", "冬": "#ADD8E6", "": "white"}
     
+    # --- データ収集 ---
     win_map_indices = som.win_map(data_for_som, return_indices=True)
     dates = pd.to_datetime(valid_time)
     
+    # --- プロット ---
     fig, axes = plt.subplots(nrows=map_y, ncols=map_x, figsize=(map_x * 1.5, map_y * 1.5))
-    axes = axes.T
+    axes = axes.T # (x,y)座標系に合わせる
 
     for i in range(map_x):
         for j in range(map_y):
-            ax = axes[i, j]; ax.set_xticks([]); ax.set_yticks([]); ax.spines[:].set_visible(False)
-            indices = win_map_indices.get((i, j), []); total_dates = len(indices)
-            if total_dates == 0: ax.set_facecolor('white'); continue
+            ax = axes[i, j]
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values(): spine.set_visible(False)
+
+            indices = win_map_indices.get((i, j), [])
+            total_dates = len(indices)
+
+            if total_dates == 0:
+                ax.set_facecolor('white')
+                continue
+
             node_dates = dates[indices]
+            
+            # 季節と月のカウント
+            season_counts = Counter(d.month_name() for d in node_dates)
+            month_counts = Counter(d.month for d in node_dates)
+            
+            # 最も多い季節
             max_season = Counter(month_to_season[d.month] for d in node_dates).most_common(1)[0][0]
             ax.set_facecolor(season_colors.get(max_season, "white"))
-            top_months = Counter(d.month for d in node_dates).most_common(3)
-            text = f"({i},{j}) N={total_dates}\n{max_season}\n" + "\n".join([f"{pd.to_datetime(f'2000-{m}-01').strftime('%b')}: {c/total_dates:.0%}" for m, c in top_months])
+
+            # 上位3つの月
+            top_months = month_counts.most_common(3)
+            
+            # テキスト表示
+            text = f"({i},{j}) N={total_dates}\n{max_season}\n"
+            text += "\n".join([f"{pd.to_datetime(f'2000-{m}-01').strftime('%b')}: {c/total_dates:.0%}" for m, c in top_months])
+            
             ax.text(0.5, 0.5, text, ha='center', va='center', fontsize=6, transform=ax.transAxes)
 
     plt.suptitle('Seasonal & Monthly Distribution on SOM Nodes', fontsize=14)
@@ -790,41 +839,53 @@ def main():
         logger.info(f"======= 実験 {i+1}/{len(EXPERIMENTS)}: '{exp_name}' を開始します =======")
         start_time_exp = time.time()
         
-        params = DEFAULT_PARAMS.copy(); params.update(exp_params)
+        # --- パラメータ設定 ---
+        params = DEFAULT_PARAMS.copy()
+        params.update(exp_params)
         
         logger.info("--- 実験パラメータ ---")
-        for k, v in params.items(): logger.info(f"- {k}: {v}")
+        for k, v in params.items():
+            logger.info(f"- {k}: {v}")
         logger.info("--------------------")
 
         try:
+            # --- 乱数シード設定 ---
             set_global_seed(GLOBAL_SEED)
+            
+            # --- デバイス設定 ---
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             logger.info(f"使用デバイス: {device}")
-            if str(device) == "cuda": logger.info(f"GPU名: {torch.cuda.get_device_name(0)}")
+            if str(device) == "cuda":
+                logger.info(f"GPU名: {torch.cuda.get_device_name(0)}")
 
+            # 1. データ読み込みと前処理
             data_normalized, labels, lat, lon, valid_time, data_mean, data_std = \
                 load_and_preprocess_data(DATA_FILES[params['data_key']], START_DATE, END_DATE)
 
+            # 2. 次元削減
             data_for_som, model_results = None, None
             if params['method'] == 'MPPCA':
                 data_for_som, model_results = run_mppca(data_normalized, params, device, exp_dir)
-                log_mppca_sample_details(model_results['R'], model_results['all_latent_coords'], valid_time, params, n_samples=5)
             elif params['method'] == 'PCA':
                 data_for_som, model_results = run_pca(data_normalized, params, exp_dir)
             else:
                 raise ValueError(f"未知のメソッドです: {params['method']}")
 
+            # 3. SOMの実行とベストモデル選択
             som, q_error_history, recall_data = run_som(data_for_som, labels, params, exp_dir)
             
+            # 4. 最終評価 (ベストモデルに対して)
             macro_recall, node_dominant_label = evaluate_classification(som, data_for_som, labels)
             
+            # 5. 可視化
+            # 可視化関数に渡すための結果をまとめる
             viz_results = {
                 'params': params,
                 'data_normalized': data_normalized, 'labels': labels, 'lat': lat, 'lon': lon,
                 'data_mean': data_mean, 'data_std': data_std, 'valid_time': valid_time,
                 'data_for_som': data_for_som,
                 'som': som, 'q_error_history': q_error_history,
-                'recall_data': recall_data,
+                'recall_data': recall_data, # ★★★ 新規追加 ★★★
                 'node_dominant_label': node_dominant_label,
                 'mppca_results': model_results if params['method'] == 'MPPCA' else None,
                 'pca_results': model_results if params['method'] == 'PCA' else None,
@@ -833,6 +894,7 @@ def main():
 
         except Exception as e:
             logger.error(f"実験 '{exp_name}' の実行中に致命的なエラーが発生しました。", exc_info=True)
+            # エラー情報をファイルに書き出す
             with open(os.path.join(exp_dir, "ERROR.txt"), "w") as f:
                 f.write(f"An error occurred during experiment: {exp_name}\n")
                 import traceback
@@ -841,12 +903,13 @@ def main():
         finally:
             end_time_exp = time.time()
             logger.info(f"======= 実験 '{exp_name}' 完了。所要時間: {format_duration(end_time_exp - start_time_exp)} =======")
-            print("\n" + "="*80 + "\n")
+            print("\n" + "="*80 + "\n") # コンソール上で実験の区切りを明確にする
 
     main_end_time = time.time()
     print(f"全実験が完了しました。総実行時間: {format_duration(main_end_time - main_start_time)}")
 
+
 if __name__ == '__main__':
     warnings.filterwarnings('ignore', category=UserWarning, module='minisom')
-    warnings.filterwarnings('ignore', category=RuntimeWarning)
+    warnings.filterwarnings('ignore', category=RuntimeWarning) # nanmeanなどで出る警告を抑制
     main()

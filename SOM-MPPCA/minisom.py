@@ -2,7 +2,7 @@ from numpy import (array, unravel_index, nditer, linalg, random, subtract, max,
                    power, exp, zeros, ones, arange, outer, meshgrid, dot,
                    logical_and, mean, cov, argsort, linspace,
                    einsum, prod, nan, sqrt, hstack, diff, argmin, multiply,
-                   nanmean, nansum, tile, array_equal, isclose, bincount)
+                   nanmean, nansum, tile, array_equal, isclose, bincount, nanmax, where, maximum)
 from numpy.linalg import norm
 from collections import defaultdict, Counter
 from warnings import warn
@@ -72,6 +72,10 @@ def fast_norm(x):
     """
     return sqrt(dot(x, x.T))
 
+# isnanをnopythonモードで使えるようにJIT化
+@jit(nopython=True, cache=True)
+def isnan(x):
+    return x != x
 
 # Numba JITコンパイル用のヘルパー関数 (distance_mapのループ部分)
 @jit(nopython=True, cache=True)
@@ -94,10 +98,6 @@ def _distance_map_loop(weights, um, ii, jj):
                             um[x, y, k] = fast_norm(w_2 - w_1)
     return um
 
-# isnanをnopythonモードで使えるようにJIT化
-@jit(nopython=True, cache=True)
-def isnan(x):
-    return x != x
 
 class MiniSom(object):
     Y_HEX_CONV_FACTOR = (3.0 / 2.0) / sqrt(3)
@@ -112,6 +112,7 @@ class MiniSom(object):
                  'for the dimension of the map.')
 
         self._random_generator = random.RandomState(random_seed)
+        self.tqdm_pbar = None # tqdmプログレスバーを保持する変数
 
         self._learning_rate = learning_rate
         self._sigma = sigma
@@ -285,7 +286,6 @@ class MiniSom(object):
 
     def quantization(self, data):
         self._check_input_len(data)
-        # 修正点: nanargmin を NumPy の argmin に変更
         winners_coords = argmin(self._distance_from_weights(data), axis=1)
         return self._weights[unravel_index(winners_coords,
                                            self._weights.shape[:2])]
@@ -356,14 +356,16 @@ class MiniSom(object):
         if verbose:
             print(f'\n quantization error: {q_error}')
 
-    def train_batch(self, data, num_iteration, verbose=False, log_interval=1000):
+    def train_batch(self, data, num_iteration, verbose=False, log_interval=1000, evaluation_callback=None):
         """
         バッチ学習を用いてSOMを訓練します。
         
         :param data: NxD のNumpy配列。Nはサンプル数、Dは特徴次元数。
         :param num_iteration: 学習の反復回数。
         :param verbose: 進捗を表示するかどうか。
-        :param log_interval: 量子化誤差を記録する間隔。
+        :param log_interval: 量子化誤差を記録し、コールバックを呼び出す間隔。
+        :param evaluation_callback: 各ログ間隔で呼び出されるコールバック関数。
+                                    `callback(som_instance, current_iteration)` の形式。
         :return: 量子化誤差の履歴リスト。
         """
         self._check_iteration_number(num_iteration)
@@ -372,10 +374,10 @@ class MiniSom(object):
         quantization_errors = [] # 誤差を記録するリストを初期化
 
         # verboseがTrueの場合、tqdmによるプログレスバーを表示
-        iterations = _build_iteration_indexes(len(data), num_iteration,
-                                                verbose=verbose, use_epochs=False)
-
-        for i in iterations:
+        self.tqdm_pbar = _build_iteration_indexes(len(data), num_iteration,
+                                              verbose=verbose, use_epochs=False)
+        
+        for i in self.tqdm_pbar:
             # 学習率と近傍半径を更新
             eta = self._learning_rate_decay_function(self._learning_rate, i, num_iteration)
             sig = self._sigma_decay_function(self._sigma, i, num_iteration)
@@ -389,20 +391,25 @@ class MiniSom(object):
 
             # バッチ更新のための分子と分母を計算
             for win_pos, data_points in win_map.items():
+                if not data_points: continue
                 h = self.neighborhood(win_pos, sig)
-                numerator += h[:, :, None] * mean(data_points, axis=0)
+                numerator += h[:, :, None] * mean(array(data_points), axis=0)
                 denominator += h
             
             # 重みを更新
             self._weights = numerator / (denominator[:, :, None] + 1e-9)
             
-            # 指定された間隔で量子化誤差を記録
-            if i % log_interval == 0:
+            # 指定された間隔で評価とコールバックを実行
+            if i % log_interval == 0 or i == num_iteration - 1:
                 q_error = self.quantization_error(data)
                 quantization_errors.append(q_error)
                 # tqdmの進捗バーに現在の誤差を表示
-                if verbose and hasattr(iterations, 'set_postfix'):
-                    iterations.set_postfix(q_error=f"{q_error:.5f}")
+                if verbose and hasattr(self.tqdm_pbar, 'set_postfix'):
+                    self.tqdm_pbar.set_postfix(q_error=f"{q_error:.5f}")
+                
+                # コールバック関数が提供されていれば実行
+                if evaluation_callback:
+                    evaluation_callback(self, i)
 
         if verbose:
             q_error = self.quantization_error(data)
@@ -488,7 +495,6 @@ class MiniSom(object):
     def _winners_from_weights(self, data):
         """Helper function to return the winner coordinates for all data points."""
         distances = self._distance_from_weights(data)
-        # 修正点: nanargmin を NumPy の argmin に変更
         winner_indices = argmin(distances, axis=1)
         return [unravel_index(i, self._weights.shape[:2]) for i in winner_indices]
 
@@ -497,10 +503,9 @@ class MiniSom(object):
 def nanargmin(arr):
     min_val = float('inf')
     min_idx = -1
-    for i in range(arr.shape[0]):
-        if not isnan(arr[i]) and arr[i] < min_val:
-            min_val = arr[i]
+    flat_arr = arr.flatten()
+    for i in range(flat_arr.shape[0]):
+        if not isnan(flat_arr[i]) and flat_arr[i] < min_val:
+            min_val = flat_arr[i]
             min_idx = i
     return min_idx
-
-from numpy import nanmax, where, maximum
