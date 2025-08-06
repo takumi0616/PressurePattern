@@ -17,7 +17,7 @@ from collections import Counter
 
 # ファイルパスとディレクトリ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-RESULT_DIR = './two_stage_clustering_results'
+RESULT_DIR = './two_stage_clustering_results_v2'
 
 # データ期間 (データセットに合わせて調整してください)
 START_DATE = '1991-01-01'
@@ -48,7 +48,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 logging.info(f"使用デバイス: {device.upper()}")
 
-# --- 3. データ準備関数 (元データも返すように修正) ---
+# --- 3. データ準備関数 (空間偏差処理を追加) ---
 def load_and_prepare_data(filepath, start_date, end_date, device):
     logging.info(f"データファイル '{filepath}' を読み込んでいます...")
     ds = xr.open_dataset(filepath)
@@ -66,8 +66,14 @@ def load_and_prepare_data(filepath, start_date, end_date, device):
     # 元のデータをnumpy配列として保持 (hPa単位)
     original_data_numpy = msl_data.values / 100.0 # PaからhPaへ変換
 
-    # 正規化処理
-    flattened_data = original_data_numpy.reshape(n_samples, d_lat * d_lon)
+    # 各日のデータから、その日の空間平均値を引く (空間偏差を計算)
+    logging.info("各日のデータから空間平均値を減算し、空間偏差データを生成しています...")
+    spatial_mean = np.mean(original_data_numpy, axis=(1, 2), keepdims=True)
+    spatial_anomaly_data = original_data_numpy - spatial_mean
+
+    # 時間的な正規化処理（ピクセルごとの標準化）
+    # 入力データを元のデータから空間偏差データに変更
+    flattened_data = spatial_anomaly_data.reshape(n_samples, d_lat * d_lon)
     mean = np.mean(flattened_data, axis=0, keepdims=True)
     std = np.std(flattened_data, axis=0, keepdims=True)
     std[std == 0] = 1
@@ -83,7 +89,8 @@ def load_and_prepare_data(filepath, start_date, end_date, device):
     logging.info(f"データ期間: {START_DATE} から {END_DATE}")
     logging.info(f"データ形状: {X_normalized.shape[0]}サンプル, {X_normalized.shape[1]}次元 ({d_lat}x{d_lon})")
     
-    return X_normalized, original_data_numpy, lat_coords, lon_coords, time_stamps, labels
+    # 可視化のために空間偏差データも返す
+    return X_normalized, original_data_numpy, spatial_anomaly_data, lat_coords, lon_coords, time_stamps, labels
 
 # --- 4. SSIMおよびクラスタリング関連関数 (最適化版) ---
 
@@ -278,6 +285,16 @@ def two_stage_clustering(X, th_merge, all_labels, all_time_stamps, base_labels, 
                 logging.warning("k-medoids中に空のクラスタが生成されました。前の状態を維持します。")
                 medoids = current_medoids 
                 clusters = [[] for _ in range(len(medoids))]
+                # 警告が出た場合、最新の有効な割り当てを再計算
+                valid_medoid_data = X[[m for m in medoids if m is not None]]
+                all_ssim_to_medoids_recalc = torch.zeros((n_samples, len(valid_medoid_data)), device=device)
+                for i in tqdm(range(0, n_samples, batch_size), desc="k-medoids: 割り当て再計算中", leave=False):
+                    end_idx = min(i + batch_size, n_samples)
+                    x_batch = X[i:end_idx]
+                    ssim_scores_batch_recalc = calculate_ssim_pairwise_batch(x_batch, valid_medoid_data)
+                    all_ssim_to_medoids_recalc[i:end_idx, :] = ssim_scores_batch_recalc
+                
+                assignments = torch.argmax(all_ssim_to_medoids_recalc, dim=1)
                 for i in range(n_samples): clusters[assignments[i]].append(i)
                 break
             
@@ -293,7 +310,7 @@ def two_stage_clustering(X, th_merge, all_labels, all_time_stamps, base_labels, 
 
     return clusters, medoids
 
-# --- 7. 新機能：可視化関数 ---
+# --- 7. 可視化関数 ---
 def plot_final_distribution_summary(clusters, all_labels, all_time_stamps, base_labels, save_dir):
     """最終的なクラスタのラベル分布と月別分布をヒートマップで可視化する"""
     logging.info("最終的な分布の可視化画像を作成中...")
@@ -342,10 +359,9 @@ def plot_final_distribution_summary(clusters, all_labels, all_time_stamps, base_
     plt.close()
     logging.info(f"分布の可視化画像を保存: {save_path}")
 
-def save_daily_maps_for_clusters(clusters, original_data, lat, lon, ts, labels, base_labels, save_dir):
-    """各クラスタの日別気圧配置図をフォルダ分けして保存する"""
-    logging.info("クラスタ別の日次気圧配置図を保存中...")
-    maps_main_dir = os.path.join(save_dir, 'daily_maps')
+def save_daily_maps_for_clusters(clusters, spatial_anomaly_data, lat, lon, ts, labels, base_labels, save_dir):
+    logging.info("クラスタ別の日次気圧配置図（空間偏差）を保存中...")
+    maps_main_dir = os.path.join(save_dir, 'daily_anomaly_maps')
     os.makedirs(maps_main_dir, exist_ok=True)
     
     # 各クラスタの主要ラベルを特定
@@ -360,6 +376,13 @@ def save_daily_maps_for_clusters(clusters, original_data, lat, lon, ts, labels, 
         else:
             dominant_labels[i] = ""
 
+    cmap = plt.get_cmap('RdBu_r')
+    pressure_vmin = -40
+    pressure_vmax = 40
+    pressure_levels = np.linspace(pressure_vmin, pressure_vmax, 21)
+    norm = Normalize(vmin=pressure_vmin, vmax=pressure_vmax)
+    line_levels = np.arange(pressure_vmin, pressure_vmax + 1, 10) # 偏差の等高線
+
     for i, cluster_indices in enumerate(tqdm(clusters, desc="Saving daily maps")):
         dom_label = dominant_labels.get(i, "")
         cluster_dir = os.path.join(maps_main_dir, f'cluster_{i+1:02d}_dom_label_{dom_label}')
@@ -369,32 +392,16 @@ def save_daily_maps_for_clusters(clusters, original_data, lat, lon, ts, labels, 
             fig = plt.figure(figsize=(6, 5))
             ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
             
-            pressure_map = original_data[data_idx].reshape(len(lat), len(lon))
-            
-            # ▼▼▼▼▼ 描画スタイルを final_clusters 形式に統一 ▼▼▼▼▼
-            # 1. 発散型カラーマップRdBu_rを使用
-            cmap = plt.get_cmap('RdBu_r')
-
-            # 2. 標準大気圧(1013.25hPa)を中心に色を割り当て
-            center_pressure = 1013.25
-            pressure_span = 35  # 中心から±35hPaの範囲を描画
-            vmin, vmax = center_pressure - pressure_span, center_pressure + pressure_span
-            norm = Normalize(vmin=vmin, vmax=vmax)
-
-            # 3. 塗りつぶしの等高線レベルを細かく設定し、滑らかな描画に
-            fill_levels = np.linspace(vmin, vmax, 21)
-            
-            # 4. 見やすいように4hPaごとに線を描画
-            line_levels = np.arange(960, 1061, 4)
+            # 元データではなく、空間偏差データをプロット
+            pressure_map = spatial_anomaly_data[data_idx].reshape(len(lat), len(lon))
             
             # 塗りつぶし等高線
-            cont = ax.contourf(lon, lat, pressure_map, levels=fill_levels, cmap=cmap, norm=norm, extend='both')
+            cont = ax.contourf(lon, lat, pressure_map, levels=pressure_levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
             cbar = fig.colorbar(cont, ax=ax, orientation='vertical', pad=0.05, aspect=20)
-            cbar.set_label('Sea Level Pressure (hPa)')
+            cbar.set_label('Sea Level Pressure Anomaly (hPa)')
             
-            # 線状の等高線
-            ax.contour(lon, lat, pressure_map, levels=line_levels, colors='k', linewidths=0.5)
-            # ▲▲▲▲▲ スタイル統一ここまで ▲▲▲▲▲
+            # 線状の等高線（黒色）
+            ax.contour(lon, lat, pressure_map, levels=line_levels, colors='k', linewidths=0.5, transform=ccrs.PlateCarree())
 
             ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.5)
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
@@ -408,27 +415,39 @@ def save_daily_maps_for_clusters(clusters, original_data, lat, lon, ts, labels, 
             plt.savefig(save_path)
             plt.close(fig)
 
-def plot_final_clusters(medoids, clusters, X, lat_coords, lon_coords, time_stamps, all_labels, base_labels, save_dir):
+def plot_final_clusters(medoids, clusters, spatial_anomaly_data, lat_coords, lon_coords, time_stamps, all_labels, base_labels, save_dir):
     num_clusters = len(medoids)
-    logging.info(f"最終結果をプロット中... 合計{num_clusters}クラスタ")
+    logging.info(f"最終結果（空間偏差図）をプロット中... 合計{num_clusters}クラスタ")
     n_cols = 5
     n_rows = (num_clusters + n_cols - 1) // n_cols if num_clusters > 0 else 1
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 3.5), subplot_kw={"projection": ccrs.PlateCarree()})
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 4, n_rows * 4), subplot_kw={"projection": ccrs.PlateCarree()})
     axes = np.atleast_1d(axes).flatten()
-    vmax = 3; vmin = -vmax
-    cmap = plt.get_cmap('RdBu_r'); norm = Normalize(vmin=vmin, vmax=vmax)
+
+    # 可視化スタイルの設定 (batchsomv15.py に合わせる)
+    cmap = plt.get_cmap('RdBu_r')
+    pressure_vmin = -40
+    pressure_vmax = 40
+    pressure_levels = np.linspace(pressure_vmin, pressure_vmax, 21)
+    norm = Normalize(vmin=pressure_vmin, vmax=pressure_vmax)
     
     for i in range(num_clusters):
         ax = axes[i]
         if medoids[i] is None:
             ax.set_title(f'Cluster {i+1} (Empty)'); ax.axis("off"); continue
-        medoid_pattern_2d = X[medoids[i]].cpu().numpy().reshape(len(lat_coords), len(lon_coords))
-        cont = ax.contourf(lon_coords, lat_coords, medoid_pattern_2d, levels=np.linspace(vmin, vmax, 21), cmap=cmap, extend="both", norm=norm)
-        ax.contour(lon_coords, lat_coords, medoid_pattern_2d, colors="k", linewidths=0.5, levels=np.arange(vmin, vmax+1, 1))
+        
+        # 標準化データ(X)ではなく、空間偏差データ(spatial_anomaly_data)からメドイドパターンを取得
+        medoid_pattern_2d = spatial_anomaly_data[medoids[i]].reshape(len(lat_coords), len(lon_coords))
+
+        # 塗りつぶし等高線
+        cont = ax.contourf(lon_coords, lat_coords, medoid_pattern_2d, levels=pressure_levels, cmap=cmap, extend="both", norm=norm, transform=ccrs.PlateCarree())
+        # 線状の等高線（黒色）
+        ax.contour(lon_coords, lat_coords, medoid_pattern_2d, colors="k", linewidths=0.5, levels=pressure_levels, transform=ccrs.PlateCarree())
+        
         ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.5)
         ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
+        
         cluster_indices = clusters[i]
-        frequency = len(cluster_indices) / X.shape[0] * 100
+        frequency = len(cluster_indices) / spatial_anomaly_data.shape[0] * 100
         medoid_date = pd.to_datetime(str(time_stamps[medoids[i]])).strftime('%Y-%m-%d')
         dominant_label_str = ""
         if all_labels:
@@ -439,20 +458,22 @@ def plot_final_clusters(medoids, clusters, X, lat_coords, lon_coords, time_stamp
         ax.set_title(f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\n{dominant_label_str}\nMedoid Date: {medoid_date}', fontsize=8)
 
     for i in range(num_clusters, len(axes)): axes[i].axis("off")
-    fig.suptitle(f'Final Synoptic Patterns (Medoids) - TH_merge={TH_MERGE}', fontsize=16)
+    fig.suptitle(f'Final Synoptic Patterns (Medoids of Spatial Anomaly) - TH_merge={TH_MERGE}', fontsize=16)
     fig.tight_layout(rect=[0, 0, 0.9, 0.95])
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-    fig.colorbar(cont, cax=cbar_ax, label="Standardized Pressure Anomaly")
-    save_path = os.path.join(save_dir, f'final_clusters_th{TH_MERGE}.png')
+    # カラーバーのラベルを変更
+    fig.colorbar(cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
+    save_path = os.path.join(save_dir, f'final_clusters_anomaly_th{TH_MERGE}.png')
     plt.savefig(save_path)
     plt.close()
-    logging.info(f"最終クラスタの画像を保存: {save_path}")
+    logging.info(f"最終クラスタの画像（空間偏差図）を保存: {save_path}")
 
 # --- 8. メイン実行ブロック ---
 if __name__ == '__main__':
     logging.info("--- 2段階クラスタリングプログラム開始 ---")
     
-    X_normalized, X_original, lat, lon, ts, labels = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE, device)
+    # 戻り値に spatial_anomaly_data を追加
+    X_normalized, X_original, X_anomaly, lat, lon, ts, labels = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE, device)
     
     if X_normalized is not None:
         start_time = time.time()
@@ -471,18 +492,18 @@ if __name__ == '__main__':
         if labels:
             calculate_and_log_macro_recall(final_clusters, labels, BASE_LABELS, "最終結果")
         
-        # 最終結果の可視化と保存
+        # 最終結果の保存
         results = {'medoid_indices': final_medoids, 'clusters': final_clusters}
         torch.save(results, os.path.join(RESULT_DIR, f'clustering_result_th{TH_MERGE}.pt'))
         logging.info(f"クラスタリング結果を保存しました。")
         
-        # 全ての可視化関数を呼び出し
+        # 改善された可視化関数を呼び出し
         if labels and ts is not None:
             plot_final_distribution_summary(final_clusters, labels, ts, BASE_LABELS, RESULT_DIR)
         
-        if X_original is not None:
-            save_daily_maps_for_clusters(final_clusters, X_original, lat, lon, ts, labels, BASE_LABELS, RESULT_DIR)
+        if X_anomaly is not None:
+            save_daily_maps_for_clusters(final_clusters, X_anomaly, lat, lon, ts, labels, BASE_LABELS, RESULT_DIR)
 
-    plot_final_clusters(final_medoids, final_clusters, X_normalized, lat, lon, ts, labels, BASE_LABELS, RESULT_DIR)
+        plot_final_clusters(final_medoids, final_clusters, X_anomaly, lat, lon, ts, labels, BASE_LABELS, RESULT_DIR)
 
     logging.info("--- プログラム終了 ---")
