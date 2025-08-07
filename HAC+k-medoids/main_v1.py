@@ -17,14 +17,14 @@ from collections import Counter
 
 # ファイルパスとディレクトリ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-RESULT_DIR = './two_stage_clustering_results'
+RESULT_DIR = './two_stage_clustering_results_v1_045'
 
 # データ期間 (データセットに合わせて調整してください)
 START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'
 
 # 2段階クラスタリングアルゴリズムのパラメータ
-TH_MERGE = 0.40
+TH_MERGE = 0.45
 
 # 安定化定数
 C1 = 1e-8
