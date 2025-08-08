@@ -21,13 +21,13 @@ RESULT_DIR = './s1_score_clustering_results' # 結果保存ディレクトリ名
 
 # データ期間 (データセットに合わせて調整してください)
 START_DATE = '1991-01-01'
-END_DATE = '2000-12-31'
+END_DATE = '1993-12-31'
 
 # 2段階クラスタリングアルゴリズムのパラメータ
 # 注意: この閾値はS1スコア用です。S1スコアは小さいほど類似度が高いため、
 # 元のSSIM(大きいほど類似度が高い)とは意味合いが異なります。
 # 最適な結果を得るには、この値を調整する必要があります。
-TH_MERGE = 0.4 # S1スコア用に値を調整 (例)
+TH_MERGE = 0.01 # S1スコア用に値を調整 (例)
 
 # S1スコア計算時のゼロ除算を避けるための微小定数
 EPSILON = 1e-9
@@ -523,6 +523,43 @@ if __name__ == '__main__':
     
     # 戻り値に d_lat, d_lon を追加
     X_normalized, X_original, X_anomaly, lat, lon, d_lat, d_lon, ts, labels = load_and_prepare_data(DATA_FILE, START_DATE, END_DATE, device)
+
+    # ===== ここから調査用コードを追加 =====
+    logging.info("S1スコアの分布を調査します...")
+    # 全データで計算すると時間がかかりすぎるため、200個をランダムに抽出
+    num_samples_to_check = 200
+    if len(X_normalized) > num_samples_to_check:
+        indices = np.random.choice(len(X_normalized), num_samples_to_check, replace=False)
+        X_sample = X_normalized[indices]
+    else:
+        X_sample = X_normalized
+
+    # ペアワイズでS1スコアを計算
+    s1_matrix_sample = torch.zeros((len(X_sample), len(X_sample)), device=device)
+    for i in tqdm(range(0, len(X_sample), CALCULATION_BATCH_SIZE), desc="S1スコア分布調査中"):
+        end_idx = min(i + CALCULATION_BATCH_SIZE, len(X_sample))
+        x_batch = X_sample[i:end_idx]
+        s1_matrix_sample[i:end_idx, :] = calculate_s1_pairwise_batch(x_batch, X_sample, d_lat, d_lon)
+
+    # 対角成分（自分自身との比較）を除外して1次元配列に
+    s1_scores_flat = s1_matrix_sample[~torch.eye(len(X_sample), dtype=bool)].cpu().numpy()
+
+    # ヒストグラムをプロットして保存
+    plt.figure(figsize=(10, 6))
+    plt.hist(s1_scores_flat, bins=50, alpha=0.7, color='blue')
+    plt.title('Distribution of S1 Scores (Sample)')
+    plt.xlabel('S1 Score (Lower is more similar)')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    s1_dist_path = os.path.join(RESULT_DIR, 's1_score_distribution.png')
+    plt.savefig(s1_dist_path)
+    plt.close()
+    logging.info(f"S1スコアの分布図を保存しました: {s1_dist_path}")
+    
+    # 調査が終わったらプログラムを終了させる (本格的なクラスタリングは実行しない)
+    import sys
+    sys.exit()
+    # ===== 調査用コードここまで =====
     
     if X_normalized is not None:
         start_time = time.time()
