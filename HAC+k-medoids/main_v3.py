@@ -25,7 +25,7 @@ END_DATE = '2000-12-31'
 
 # 2段階クラスタリングアルゴリズムのパラメータ
 # 注意: この閾値はS1スコア用。S1は小さいほど類似。
-TH_MERGE = 90.0
+TH_MERGE = 85.0
 
 # S1スコア計算時のゼロ除算回避
 EPSILON = 1e-9
@@ -589,9 +589,9 @@ if __name__ == '__main__':
         logging.info(f"最終的なクラスタ数: {len(final_clusters)}")
         
         # 詳細分析と評価
-        # analyze_cluster_distribution(final_clusters, labels, ts, BASE_LABELS, "最終結果")
-        # if labels:
-        #     calculate_and_log_macro_recall(final_clusters, labels, BASE_LABELS, "最終結果")
+        analyze_cluster_distribution(final_clusters, labels, ts, BASE_LABELS, "最終結果")
+        if labels:
+            calculate_and_log_macro_recall(final_clusters, labels, BASE_LABELS, "最終結果")
         
         # 結果保存
         results = {'medoid_indices': final_medoids, 'clusters': final_clusters}
