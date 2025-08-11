@@ -12,6 +12,7 @@ from matplotlib.colors import Normalize
 from tqdm import tqdm
 import time
 from collections import Counter
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
 # --- 1. 設定項目 ---
 
@@ -25,7 +26,7 @@ END_DATE = '2000-12-31'
 
 # 2段階クラスタリングアルゴリズムのパラメータ
 # 注意: この閾値はS1スコア用。S1は小さいほど類似。
-TH_MERGE = 88
+TH_MERGE = 89
 
 # S1スコア計算時のゼロ除算回避
 EPSILON = 1e-9
@@ -159,7 +160,8 @@ def find_medoid_torch(cluster_indices, X, batch_size, d_lat, d_lon):
     medoid_pos_in_cluster = torch.argmin(s1_sum)
     return cluster_indices[medoid_pos_in_cluster]
 
-# --- 5. 分布/評価（変更なし） ---
+# --- 5. 分布/評価 ---
+
 def analyze_cluster_distribution(clusters, all_labels, all_time_stamps, base_labels, iteration_name):
     logging.info(f"\n--- {iteration_name} クラスタ分布分析 ---")
     for i, cluster_indices in enumerate(clusters):
@@ -188,43 +190,142 @@ def analyze_cluster_distribution(clusters, all_labels, all_time_stamps, base_lab
                 logging.info(f"    - {month_val:2d}月: {count:4d}件 ({percentage:5.1f}%) {bar}")
     logging.info(f"--- {iteration_name} 分析終了 ---\n")
 
-def calculate_and_log_macro_recall(clusters, all_labels, base_labels, iteration_name):
-    logging.info(f"\n--- {iteration_name} マクロ平均再現率 (精度) 計算 ---")
-    cluster_names = [f'Cluster_{i+1}' for i in range(len(clusters))]
-    confusion_matrix = pd.DataFrame(0, index=base_labels, columns=cluster_names)
-    
-    for i, cluster_indices in enumerate(clusters):
-        cluster_name = cluster_names[i]
-        cluster_true_labels = [all_labels[j] for j in cluster_indices if all_labels[j] in base_labels]
+def evaluate_clusters_majority_recall(clusters, all_labels, base_labels, iteration_name):
+    """
+    各クラスタで多数決により代表ラベルを決定し、
+    各ラベル l の Recall_l = (代表が l のクラスタ群に含まれる l の件数合計) / (ラベル l の総件数)
+    を計算。マクロ平均再現率（出現ラベルの平均）を出力する。
+    参考として、マイクロ精度（base_labels対象）と ARI/NMI も併せてログ出力。
+    """
+    logging.info(f"\n--- {iteration_name} 評価 (クラスタ多数決ベースのマクロ平均再現率) ---")
+
+    if not all_labels:
+        logging.warning("真のラベルがないため評価をスキップします。")
+        return None
+
+    n_samples = len(all_labels)
+    num_clusters = len(clusters)
+    cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
+
+    # 1) 混同行列（行: 基本ラベル, 列: クラスタ）
+    confusion_matrix = pd.DataFrame(0, index=base_labels, columns=cluster_names, dtype=int)
+    for i, idxs in enumerate(clusters):
+        if not idxs:
+            continue
+        cluster_true_labels = [all_labels[j] for j in idxs if all_labels[j] in base_labels]
         label_counts = Counter(cluster_true_labels)
         for label, count in label_counts.items():
-            confusion_matrix.loc[label, cluster_name] = count
-            
-    logging.info("【混同行列 (Confusion Matrix)】")
-    logging.info(f"\n{confusion_matrix.to_string()}")
+            confusion_matrix.loc[label, cluster_names[i]] = count
 
-    logging.info("\n【各ラベルの再現率 (Recall) 計算過程】")
-    logging.info("Recall = TP / (TP + FN)")
-    
-    recalls = []
-    representative_clusters = confusion_matrix.idxmax(axis=1)
-    
-    for label in base_labels:
-        total_positives = confusion_matrix.loc[label].sum()
-        if total_positives == 0:
-            logging.info(f" - ラベル '{label}': データなし。Recall = N/A")
+    present_labels = [lbl for lbl in base_labels if confusion_matrix.loc[lbl].sum() > 0]
+    if len(present_labels) == 0:
+        logging.warning("基本ラベルに該当するデータがありません。評価をスキップします。")
+        return None
+
+    logging.info("【混同行列 (基本ラベルのみ)】")
+    logging.info(f"\n{confusion_matrix.loc[present_labels, :].to_string()}")
+
+    # 2) 各クラスタの代表ラベル r(k)（多数決）
+    cluster_majority = {}  # k -> label or None
+    logging.info("\n【各クラスタの多数決（代表ラベル）】")
+    total_base_count = int(confusion_matrix.values.sum())
+    micro_correct_sum = 0  # base_labelsのみでのマイクロ精度用分子（各クラスタの最大件数の合計）
+
+    for k in range(num_clusters):
+        col = cluster_names[k]
+        col_counts = confusion_matrix[col]
+        col_sum = int(col_counts.sum())
+
+        if col_sum == 0:
+            cluster_majority[k] = None
+            logging.info(f" - {col:<12}: 代表ラベル=None（基本ラベルの出現なし）")
             continue
-        pred_cluster_for_label = representative_clusters[label]
-        true_positives = confusion_matrix.loc[label, pred_cluster_for_label]
-        recall = true_positives / total_positives
-        recalls.append(recall)
-        logging.info(f" - ラベル '{label}': 代表={pred_cluster_for_label}, TP={true_positives}, 全数={total_positives}, Recall={recall:.4f}")
 
-    macro_recall = np.mean(recalls) if recalls else 0.0
-    logging.info("\n【最終スコア】")
-    logging.info(f"マクロ平均再現率 (Macro-Average Recall) = {macro_recall:.4f}")
-    logging.info(f"--- {iteration_name} 精度計算終了 ---\n")
-    return macro_recall
+        top_label = col_counts.idxmax()  # 同数タイの場合、index順（= BASE_LABELS の順）で先勝
+        top_count = int(col_counts.max())
+        micro_correct_sum += top_count
+        share = top_count / col_sum if col_sum > 0 else 0.0
+
+        cluster_majority[k] = top_label
+        # 上位3件程度までの分布をログ（見やすさのため）
+        top3 = col_counts.sort_values(ascending=False)[:3]
+        top3_str = ", ".join([f"{lbl}:{int(cnt)}" for lbl, cnt in top3.items()])
+        logging.info(f" - {col:<12}: 代表={top_label:<3}  件数={top_count:4d}  シェア={share:5.2f}  | 上位: {top3_str}")
+
+    # 3) 各ラベルの再現率 Recall_l
+    metrics = {}
+    per_label = {}
+    logging.info("\n【各ラベルの再現率 (クラスタ多数決ベース)】")
+    for lbl in present_labels:
+        row_sum = int(confusion_matrix.loc[lbl, :].sum())  # N_l
+        # 代表が lbl になっているクラスタの列のみを合計（分子 M_l）
+        cols_for_lbl = [cluster_names[k] for k in range(num_clusters) if cluster_majority.get(k, None) == lbl]
+        if len(cols_for_lbl) == 0:
+            num_correct = 0
+        else:
+            num_correct = int(confusion_matrix.loc[lbl, cols_for_lbl].sum())
+
+        recall = num_correct / row_sum if row_sum > 0 else 0.0
+        per_label[lbl] = {
+            'Total': row_sum,
+            'CorrectInMajorityClusters': num_correct,
+            'Recall': recall,
+            'MajorityClusters': cols_for_lbl
+        }
+        logging.info(f" - {lbl:<3}: N={row_sum:4d}, "
+                     f"Correct(代表クラスタ群内)={num_correct:4d}, "
+                     f"Recall={recall:.4f}, 代表クラスタ={cols_for_lbl if cols_for_lbl else 'なし'}")
+
+    macro_recall = float(np.mean([per_label[l]['Recall'] for l in present_labels]))
+    metrics['MacroRecall_majority'] = macro_recall
+
+    logging.info("\n【集計】")
+    logging.info(f"Macro Recall (多数決ベース) = {macro_recall:.4f}")
+
+    # 4) 参考: マイクロ精度（base_labels に含まれるデータ対象）
+    micro_accuracy = micro_correct_sum / total_base_count if total_base_count > 0 else 0.0
+    metrics['MicroAccuracy_majority'] = micro_accuracy
+    logging.info(f"Micro Accuracy (多数決, base_labels対象) = {micro_accuracy:.4f}")
+
+    # 5) 参考: ARI/NMI（base_labels のみ対象、予測ラベル=クラスタ多数決）
+    # サンプル -> 所属クラスタID
+    sample_to_cluster = [-1] * n_samples
+    for ci, idxs in enumerate(clusters):
+        for j in idxs:
+            sample_to_cluster[j] = ci
+
+    y_true, y_pred = [], []
+    for j in range(n_samples):
+        true_lbl = all_labels[j]
+        if true_lbl not in present_labels:
+            continue  # base_labelsに含まれない真ラベルは評価対象外
+        ci = sample_to_cluster[j]
+        if ci < 0:
+            continue
+        pred_lbl = cluster_majority.get(ci, None)
+        if pred_lbl is None:
+            pred_lbl = "Unassigned"
+        y_true.append(true_lbl)
+        y_pred.append(pred_lbl)
+
+    # 数値エンコードして計算
+    if len(y_true) > 0:
+        uniq_true = {l: i for i, l in enumerate(sorted(set(y_true)))}
+        uniq_pred = {l: i for i, l in enumerate(sorted(set(y_pred)))}
+        y_true_idx = [uniq_true[l] for l in y_true]
+        y_pred_idx = [uniq_pred[l] for l in y_pred]
+
+        ari = adjusted_rand_score(y_true_idx, y_pred_idx)
+        nmi = normalized_mutual_info_score(y_true_idx, y_pred_idx)
+        metrics['ARI_majority'] = float(ari)
+        metrics['NMI_majority'] = float(nmi)
+        logging.info(f"Adjusted Rand Index (多数決) = {ari:.4f}")
+        logging.info(f"Normalized Mutual Info (多数決) = {nmi:.4f}")
+    else:
+        logging.info("base_labels に該当する評価対象サンプルがないため、ARI/NMI は計算しません。")
+
+    logging.info(f"--- {iteration_name} 評価終了 ---\n")
+    return metrics
 
 # --- 6. 2段階クラスタリング（HACをMNNマージに変更） ---
 def two_stage_clustering(X, th_merge, all_labels, all_time_stamps, base_labels, batch_size, d_lat, d_lon):
@@ -544,17 +645,12 @@ if __name__ == '__main__':
         DATA_FILE, START_DATE, END_DATE, device
     )
 
-    # ===== S1スコア分布の簡易調査 =====
-    logging.info("S1スコアの分布を調査します...")
-    num_samples_to_check = 200
-    if len(X_normalized) > num_samples_to_check:
-        indices = np.random.choice(len(X_normalized), num_samples_to_check, replace=False)
-        X_sample = X_normalized[indices]
-    else:
-        X_sample = X_normalized
+    # ===== S1スコア分布の調査（全データ） =====
+    logging.info("S1スコアの分布を全データで調査します...")
+    X_sample = X_normalized  # 全データを対象
 
     s1_matrix_sample = torch.zeros((len(X_sample), len(X_sample)), device=device)
-    for i in tqdm(range(0, len(X_sample), CALCULATION_BATCH_SIZE), desc="S1スコア分布調査中"):
+    for i in tqdm(range(0, len(X_sample), CALCULATION_BATCH_SIZE), desc="S1スコア分布調査中 (ALL)"):
         end_idx = min(i + CALCULATION_BATCH_SIZE, len(X_sample))
         x_batch = X_sample[i:end_idx]
         s1_matrix_sample[i:end_idx, :] = calculate_s1_pairwise_batch(x_batch, X_sample, d_lat, d_lon)
@@ -565,14 +661,14 @@ if __name__ == '__main__':
 
     plt.figure(figsize=(10, 6))
     plt.hist(s1_scores_flat, bins=50, alpha=0.7, color='blue')
-    plt.title('Distribution of S1 Scores (Sample)')
+    plt.title('Distribution of S1 Scores (All Data)')
     plt.xlabel('S1 Score (Lower is more similar)')
     plt.ylabel('Frequency')
     plt.grid(True)
-    s1_dist_path = os.path.join(RESULT_DIR, 's1_score_distribution.png')
+    s1_dist_path = os.path.join(RESULT_DIR, 's1_score_distribution.png')  # 必要ならファイル名を *_all に変更可
     plt.savefig(s1_dist_path)
     plt.close()
-    logging.info(f"S1スコアの分布図を保存しました: {s1_dist_path}")
+    logging.info(f"S1スコアの分布図(ALL)を保存しました: {s1_dist_path}")
     # ===== ここまで =====
     
     if X_normalized is not None:
@@ -590,9 +686,11 @@ if __name__ == '__main__':
         
         # 詳細分析と評価
         analyze_cluster_distribution(final_clusters, labels, ts, BASE_LABELS, "最終結果")
+
+        # 新仕様：クラスタ多数決ベースのマクロ平均再現率
         if labels:
-            calculate_and_log_macro_recall(final_clusters, labels, BASE_LABELS, "最終結果")
-        
+            _ = evaluate_clusters_majority_recall(final_clusters, labels, BASE_LABELS, "最終結果")
+
         # 結果保存
         results = {'medoid_indices': final_medoids, 'clusters': final_clusters}
         torch.save(results, os.path.join(RESULT_DIR, f'clustering_result_th{TH_MERGE}.pt'))
