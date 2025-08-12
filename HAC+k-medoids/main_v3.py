@@ -27,7 +27,7 @@ from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 import random
 
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-RESULT_DIR = './s1_score_clustering_results'
+RESULT_DIR = './v3_clustering_results'
 
 START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'

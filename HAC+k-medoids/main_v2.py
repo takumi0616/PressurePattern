@@ -31,7 +31,7 @@ import random
 # --- 1. 設定項目 ---
 
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-RESULT_DIR = './two_stage_clustering_results_04'
+RESULT_DIR = './v2_clustering_results'
 
 START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'
@@ -46,7 +46,7 @@ BASE_LABELS = [
     '4A', '4B', '5', '6A', '6B', '6C'
 ]
 
-CALCULATION_BATCH_SIZE = 32
+CALCULATION_BATCH_SIZE = 16
 
 # タイブレーク用の極小値（浮動小数誤差より十分小さく）
 TIE_EPS = 1e-12
