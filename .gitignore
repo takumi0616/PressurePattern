@@ -48,8 +48,6 @@ nc/era5_msl/
 
 *.png
 
-*.pdf
-
 *.csv
 
 *.pkl
