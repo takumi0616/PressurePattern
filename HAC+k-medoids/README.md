@@ -6,6 +6,8 @@
 nohup python main_v2.py > main_v2.log 2>&1 &
 
 nohup python main_v3.py > main_v3.log 2>&1 &
+
+nohup python main_v4.py > main_v4.log 2>&1 &
 ```
 
 ## タスクの削除
@@ -14,6 +16,8 @@ nohup python main_v3.py > main_v3.log 2>&1 &
 pkill -f "main_v2.py"
 
 pkill -f "main_v3.py"
+
+pkill -f "main_v4.py"
 ```
 
 # プログラム説明
