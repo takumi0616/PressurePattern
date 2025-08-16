@@ -33,16 +33,16 @@ SEED = 42                 # 乱数シード（再現性）
 TH_MERGE = 83             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
 
 # 2段階クラスタリング用の行バッチと列チャンク
-CLUS_ROW_BATCH = 4        # 行バッチ（B）。8でOOMが出たので2〜4程度を推奨
-CLUS_COL_CHUNK = 256       # 列チャンク（Nc）。16〜64程度で調整
+CLUS_ROW_BATCH = 16        # 行バッチ（B）。8でOOMが出たので2〜4程度を推奨
+CLUS_COL_CHUNK = 1024      # 列チャンク（Nc）。16〜64程度で調整
 
 # SOM学習・推論用のバッチサイズ（メドイド数が少ないので大きめでもOK）
 SOM_BATCH_SIZE = 32
 
 # S1分布ヒストグラム用の設定（計算コスト削減のためのサンプル上限とチャンク）
 S1_DISTRIBUTION_MAX_SAMPLES = 3653
-S1_HIST_ROW_BATCH = 4
-S1_HIST_COL_CHUNK = 256
+S1_HIST_ROW_BATCH = 16
+S1_HIST_COL_CHUNK = 1024
 
 # 日次マップ出力の1クラスタあたり上限(Noneで無制限)
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
