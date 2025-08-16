@@ -33,7 +33,7 @@ import re
 
 # ============== 設定 ==============
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-RESULT_DIR = './v4_clustering_results'
+RESULT_DIR = './v4_clustering_results_83'
 ONLY_BASE_DIR = os.path.join(RESULT_DIR, 'only_base_label')
 MULTI_LABEL_DIR = os.path.join(RESULT_DIR, 'multi_label')
 
@@ -41,7 +41,7 @@ START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'
 
 # S1は小さいほど類似
-TH_MERGE = 89
+TH_MERGE = 83
 EPSILON = 1e-9
 
 BASE_LABELS = [

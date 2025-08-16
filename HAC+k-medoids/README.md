@@ -32,8 +32,22 @@ pkill -f "main_v4.py"
 
 ## v3(S1 スコアによる HAC+k-medoids) の TH_MERGE
 
-適正数値帯 : 87~88
-クラスタ数 : 45~30
+適正数値帯 : 80~85
+クラスタ数 : 1206~11
 
 - 数値が低いとクラスタ数が増える
 - 数値が高いとクラスタ数が減る
+
+# 結果を mac に転送
+
+## wsl-ubuntu → mac
+
+```bash
+rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/HAC+k-medoids/v4_clustering_results_83 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/HAC+k-medoids/document
+```
+
+## via-tml2 → mac
+
+```bash
+rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/HAC+k-medoids/v4_clustering_results_84 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/HAC+k-medoids/document
+```
