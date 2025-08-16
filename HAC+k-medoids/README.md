@@ -51,3 +51,9 @@ rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePatte
 ```bash
 rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/HAC+k-medoids/v4_clustering_results_84 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/HAC+k-medoids/document
 ```
+
+## gpu01 → mac
+
+```bash
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/clustering+som/results_v1 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/document
+```

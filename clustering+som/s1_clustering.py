@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 import os
 import logging
+import unicodedata
+import re
 from typing import List, Tuple, Callable, Optional, Dict
 from collections import Counter
 
@@ -33,7 +35,10 @@ def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
     x_batch: (B, D) torch tensor
     y_all  : (N, D) torch tensor
     戻り値: (B, N) のS1スコア
-    メモ: 列方向チャンクを外側で回してこの関数を呼ぶと良い。
+    備考:
+      - 本実装では「差分場の勾配」に基づく近似式（元実装）を保持
+      - SOM側のS1は '差分の勾配' ではなく '勾配の差分' を用いる版だが、
+        ここは閾値TH_MERGEとの互換を保つため現状の式を維持
     """
     B, D = x_batch.shape
     N, _ = y_all.shape
@@ -61,16 +66,55 @@ def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
     return s1_score
 
 
-def basic_label_or_none(label_str: Optional[str], base_labels: List[str]) -> Optional[str]:
+def _normalize_to_base_candidate(label_str: Optional[str]) -> Optional[str]:
     """
-    ラベルが基本ラベル集合に含まれる場合のみ返す。複合/移行型はNone。
+    与えられたラベル文字列を正規化し、英数字のみ残す。
+    例:
+      '２Ａ' -> '2A'
+      '2 A' -> '2A'
+      '2A＋' -> '2A'
+      '3B-移行' -> '3B'
+      '2A/3B' -> '2A3B' （複合はこの後でNone判定に回す）
     """
     if label_str is None:
         return None
-    s = str(label_str).strip()
+    s = str(label_str)
+    # Unicode正規化（全角→半角、合成文字等の正規化）
+    s = unicodedata.normalize('NFKC', s)
+    s = s.upper().strip()
+    # 記号類の正規化
     s = s.replace('＋', '+').replace('－', '-').replace('−', '-')
-    s = s.replace(' ', '')
-    return s if s in base_labels else None
+    # 英数字以外は除去（日本語・記号・空白など）
+    s = re.sub(r'[^0-9A-Z]', '', s)
+    return s if s != '' else None
+
+
+def basic_label_or_none(label_str: Optional[str], base_labels: List[str]) -> Optional[str]:
+    """
+    ラベルが基本ラベル集合に含まれる場合のみ返す。複合/移行型はNone。
+    正規化を強化し、'2 A', '２Ａ', '2A+', '3B-移行' などを '2A', '3B' として扱う。
+    '2A/3B' のような複合は None にする。
+    """
+    cand = _normalize_to_base_candidate(label_str)
+    if cand is None:
+        return None
+    # 候補中に基本ラベルが1つだけ含まれていれば採用、それ以外（0または2つ以上）はNone
+    hits = [bl for bl in base_labels if bl in cand]
+    # よくある単一表記（完全一致）を優先
+    if cand in base_labels:
+        return cand
+    # '2A+' → '2A' のように末尾記号や語尾が削られて一致する場合を許可
+    for bl in base_labels:
+        if cand == bl:
+            return bl
+        # 先頭が完全一致かつ残りが短い記号のみとみなせる場合に許容
+        if cand.startswith(bl):
+            # bl を除いた残りに英数字が含まれていれば複合と判断して除外
+            rest = cand[len(bl):]
+            if re.search(r'[0-9A-Z]', rest) is None:
+                return bl
+    # 残りは複合（例: '2A3B'）等とみなして除外
+    return None
 
 
 def analyze_cluster_distribution(clusters: List[List[int]],
@@ -125,7 +169,15 @@ def build_confusion_matrix_only_base(clusters: List[List[int]],
 def evaluate_clusters_only_base(clusters: List[List[int]],
                                 all_labels: List[Optional[str]],
                                 base_labels: List[str],
-                                title: str = "評価（基本ラベルのみ）") -> Optional[Dict[str, float]]:
+                                title: str = "評価（基本ラベルのみ）",
+                                medoids: Optional[List[Optional[int]]] = None) -> Optional[Dict[str, float]]:
+    """
+    - 各クラスタの代表（多数決）ラベルを base_labels のみで決定（複数クラスタが同一ラベルも可）
+    - マクロ平均再現率を「各基本ラベル l に対して、代表ラベルが l であるクラスタ群に入った l の件数 / l 全体の件数」の平均で算出
+    - マイクロ精度は「各クラスタの多数派件数の総和 / 基本ラベル総件数」
+    - ARI/NMI は、基本ラベルを持ち、かつクラスタの代表ラベルが None でないサンプルのみで算出
+    - 代表ラベルとメドイドの真ラベルの一致状況もログ出力（medoids 指定時）
+    """
     logger.info(f"\n--- {title} ---")
     if not all_labels:
         logger.warning("ラベル無しのため評価をスキップします。")
@@ -140,6 +192,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     logger.info("【混同行列（基本ラベルのみ）】")
     logger.info(f"\n{cm.loc[present_labels, :].to_string()}")
 
+    # 各クラスタの多数決（代表ラベル）を決定
     cluster_majority: Dict[int, Optional[str]] = {}
     logger.info("\n【各クラスタの多数決（代表ラベル）】")
     total_count = int(cm.values.sum())
@@ -150,8 +203,9 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         col_sum = int(col_counts.sum())
         if col_sum == 0:
             cluster_majority[k] = None
-            logger.info(f" - {col:<12}: 代表ラベル=None（出現なし）")
+            logger.info(f" - {col:<12}: 代表ラベル=None（基本ラベル出現なし）")
             continue
+        # 同数タイは index順で先勝（再現性のため）
         top_label = col_counts.idxmax()
         top_count = int(col_counts.max())
         micro_correct_sum += top_count
@@ -159,6 +213,29 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         top3 = col_counts.sort_values(ascending=False)[:3]
         top3_str = ", ".join([f"{lbl}:{int(cnt)}" for lbl, cnt in top3.items()])
         logger.info(f" - {col:<12}: 代表={top_label:<3} 件数={top_count:4d} シェア={share:5.2f} | 上位: {top3_str}")
+        cluster_majority[k] = top_label
+
+    # メドイドと代表ラベルの一致状況
+    medoid_match_rate = np.nan
+    if medoids is not None and len(medoids) == len(clusters):
+        logger.info("\n【メドイドと代表ラベルの一致状況】")
+        matches = 0
+        valid = 0
+        for k, (col, med_idx) in enumerate(zip(cluster_names, medoids)):
+            rep = cluster_majority.get(k, None)
+            if med_idx is None:
+                logger.info(f" - {col:<12}: 代表={rep}, メドイド=None")
+                continue
+            med_true = basic_label_or_none(all_labels[med_idx], base_labels)
+            if rep is None or med_true is None:
+                logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル={med_true}, 判定=スキップ")
+                continue
+            valid += 1
+            ok = (rep == med_true)
+            matches += int(ok)
+            logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル={med_true}, 一致={ok}")
+        medoid_match_rate = (matches / valid) if valid > 0 else np.nan
+        logger.info(f"メドイド-代表ラベル一致率: {medoid_match_rate:.4f}")
 
     logger.info("\n【各ラベルの再現率（代表クラスタ群ベース）】")
     per_label = {}
@@ -176,6 +253,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     logger.info(f"Macro Recall (基本ラベル) = {macro_recall:.4f}")
     logger.info(f"Micro Accuracy (基本ラベル) = {micro_accuracy:.4f}")
 
+    # ARI/NMI 計算（基本ラベルを持ち、かつクラスタ代表ラベルが有効なサンプルのみ）
     n_samples = len(all_labels)
     sample_to_cluster = [-1] * n_samples
     for ci, idxs in enumerate(clusters):
@@ -190,12 +268,18 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         ci = sample_to_cluster[j]
         if ci < 0:
             continue
-        pred_lbl = cluster_majority.get(ci, None) or "Unassigned"
+        rep = cluster_majority.get(ci, None)
+        if rep is None:
+            continue  # Unassignedは評価から除外
         y_true.append(lbl)
-        y_pred.append(pred_lbl)
+        y_pred.append(rep)
 
-    metrics: Dict[str, float] = {'MacroRecall_majority': macro_recall, 'MicroAccuracy_majority': micro_accuracy}
-    if len(y_true) > 0:
+    metrics: Dict[str, float] = {
+        'MacroRecall_majority': macro_recall,
+        'MicroAccuracy_majority': micro_accuracy,
+        'MedoidMajorityMatchRate': float(medoid_match_rate) if not np.isnan(medoid_match_rate) else np.nan
+    }
+    if len(y_true) > 1:
         uniq_true = {l: i for i, l in enumerate(sorted(set(y_true)))}
         uniq_pred = {l: i for i, l in enumerate(sorted(set(y_pred)))}
         y_true_idx = [uniq_true[l] for l in y_true]
@@ -207,7 +291,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         logger.info(f"Adjusted Rand Index (基本ラベル) = {ari:.4f}")
         logger.info(f"Normalized Mutual Info (基本ラベル) = {nmi:.4f}")
     else:
-        logger.info("評価対象サンプルがないため ARI/NMI を計算しません。")
+        logger.info("評価対象サンプルが少ないため ARI/NMI を計算しません。")
 
     logger.info(f"--- {title} 終了 ---\n")
     return metrics
@@ -250,7 +334,7 @@ def find_medoid_torch(cluster_indices: List[int],
                 if t > 0:
                     ar = torch.arange(t, device=device)
                     s1_chunk[o_start - i0 + ar, o_start - j0 + ar] = float('inf')
-            # 合計（infが入ると困るので、ここは"総和"ではなく"有限部分のみ総和"とし、infは無視）
+            # 合計（infは無視）
             finite_mask = torch.isfinite(s1_chunk)
             s1_chunk = torch.where(finite_mask, s1_chunk, torch.zeros_like(s1_chunk))
             partial_sum += s1_chunk.sum(dim=1, dtype=torch.float64)
@@ -479,10 +563,8 @@ def plot_s1_distribution_histogram(X: torch.Tensor,
             yb = Xs[j0:j1]
             s1_chunk = calculate_s1_pairwise_batch(xb, yb, d_lat, d_lon)  # (B, Nc)
             # 上三角のみ採用（全組のうち i < j ）
-            # 行側のグローバルインデックス
             for r in range(i1 - i0):
                 gi = i0 + r
-                # 列側のグローバルインデックス配列
                 gj = np.arange(j0, j1)
                 mask = gj > gi
                 if mask.any():
@@ -564,6 +646,7 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
     levels = np.linspace(vmin, vmax, 21)
     norm = Normalize(vmin=vmin, vmax=vmax)
 
+    last_cont = None
     for i in range(num_clusters):
         ax = axes[i]
         if medoids[i] is None:
@@ -572,6 +655,7 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
             continue
         medoid_pattern_2d = spatial_anomaly_data[medoids[i]].reshape(len(lat_coords), len(lon_coords))
         cont = ax.contourf(lon_coords, lat_coords, medoid_pattern_2d, levels=levels, cmap=cmap, extend="both", norm=norm, transform=ccrs.PlateCarree())
+        last_cont = cont
         ax.contour(lon_coords, lat_coords, medoid_pattern_2d, colors="k", linewidth=0.5, levels=levels, transform=ccrs.PlateCarree())
         ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.5)
         ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
@@ -584,18 +668,22 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
             lbl = basic_label_or_none(all_labels[j], base_labels)
             if lbl is not None:
                 cnt[lbl] += 1
-        dom_str = ""
-        if cnt:
-            dom_label = cnt.most_common(1)[0][0]
-            dom_str = f"Dom: {dom_label}"
-        ax.set_title(f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\n{dom_str}  Medoid: {medoid_date}', fontsize=8)
+        rep = cnt.most_common(1)[0][0] if cnt else "Unknown"  # 代表（多数決）
+        med_true = basic_label_or_none(all_labels[medoids[i]], base_labels) if all_labels else None
+        match_str = ""
+        if med_true is not None and rep is not None:
+            match_str = f" | MedoidMatch={rep == med_true}"
+        elif med_true is not None:
+            match_str = f" | MedoidLbl={med_true}"
+        ax.set_title(f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\nRep:{rep}  Medoid:{medoid_date} Lbl:{med_true}{match_str}', fontsize=8)
 
     for i in range(num_clusters, len(axes)):
         axes[i].axis("off")
 
     fig.tight_layout(rect=[0, 0, 0.9, 0.95])
     cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-    fig.colorbar(cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
+    if last_cont is not None:
+        fig.colorbar(last_cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
     fig.suptitle('Final Synoptic Patterns (Medoids of Spatial Anomaly)', fontsize=16)
     plt.savefig(save_path)
     plt.close()
@@ -625,8 +713,8 @@ def save_daily_maps_per_cluster(clusters: List[List[int]],
             lbl = basic_label_or_none(labels[j], base_labels)
             if lbl is not None:
                 cnt[lbl] += 1
-        dom_label = cnt.most_common(1)[0][0] if cnt else "Unknown"
-        cluster_dir = os.path.join(out_dir, f'cluster_{i+1:02d}_dom_{dom_label}')
+        rep = cnt.most_common(1)[0][0] if cnt else "Unknown"
+        cluster_dir = os.path.join(out_dir, f'cluster_{i+1:02d}_rep_{rep}')
         os.makedirs(cluster_dir, exist_ok=True)
 
         saved = 0
@@ -686,7 +774,8 @@ def summarize_cluster_info(clusters: List[List[int]],
                            base_labels: List[str],
                            time_stamps: np.ndarray) -> pd.DataFrame:
     """
-    クラスタごとに代表（メドイド）、頻度、ドミナントラベル、メドイド日などを集計
+    クラスタごとに代表（メドイド）、頻度、代表（多数決）ラベル、
+    メドイド真ラベル、一致有無などを集計
     """
     rows = []
     total = sum(len(c) for c in clusters)
@@ -694,21 +783,29 @@ def summarize_cluster_info(clusters: List[List[int]],
         med = medoids[i]
         cnt = len(idxs)
         share = cnt / max(1, total)
-        dom = None
+        # 代表（多数決）ラベル
         c = Counter()
         for j in idxs:
             lbl = basic_label_or_none(labels[j], base_labels)
             if lbl is not None:
                 c[lbl] += 1
-        if c:
-            dom = c.most_common(1)[0][0]
+        rep = c.most_common(1)[0][0] if c else None
+        rep_count = c[rep] if rep is not None else 0
+        rep_share_in_cluster = rep_count / max(1, cnt)
+
         med_date = pd.to_datetime(str(time_stamps[med])).strftime('%Y-%m-%d') if med is not None else None
+        med_lbl = basic_label_or_none(labels[med], base_labels) if (med is not None and labels) else None
+        match = (rep == med_lbl) if (rep is not None and med_lbl is not None) else None
+
         rows.append({
             'Cluster': i + 1,
             'Size': cnt,
             'Share': share,
+            'MajorityLabel': rep,
+            'MajorityShare': rep_share_in_cluster,
             'MedoidIndex': med,
             'MedoidDate': med_date,
-            'DominantLabel': dom
+            'MedoidLabel': med_lbl,
+            'MedoidMatchesMajority': match
         })
     return pd.DataFrame(rows)

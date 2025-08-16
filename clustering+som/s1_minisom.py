@@ -6,12 +6,7 @@ from typing import Tuple, Optional, List
 import numpy as np
 import torch
 from torch import Tensor
-
-try:
-    from tqdm import trange
-except Exception:
-    def trange(n, **kwargs):
-        return range(n)
+from tqdm import trange
 
 
 def grid_auto_size(n_targets: int) -> Tuple[int, int]:

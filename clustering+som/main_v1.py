@@ -3,7 +3,8 @@
 import os
 import logging
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -21,25 +22,27 @@ from s1_clustering import (
     save_daily_maps_per_cluster,
     save_metrics_history_to_csv,
     plot_iteration_metrics,
-    summarize_cluster_info
+    summarize_cluster_info,
+    basic_label_or_none,  # 追加: ラベル正規化を注釈にも使う
 )
 from s1_minisom import MiniSom, grid_auto_size
 
-import cartopy.crs as ccrs  # noqa: F401
-import cartopy.feature as cfeature  # noqa: F401
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from matplotlib.colors import Normalize
 
 # ============== ユーザ調整パラメータ（ここだけでOK） ==============
 SEED = 42                 # 乱数シード（再現性）
-TH_MERGE = 83             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
+TH_MERGE = 81             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
 
 # 2段階クラスタリング用の行バッチと列チャンク
-CLUS_ROW_BATCH = 16        # 行バッチ（B）。8でOOMが出たので2〜4程度を推奨
-CLUS_COL_CHUNK = 1024      # 列チャンク（Nc）。16〜64程度で調整
+CLUS_ROW_BATCH = 16        # 行バッチ（B）
+CLUS_COL_CHUNK = 1024      # 列チャンク（Nc）
 
-# SOM学習・推論用のバッチサイズ（メドイド数が少ないので大きめでもOK）
+# SOM学習・推論用のバッチサイズ
 SOM_BATCH_SIZE = 32
 
-# S1分布ヒストグラム用の設定（計算コスト削減のためのサンプル上限とチャンク）
+# S1分布ヒストグラム用の設定
 S1_DISTRIBUTION_MAX_SAMPLES = 3653
 S1_HIST_ROW_BATCH = 16
 S1_HIST_COL_CHUNK = 1024
@@ -47,8 +50,8 @@ S1_HIST_COL_CHUNK = 1024
 # 日次マップ出力の1クラスタあたり上限(Noneで無制限)
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 
-# SOM学習のイテレーション回数（自動設定: max(300, 20*ノード数), ただし2000上限）
-SOM_MAX_ITERS_CAP = 2000
+# SOM学習のイテレーション回数
+SOM_MAX_ITERS_CAP = 100
 
 # ============== 固定：実験条件・パス等 ==============
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -72,8 +75,6 @@ def set_reproducibility(seed: int = 42):
     os.environ['OMP_NUM_THREADS'] = '1'
     os.environ['NUMEXPR_NUM_THREADS'] = '1'
     os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    # optional: 断片化回避（環境に応じて）
-    # os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     import random
     random.seed(seed)
     np.random.seed(seed)
@@ -140,6 +141,24 @@ def load_and_prepare_data(filepath: str,
     return X_for_s1, msl_hpa, anomaly_hpa, lat, lon, H, W, ts, labels
 
 
+def compute_cluster_majorities(clusters: List[List[int]],
+                               labels: List[Optional[str]],
+                               base_labels: List[str]) -> Dict[int, Optional[str]]:
+    """
+    各クラスタの代表（基本ラベルの多数決）を返す。存在しない場合は None。
+    """
+    rep_map: Dict[int, Optional[str]] = {}
+    for i, idxs in enumerate(clusters):
+        c = Counter()
+        for j in idxs:
+            bl = basic_label_or_none(labels[j], base_labels)
+            if bl is not None:
+                c[bl] += 1
+        rep = c.most_common(1)[0][0] if c else None
+        rep_map[i] = rep
+    return rep_map
+
+
 def main():
     set_reproducibility(SEED)
     setup_logging()
@@ -167,17 +186,33 @@ def main():
     except Exception:
         pass
 
-    # 反復毎の評価履歴
-    history_only_base = {'iteration': [], 'MacroRecall_majority': [], 'MicroAccuracy_majority': [], 'ARI_majority': [], 'NMI_majority': []}
+    # 反復毎の評価履歴（iterationの直後に num_clusters を追加）
+    history_only_base: Dict[str, List[float]] = {
+        'iteration': [],
+        'num_clusters': [],              # 追加: その時点のクラスタ数
+        'MacroRecall_majority': [],
+        'MicroAccuracy_majority': [],
+        'ARI_majority': [],
+        'NMI_majority': [],
+        'MedoidMajorityMatchRate': []
+    }
 
     def eval_callback(iter_idx: int, clusters: List[List[int]], medoids: List[Optional[int]]):
-        m = evaluate_clusters_only_base(clusters, labels, BASE_LABELS, title=f"反復 {iter_idx} 評価（基本ラベル）")
+        m = evaluate_clusters_only_base(
+            clusters=clusters,
+            all_labels=labels,
+            base_labels=BASE_LABELS,
+            title=f"反復 {iter_idx} 評価（基本ラベル）",
+            medoids=medoids  # 中心点と代表ラベルの一致状況もログ
+        )
         if m is not None:
             history_only_base['iteration'].append(iter_idx)
+            history_only_base['num_clusters'].append(len(clusters))  # 追加: クラスタ数
             history_only_base['MacroRecall_majority'].append(m.get('MacroRecall_majority', np.nan))
             history_only_base['MicroAccuracy_majority'].append(m.get('MicroAccuracy_majority', np.nan))
             history_only_base['ARI_majority'].append(m.get('ARI_majority', np.nan))
             history_only_base['NMI_majority'].append(m.get('NMI_majority', np.nan))
+            history_only_base['MedoidMajorityMatchRate'].append(m.get('MedoidMajorityMatchRate', np.nan))
 
     # 二段階クラスタリング（行×列チャンクでメモリ節約）
     logging.info("二段階クラスタリング開始...")
@@ -194,14 +229,14 @@ def main():
 
     # 最終状態の分析・評価
     analyze_cluster_distribution(clusters, labels, ts, BASE_LABELS, title="最終クラスタ分布分析（基本ラベル）")
-    _ = evaluate_clusters_only_base(clusters, labels, BASE_LABELS, title="最終評価（基本ラベル）")
+    _ = evaluate_clusters_only_base(clusters, labels, BASE_LABELS, title="最終評価（基本ラベル）", medoids=medoids)
 
     # 結果保存（torch）
     results_path = os.path.join(RESULT_DIR, f'clustering_result_th{TH_MERGE}_v1.pt')
     torch.save({'clusters': clusters, 'medoids': medoids}, results_path)
     logging.info(f"クラスタリング結果保存: {results_path}")
 
-    # 評価推移の保存
+    # 評価推移の保存（num_clusters を iteration の右隣に）
     hist_csv = os.path.join(ONLY_BASE_DIR, 'iteration_metrics_only_base.csv')
     save_metrics_history_to_csv(history_only_base, hist_csv)
     hist_plot = os.path.join(ONLY_BASE_DIR, 'iteration_vs_metrics_only_base.png')
@@ -212,7 +247,7 @@ def main():
     plot_final_distribution_summary(clusters, labels, ts, BASE_LABELS, dist_img)
     logging.info(f"分布サマリ保存: {dist_img}")
 
-    # メドイド・クラスタの空間偏差図
+    # メドイド・クラスタの空間偏差図（代表ラベルとメドイド真ラベルの一致状況も表示）
     final_clusters_img = os.path.join(ONLY_BASE_DIR, f'final_clusters_anomaly_th{TH_MERGE}_only_base.png')
     plot_final_clusters_medoids(medoids, clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, final_clusters_img)
     logging.info(f"メドイド図保存: {final_clusters_img}")
@@ -222,7 +257,7 @@ def main():
     save_daily_maps_per_cluster(clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, daily_dir, per_cluster_limit=DAILY_MAPS_PER_CLUSTER_LIMIT)
     logging.info(f"日次マップ保存先: {daily_dir}")
 
-    # クラスタ情報をCSVで保存
+    # クラスタ情報をCSVで保存（代表ラベル・メドイド真ラベル・一致有無も含む）
     info_df = summarize_cluster_info(clusters, medoids, labels, BASE_LABELS, ts)
     info_csv = os.path.join(RESULT_DIR, 'cluster_summary.csv')
     info_df.to_csv(info_csv, index=False)
@@ -234,6 +269,7 @@ def main():
         logging.warning("SOM学習のための有効メドイドがありません。SOMをスキップします。")
         return
 
+    # 学習データ: メドイドの空間偏差[hPa]
     medoid_data = X_anomaly_hpa[medoid_indices].reshape(len(medoid_indices), d_lat * d_lon).astype(np.float32)
 
     # SOMサイズ自動選択（クラス数を覆う最小正方格子）
@@ -251,18 +287,44 @@ def main():
     som.random_weights_init(medoid_data)
 
     som_iters = min(SOM_MAX_ITERS_CAP, max(300, 20 * som_nodes))
+    som_log_interval = max(10, som_iters // 10)
     logging.info(f"SOM学習: iters={som_iters}, batch={SOM_BATCH_SIZE}, sigma0={sigma0:.2f}, nodes_chunk={nodes_chunk}")
-    _ = som.train_batch(medoid_data, num_iteration=som_iters, batch_size=SOM_BATCH_SIZE, verbose=True, log_interval=max(10, som_iters // 10))
+    qhist = som.train_batch(  # 量子化誤差履歴を受け取る
+        medoid_data,
+        num_iteration=som_iters,
+        batch_size=SOM_BATCH_SIZE,
+        verbose=True,
+        log_interval=som_log_interval,
+        update_per_iteration=True,
+        shuffle=True
+    )
 
-    # メドイドのBMUを予測
+    # 量子化誤差の履歴をプロットして保存
+    qe_plot = os.path.join(SOM_DIR, f'som_qe_history_{som_x}x{som_y}.png')
+    try:
+        it_ticks = np.linspace(0, som_iters - 1, num=len(qhist))
+        plt.figure(figsize=(8, 4))
+        plt.plot(it_ticks, qhist, marker='o', color='tab:blue')
+        plt.title(f"SOM Quantization Error (size={som_x}x{som_y})")
+        plt.xlabel("Iteration")
+        plt.ylabel("Quantization Error (S1)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(qe_plot)
+        plt.close()
+        logging.info(f"SOM量子化誤差履歴を保存: {qe_plot}")
+    except Exception as e:
+        logging.warning(f"SOM量子化誤差履歴の保存に失敗: {e}")
+
+    # メドイドのBMUを予測（順序は medoid_data の行に対応）
     bmu_xy = som.predict(medoid_data, batch_size=SOM_BATCH_SIZE)  # (M, 2)
 
-    # 各メドイドと元クラスタ番号の対応
+    # 各メドイド行（medoid_dataのi番目）に対応する "元クラスタ番号" を回収
     medoid_to_cluster = []
     for ci, m in enumerate(medoids):
         if m is not None:
-            medoid_to_cluster.append((ci, m))
-    cluster_ids_in_order = []
+            medoid_to_cluster.append((ci, m))   # (cluster_id, sample_index)
+    cluster_ids_in_order = []  # medoid_data[i] に対応する cluster_id
     for mi in medoid_indices:
         for ci, m in medoid_to_cluster:
             if m == mi:
@@ -288,11 +350,73 @@ def main():
     plt.close()
     logging.info(f"SOM BMU散布図保存: {som_scatter}")
 
-    # SOMコードブック（各ノードのパターン）を地理図でタイル表示
+    # SOMノードの使用頻度ヒートマップ（どのノードがどれだけ使われたか）
+    usage = np.zeros((som_x, som_y), dtype=np.int32)
+    for (x, y) in bmu_xy:
+        usage[int(x), int(y)] += 1
+    som_usage_img = os.path.join(SOM_DIR, f'som_bmu_usage_{som_x}x{som_y}.png')
+    plt.figure(figsize=(max(6, som_y), max(6, som_x)))
+    plt.title(f"SOM BMU Usage Heatmap (medoids)  size={som_x}x{som_y}")
+    plt.imshow(usage, cmap='viridis', origin='upper')
+    plt.colorbar(label='Assigned Medoids')
+    plt.xticks(range(som_y))
+    plt.yticks(range(som_x))
+    plt.xlabel('y')
+    plt.ylabel('x')
+    plt.tight_layout()
+    plt.savefig(som_usage_img)
+    plt.close()
+    logging.info(f"SOM BMU使用頻度ヒートマップ保存: {som_usage_img}")
+
+    # 代表（多数決）ラベルをクラスタごとに計算（注釈に使う）
+    rep_map = compute_cluster_majorities(clusters, labels, BASE_LABELS)  # {cluster_idx: rep or None}
+
+    # ノードごとの割当メドイド情報を収集（注釈とCSVに使う）
+    # bmu_xy の各行 k は medoid_data[k]（= medoid_indices[k]）に対応
+    node_to_items: Dict[Tuple[int, int], List[Dict[str, str]]] = {}
+    for k, (x, y) in enumerate(bmu_xy):
+        x = int(x)
+        y = int(y)
+        cid0 = cluster_ids_in_order[k]          # 0始まりクラスタID
+        cid = cid0 + 1                          # 1始まり表示
+        mi = medoid_indices[k]                  # 元データのメドイドインデックス
+        date_str = pd.to_datetime(str(ts[mi])).strftime('%Y-%m-%d')
+        raw_lbl = labels[mi] if labels else None
+        base_lbl = basic_label_or_none(raw_lbl, BASE_LABELS)
+        rep_lbl = rep_map.get(cid0, None)
+        match = (rep_lbl == base_lbl) if (rep_lbl is not None and base_lbl is not None) else None
+        node_to_items.setdefault((x, y), []).append({
+            'cluster_id': f"C{cid}",
+            'medoid_index': str(mi),
+            'date': date_str,
+            'label_raw': str(raw_lbl),
+            'label_base': str(base_lbl) if base_lbl is not None else "-",
+            'rep_label': str(rep_lbl) if rep_lbl is not None else "-",
+            'match': '-' if match is None else str(bool(match))
+        })
+
+    # CSVで保存（確認用）
+    csv_rows = []
+    for (x, y), items in node_to_items.items():
+        for it in items:
+            csv_rows.append({
+                'node_x': x, 'node_y': y, 'node_flat': x * som_y + y,
+                'cluster': it['cluster_id'],
+                'medoid_index': it['medoid_index'],
+                'date': it['date'],
+                'label_base': it['label_base'],
+                'label_raw': it['label_raw'],
+                'cluster_majority_label': it['rep_label'],
+                'majority_medoid_match': it['match']
+            })
+    assign_csv = os.path.join(SOM_DIR, f'som_node_assignments_{som_x}x{som_y}.csv')
+    pd.DataFrame(csv_rows).to_csv(assign_csv, index=False)
+    logging.info(f"SOMノード割当CSV保存: {assign_csv}")
+
+    # SOMコードブック（各ノードのパターン）を地理図でタイル表示（non-annotated）
+    # 追加仕様: 割当がないノードは圧力パターン画像を描かない（軸オフで空白）
     som_codebook_img = os.path.join(SOM_DIR, f'som_codebook_maps_{som_x}x{som_y}.png')
     weights_grid = som.get_weights()  # (x, y, D)
-    from matplotlib.colors import Normalize
-
     fig, axes = plt.subplots(som_x, som_y, figsize=(som_y * 3, som_x * 3), subplot_kw={"projection": ccrs.PlateCarree()})
     axes = np.atleast_2d(axes)
     cmap = plt.get_cmap('RdBu_r')
@@ -303,6 +427,11 @@ def main():
     for ix in range(som_x):
         for iy in range(som_y):
             ax = axes[ix, iy]
+            items = node_to_items.get((ix, iy), [])
+            if len(items) == 0:
+                # 何も割当がない場合は画像を描かない（空白）
+                ax.axis("off")
+                continue
             pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
             last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
             ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
@@ -317,6 +446,49 @@ def main():
     plt.savefig(som_codebook_img)
     plt.close()
     logging.info(f"SOMコードブック（地理図）保存: {som_codebook_img}")
+
+    # 注釈付きコードブック図（各ノードの割当一覧をサブプロット内に描画）
+    # 追加仕様: 割当がないノードはパターン画像を描かず、注釈のみ（No medoids）を表示
+    som_codebook_annotated_img = os.path.join(SOM_DIR, f'som_codebook_maps_{som_x}x{som_y}_annotated.png')
+    fig, axes = plt.subplots(som_x, som_y, figsize=(som_y * 3.2, som_x * 3.2), subplot_kw={"projection": ccrs.PlateCarree()})
+    axes = np.atleast_2d(axes)
+    last_cont = None
+    for ix in range(som_x):
+        for iy in range(som_y):
+            ax = axes[ix, iy]
+            items = node_to_items.get((ix, iy), [])
+            if len(items) == 0:
+                # 画像は描かず、注釈のみ
+                ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
+                ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.3)
+                txt = f"({ix},{iy}) | n=0\nNo medoids"
+                ax.text(0.02, 0.02, txt, transform=ax.transAxes, ha='left', va='bottom',
+                        fontsize=6, color='black',
+                        bbox=dict(facecolor='white', edgecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
+                continue
+
+            pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
+            last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
+            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
+            ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
+            # 注釈テキスト
+            lines = [f"({ix},{iy}) | n={len(items)}"]
+            # 例: C3 | rep=1 | med=1996-01-12 | lbl=1
+            for it in items:
+                lines.append(f"{it['cluster_id']} | rep={it['rep_label']} | med={it['date']} | lbl={it['label_base']}")
+            txt = "\n".join(lines)
+            ax.text(0.02, 0.02, txt, transform=ax.transAxes, ha='left', va='bottom',
+                    fontsize=6, color='black',
+                    bbox=dict(facecolor='white', edgecolor='black', alpha=0.7, boxstyle='round,pad=0.2'))
+    fig.tight_layout(rect=[0, 0, 0.9, 0.95])
+    cbar_ax = fig.add_axes([0.91, 0.15, 0.02, 0.7])
+    if last_cont is not None:
+        fig.colorbar(last_cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
+    fig.suptitle(f"SOM Codebook Maps Annotated (size={som_x}x{som_y})", fontsize=14)
+    plt.savefig(som_codebook_annotated_img)
+    plt.close()
+    logging.info(f"SOMコードブック（注釈付き）保存: {som_codebook_annotated_img}")
 
     logging.info("全処理完了。")
 
