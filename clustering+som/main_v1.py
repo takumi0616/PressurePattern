@@ -23,7 +23,8 @@ from s1_clustering import (
     save_metrics_history_to_csv,
     plot_iteration_metrics,
     summarize_cluster_info,
-    basic_label_or_none,  # 追加: ラベル正規化を注釈にも使う
+    basic_label_or_none,
+    primary_base_label,
 )
 from s1_minisom import MiniSom, grid_auto_size
 
@@ -33,7 +34,7 @@ from matplotlib.colors import Normalize
 
 # ============== ユーザ調整パラメータ（ここだけでOK） ==============
 SEED = 42                 # 乱数シード（再現性）
-TH_MERGE = 81             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
+TH_MERGE = 80             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
 
 # 2段階クラスタリング用の行バッチと列チャンク
 CLUS_ROW_BATCH = 16        # 行バッチ（B）
@@ -51,7 +52,7 @@ S1_HIST_COL_CHUNK = 1024
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 
 # SOM学習のイテレーション回数
-SOM_MAX_ITERS_CAP = 100
+SOM_MAX_ITERS_CAP = 10000
 
 # ============== 固定：実験条件・パス等 ==============
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -59,7 +60,7 @@ RESULT_DIR = './results_v1'
 ONLY_BASE_DIR = os.path.join(RESULT_DIR, 'only_base_label')
 SOM_DIR = os.path.join(RESULT_DIR, 'som')
 
-START_DATE = '1991-01-01'
+START_DATE = '2000-01-01'
 END_DATE = '2000-12-31'
 
 BASE_LABELS = [
@@ -203,7 +204,7 @@ def main():
             all_labels=labels,
             base_labels=BASE_LABELS,
             title=f"反復 {iter_idx} 評価（基本ラベル）",
-            medoids=medoids  # 中心点と代表ラベルの一致状況もログ
+            medoids=medoids  # 中心点と代表ラベルの一致状況もログ（raw表示＋主要成分）
         )
         if m is not None:
             history_only_base['iteration'].append(iter_idx)
@@ -247,7 +248,7 @@ def main():
     plot_final_distribution_summary(clusters, labels, ts, BASE_LABELS, dist_img)
     logging.info(f"分布サマリ保存: {dist_img}")
 
-    # メドイド・クラスタの空間偏差図（代表ラベルとメドイド真ラベルの一致状況も表示）
+    # メドイド・クラスタの空間偏差図（代表ラベルとメドイド真ラベルの一致状況も表示：raw＋base）
     final_clusters_img = os.path.join(ONLY_BASE_DIR, f'final_clusters_anomaly_th{TH_MERGE}_only_base.png')
     plot_final_clusters_medoids(medoids, clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, final_clusters_img)
     logging.info(f"メドイド図保存: {final_clusters_img}")
@@ -257,7 +258,7 @@ def main():
     save_daily_maps_per_cluster(clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, daily_dir, per_cluster_limit=DAILY_MAPS_PER_CLUSTER_LIMIT)
     logging.info(f"日次マップ保存先: {daily_dir}")
 
-    # クラスタ情報をCSVで保存（代表ラベル・メドイド真ラベル・一致有無も含む）
+    # クラスタ情報をCSVで保存（代表ラベル・メドイド真ラベル(raw/base)・一致有無も含む）
     info_df = summarize_cluster_info(clusters, medoids, labels, BASE_LABELS, ts)
     info_csv = os.path.join(RESULT_DIR, 'cluster_summary.csv')
     info_df.to_csv(info_csv, index=False)
@@ -382,11 +383,12 @@ def main():
         mi = medoid_indices[k]                  # 元データのメドイドインデックス
         date_str = pd.to_datetime(str(ts[mi])).strftime('%Y-%m-%d')
         raw_lbl = labels[mi] if labels else None
-        base_lbl = basic_label_or_none(raw_lbl, BASE_LABELS)
+        base_lbl = primary_base_label(raw_lbl, BASE_LABELS)
         rep_lbl = rep_map.get(cid0, None)
         match = (rep_lbl == base_lbl) if (rep_lbl is not None and base_lbl is not None) else None
         node_to_items.setdefault((x, y), []).append({
             'cluster_id': f"C{cid}",
+            'cluster_id0': cid0,
             'medoid_index': str(mi),
             'date': date_str,
             'label_raw': str(raw_lbl),
@@ -412,6 +414,64 @@ def main():
     assign_csv = os.path.join(SOM_DIR, f'som_node_assignments_{som_x}x{som_y}.csv')
     pd.DataFrame(csv_rows).to_csv(assign_csv, index=False)
     logging.info(f"SOMノード割当CSV保存: {assign_csv}")
+
+    # ============== SOM配置の詳細ログ出力（可視化＋CSVに加え） ==============
+    logging.info("\n--- SOM配置詳細ログ ---")
+    logging.info(f"SOMグリッド: {som_x} x {som_y}（ノード数={som_nodes}）")
+    # 1) ノードごとの詳細
+    for ix in range(som_x):
+        for iy in range(som_y):
+            items = node_to_items.get((ix, iy), [])
+            if len(items) == 0:
+                continue
+            labels_here = [it['rep_label'] for it in items if it['rep_label'] != '-']
+            rep_count = Counter(labels_here)
+            rep_str = ", ".join([f"{k}:{v}" for k, v in rep_count.most_common()])
+            clist = ", ".join([f"{it['cluster_id']}({it['rep_label']})" for it in items])
+            logging.info(f"ノード({ix},{iy}) n={len(items)} | 代表ラベル内訳: [{rep_str}] | {clist}")
+
+    # 2) ノード純度（そのノード内で最頻の代表ラベル割合）
+    logging.info("\n[SOMノード純度]")
+    for (ix, iy), items in sorted(node_to_items.items()):
+        labels_here = [it['rep_label'] for it in items if it['rep_label'] != '-']
+        purity = 0.0
+        if labels_here:
+            c = Counter(labels_here)
+            purity = c.most_common(1)[0][1] / len(items)
+        logging.info(f"  ノード({ix},{iy}) n={len(items)} 純度={purity:.2f}")
+
+    # 3) 代表ラベルごとの分布（どのノードに集まっているか）
+    logging.info("\n[代表ラベルごとのBMUノード分布]")
+    rep_to_nodes: Dict[str, Dict[Tuple[int, int], List[str]]] = {}
+    for (ix, iy), items in node_to_items.items():
+        for it in items:
+            rep = it['rep_label']
+            if rep == '-':
+                continue
+            rep_to_nodes.setdefault(rep, {}).setdefault((ix, iy), []).append(it['cluster_id'])
+    for rep, nd in rep_to_nodes.items():
+        num_nodes = len(nd)
+        num_clusters_rep = sum(len(set(v)) for v in nd.values())
+        node_desc = "; ".join([f"({ix},{iy}):{sorted(list(set(v)))}" for (ix, iy), v in sorted(nd.items())])
+        logging.info(f"  代表={rep}: ノード数={num_nodes}, クラスタ数={num_clusters_rep} | {node_desc}")
+
+    # 4) 各クラスタのBMU位置一覧
+    logging.info("\n[各クラスタのBMUノード（メドイド基準）]")
+    cid_to_node: Dict[int, Tuple[int, int]] = {}
+    for (ix, iy), items in node_to_items.items():
+        for it in items:
+            cid0 = it['cluster_id0']
+            cid_to_node[cid0] = (ix, iy)
+    for cid0 in range(len(clusters)):
+        node = cid_to_node.get(cid0, None)
+        rep_lbl = rep_map.get(cid0, None)
+        if node is None:
+            logging.info(f"  Cluster_{cid0+1}: ノード未割当（メドイドなし）")
+        else:
+            (ix, iy) = node
+            logging.info(f"  Cluster_{cid0+1}: BMU=({ix},{iy}) 代表={rep_lbl}")
+
+    logging.info("--- SOM配置詳細ログ 終了 ---\n")
 
     # SOMコードブック（各ノードのパターン）を地理図でタイル表示（non-annotated）
     # 追加仕様: 割当がないノードは圧力パターン画像を描かない（軸オフで空白）
@@ -472,11 +532,11 @@ def main():
             ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
-            # 注釈テキスト
+            # 注釈テキスト（rawラベルも併記）
             lines = [f"({ix},{iy}) | n={len(items)}"]
-            # 例: C3 | rep=1 | med=1996-01-12 | lbl=1
+            # 例: C3 | rep=1 | med=1996-01-12 | raw=4A+1 | base=4A
             for it in items:
-                lines.append(f"{it['cluster_id']} | rep={it['rep_label']} | med={it['date']} | lbl={it['label_base']}")
+                lines.append(f"{it['cluster_id']} | rep={it['rep_label']} | med={it['date']} | raw={it['label_raw']} | base={it['label_base']}")
             txt = "\n".join(lines)
             ax.text(0.02, 0.02, txt, transform=ax.transAxes, ha='left', va='bottom',
                     fontsize=6, color='black',

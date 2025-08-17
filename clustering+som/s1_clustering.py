@@ -117,6 +117,34 @@ def basic_label_or_none(label_str: Optional[str], base_labels: List[str]) -> Opt
     return None
 
 
+def extract_base_components(raw_label: Optional[str], base_labels: List[str]) -> List[str]:
+    """
+    複合ラベル（例: '4A+1', '6C-3C', '2A/3B'）から基本ラベル成分を出現順で抽出して返す。
+    戻り値は ['4A','1'] や ['6C','3C'] のようなリスト。
+    抽出できない場合は空リスト。
+    """
+    if raw_label is None:
+        return []
+    s = unicodedata.normalize('NFKC', str(raw_label)).upper().strip()
+    s = s.replace('＋', '+').replace('－', '-').replace('−', '-')
+    # 区切りは +, -, /, 空白, その他非英数字すべてを分割とみなす
+    tokens = re.split(r'[^0-9A-Z]+', s)
+    comps: List[str] = []
+    for t in tokens:
+        if t in base_labels and t not in comps:
+            comps.append(t)
+    return comps
+
+
+def primary_base_label(raw_label: Optional[str], base_labels: List[str]) -> Optional[str]:
+    """
+    複合ラベルから主要（最初に出現する）基本ラベルを返す。
+    見つからない場合は None。
+    """
+    parts = extract_base_components(raw_label, base_labels)
+    return parts[0] if parts else None
+
+
 def analyze_cluster_distribution(clusters: List[List[int]],
                                  all_labels: List[Optional[str]],
                                  all_time_stamps: Optional[np.ndarray],
@@ -177,6 +205,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     - マイクロ精度は「各クラスタの多数派件数の総和 / 基本ラベル総件数」
     - ARI/NMI は、基本ラベルを持ち、かつクラスタの代表ラベルが None でないサンプルのみで算出
     - 代表ラベルとメドイドの真ラベルの一致状況もログ出力（medoids 指定時）
+      注: メドイド真ラベルは raw（複合含む）を表示し、判定用には primary_base_label（主要成分）を用いる
     """
     logger.info(f"\n--- {title} ---")
     if not all_labels:
@@ -215,7 +244,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         logger.info(f" - {col:<12}: 代表={top_label:<3} 件数={top_count:4d} シェア={share:5.2f} | 上位: {top3_str}")
         cluster_majority[k] = top_label
 
-    # メドイドと代表ラベルの一致状況
+    # メドイドと代表ラベルの一致状況（raw表示＋主要成分で判定）
     medoid_match_rate = np.nan
     if medoids is not None and len(medoids) == len(clusters):
         logger.info("\n【メドイドと代表ラベルの一致状況】")
@@ -226,14 +255,15 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
             if med_idx is None:
                 logger.info(f" - {col:<12}: 代表={rep}, メドイド=None")
                 continue
-            med_true = basic_label_or_none(all_labels[med_idx], base_labels)
-            if rep is None or med_true is None:
-                logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル={med_true}, 判定=スキップ")
+            med_raw = all_labels[med_idx] if all_labels else None
+            med_base = primary_base_label(med_raw, base_labels)
+            if rep is None or med_base is None:
+                logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル(raw)={med_raw}, base={med_base}, 判定=スキップ")
                 continue
             valid += 1
-            ok = (rep == med_true)
+            ok = (rep == med_base)
             matches += int(ok)
-            logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル={med_true}, 一致={ok}")
+            logger.info(f" - {col:<12}: 代表={rep}, メドイド真ラベル(raw)={med_raw}, base={med_base}, 一致={ok}")
         medoid_match_rate = (matches / valid) if valid > 0 else np.nan
         logger.info(f"メドイド-代表ラベル一致率: {medoid_match_rate:.4f}")
 
@@ -669,13 +699,19 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
             if lbl is not None:
                 cnt[lbl] += 1
         rep = cnt.most_common(1)[0][0] if cnt else "Unknown"  # 代表（多数決）
-        med_true = basic_label_or_none(all_labels[medoids[i]], base_labels) if all_labels else None
+
+        med_raw = all_labels[medoids[i]] if all_labels else None
+        med_base = primary_base_label(med_raw, base_labels)
         match_str = ""
-        if med_true is not None and rep is not None:
-            match_str = f" | MedoidMatch={rep == med_true}"
-        elif med_true is not None:
-            match_str = f" | MedoidLbl={med_true}"
-        ax.set_title(f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\nRep:{rep}  Medoid:{medoid_date} Lbl:{med_true}{match_str}', fontsize=8)
+        if (med_base is not None) and (rep is not None):
+            match_str = f" | MedoidMatch={rep == med_base}"
+        elif med_base is not None:
+            match_str = f" | MedoidBase={med_base}"
+        ax.set_title(
+            f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\n'
+            f'Rep:{rep}  Medoid:{medoid_date} RawLbl:{med_raw} Base:{med_base}{match_str}',
+            fontsize=8
+        )
 
     for i in range(num_clusters, len(axes)):
         axes[i].axis("off")
@@ -775,7 +811,7 @@ def summarize_cluster_info(clusters: List[List[int]],
                            time_stamps: np.ndarray) -> pd.DataFrame:
     """
     クラスタごとに代表（メドイド）、頻度、代表（多数決）ラベル、
-    メドイド真ラベル、一致有無などを集計
+    メドイド真ラベル（raw/base）、一致有無などを集計
     """
     rows = []
     total = sum(len(c) for c in clusters)
@@ -794,8 +830,9 @@ def summarize_cluster_info(clusters: List[List[int]],
         rep_share_in_cluster = rep_count / max(1, cnt)
 
         med_date = pd.to_datetime(str(time_stamps[med])).strftime('%Y-%m-%d') if med is not None else None
-        med_lbl = basic_label_or_none(labels[med], base_labels) if (med is not None and labels) else None
-        match = (rep == med_lbl) if (rep is not None and med_lbl is not None) else None
+        med_raw = labels[med] if (med is not None and labels) else None
+        med_base = primary_base_label(med_raw, base_labels) if med_raw is not None else None
+        match = (rep == med_base) if (rep is not None and med_base is not None) else None
 
         rows.append({
             'Cluster': i + 1,
@@ -805,7 +842,8 @@ def summarize_cluster_info(clusters: List[List[int]],
             'MajorityShare': rep_share_in_cluster,
             'MedoidIndex': med,
             'MedoidDate': med_date,
-            'MedoidLabel': med_lbl,
+            'MedoidRawLabel': med_raw,
+            'MedoidBaseLabel': med_base,
             'MedoidMatchesMajority': match
         })
     return pd.DataFrame(rows)
