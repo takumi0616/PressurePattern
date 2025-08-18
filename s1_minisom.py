@@ -38,7 +38,8 @@ class MiniSom:
       som = MiniSom(x, y, D, s1_field_shape=(H, W), device='cuda', random_seed=SEED)
       som.random_weights_init(data)  # data: (N, D), ここではメドイドの空間偏差[hPa]を想定
       som.train_batch(data, num_iteration=..., batch_size=..., nodes_chunk=...)  # GPUに合わせて
-      winners = som.predict(data)  # (N, 2) のBMU座標
+      winners = som.predict(data)  # (N, 2) のBMU座標（重複許容）
+      winners_unique = som.predict_unique(data)  # (N, 2) のBMU座標（1ノード1データの一意割当）
     """
     def __init__(self,
                  x: int,
@@ -258,6 +259,9 @@ class MiniSom:
 
     @torch.no_grad()
     def predict(self, data: np.ndarray, batch_size: int = 64) -> np.ndarray:
+        """
+        通常のBMU割当て（重複許容）。戻り値は (N, 2) = (x, y)
+        """
         N, D = data.shape
         H, W = self.s1_field_shape
         X = _to_device(data, self.device, self.dtype).reshape(N, H, W)
@@ -273,3 +277,56 @@ class MiniSom:
         x = (bmu_flat // self.y).to(torch.long)
         out = torch.stack([x, y], dim=1)
         return _as_numpy(out)
+
+    @torch.no_grad()
+    def predict_unique(self, data: np.ndarray, batch_size: int = 64) -> np.ndarray:
+        """
+        一意なBMU割当て（1ノードにつき最大1データ）。
+        - 距離行列 D (N, M) を計算し、全候補 (i, j) を距離昇順に走査する貪欲法で
+          まだ割当てられていないデータ i と空いているノード j をペアリング。
+        - グリッドノード数 M は N 以上であることが前提（不足時は通常predictにフォールバック）。
+
+        戻り値: (N, 2) = (x, y)
+        """
+        N, D = data.shape
+        H, W = self.s1_field_shape
+        if self.m < N:
+            # 例外的状況では通常のpredict（重複許容）にフォールバック
+            return self.predict(data, batch_size=batch_size)
+
+        # 全データ×全ノードの距離行列を構築（行バッチで）
+        X = _to_device(data, self.device, self.dtype).reshape(N, H, W)
+        rows: List[np.ndarray] = []
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            Xb = X[start:end]
+            db = self._s1_distance_batch(Xb, nodes_chunk=self.nodes_chunk)  # (B, m)
+            rows.append(_as_numpy(db).astype(np.float64))
+        Dmat = np.vstack(rows)  # (N, m)
+
+        # 距離昇順で貪欲割当て
+        flat_idx = np.argsort(Dmat, axis=None, kind='mergesort')  # 安定ソート
+        ridx, cidx = np.unravel_index(flat_idx, Dmat.shape)
+
+        assigned_node = -np.ones(N, dtype=np.int64)
+        node_used = np.zeros(self.m, dtype=bool)
+        assigned_count = 0
+        for r, c in zip(ridx, cidx):
+            if assigned_node[r] == -1 and not node_used[c]:
+                assigned_node[r] = c
+                node_used[c] = True
+                assigned_count += 1
+                if assigned_count >= N:
+                    break
+
+        # 念のため未割当が残れば、空きノードに順に埋める（通常到達しない）
+        if np.any(assigned_node == -1):
+            free_nodes = np.where(~node_used)[0]
+            it = iter(free_nodes)
+            for i in range(N):
+                if assigned_node[i] == -1:
+                    assigned_node[i] = next(it)
+
+        y = (assigned_node % self.y).astype(np.int64)
+        x = (assigned_node // self.y).astype(np.int64)
+        return np.stack([x, y], axis=1)

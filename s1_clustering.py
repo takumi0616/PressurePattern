@@ -31,36 +31,43 @@ def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
                                 d_lon: int,
                                 epsilon: float = EPSILON) -> torch.Tensor:
     """
-    S1スコア（小さいほど類似）をバッチで計算
-    x_batch: (B, D) torch tensor
-    y_all  : (N, D) torch tensor
-    戻り値: (B, N) のS1スコア
-    備考:
-      - 本実装では「差分場の勾配」に基づく近似式（元実装）を保持
-      - SOM側のS1は '差分の勾配' ではなく '勾配の差分' を用いる版だが、
-        ここは閾値TH_MERGEとの互換を保つため現状の式を維持
+    Teweles–WobusのS1スコア（小さいほど類似）をバッチで計算する。
+
+    定義（本実装）:
+      分子:   |∇W − ∇X| の和（x方向・y方向の勾配差の絶対値和）
+      分母:   max(|∇W|, |∇X|) の和（x方向・y方向）
+      スコア: 100 * 分子 / (分母 + epsilon)
+
+    注意:
+      - 「差分場の勾配 |∇(W−X)|」ではなく、「勾配の差分 |∇W − ∇X|」で実装
+        （SOM側[s1_minisom.py, 3type_som/minisom.py]と完全に一致）
+      - x_batch: (B, D), y_all: (N, D), D = d_lat * d_lon
+      - 戻り値: (B, N)
     """
+    device = x_batch.device
     B, D = x_batch.shape
-    N, _ = y_all.shape
-    x_maps = x_batch.view(B, 1, d_lat, d_lon)
-    y_maps = y_all.view(1, N, d_lat, d_lon)
-    diff_maps = y_maps - x_maps  # (B, N, H, W)
+    N, D2 = y_all.shape
+    assert D == D2 == d_lat * d_lon, "入力次元とフィールド形状が一致しません。"
 
-    # 分子: 差分場の勾配
-    grad_x_D = (diff_maps[..., :, 1:] - diff_maps[..., :, :-1])[..., :-1, :]
-    grad_y_D = (diff_maps[..., 1:, :] - diff_maps[..., :-1, :])[..., :, :-1]
-    numerator_term = torch.abs(grad_x_D) + torch.abs(grad_y_D)
-    numerator = torch.mean(numerator_term, dim=(-2, -1))  # (B, N)
+    # (B, 1, H, W), (1, N, H, W) に整形（ブロードキャスト用）
+    X = x_batch.view(B, 1, d_lat, d_lon)
+    Y = y_all.view(1, N, d_lat, d_lon)
 
-    # 分母: 各場の勾配の最大値の和
-    grad_x_y = (y_maps[..., :, 1:] - y_maps[..., :, :-1])[..., :-1, :]
-    grad_y_y = (y_maps[..., 1:, :] - y_maps[..., :-1, :])[..., :, :-1]
-    grad_x_x = (x_maps[..., :, 1:] - x_maps[..., :, :-1])[..., :-1, :]
-    grad_y_x = (x_maps[..., 1:, :] - x_maps[..., :-1, :])[..., :, :-1]
-    max_grad_x = torch.max(torch.abs(grad_x_y), torch.abs(grad_x_x))
-    max_grad_y = torch.max(torch.abs(grad_y_y), torch.abs(grad_y_x))
-    denominator_term = max_grad_x + max_grad_y
-    denominator = torch.mean(denominator_term, dim=(-2, -1))  # (B, N)
+    # 勾配（前進差分）
+    dXdx = X[:, :, :, 1:] - X[:, :, :, :-1]   # (B, 1, H, W-1)
+    dXdy = X[:, :, 1:, :] - X[:, :, :-1, :]   # (B, 1, H-1, W)
+    dYdx = Y[:, :, :, 1:] - Y[:, :, :, :-1]   # (1, N, H, W-1)
+    dYdy = Y[:, :, 1:, :] - Y[:, :, :-1, :]   # (1, N, H-1, W)
+
+    # 分子: |∇W − ∇X| の和（x方向 + y方向）
+    num_dx = torch.abs(dYdx - dXdx).sum(dim=(-2, -1))  # (B, N)
+    num_dy = torch.abs(dYdy - dXdy).sum(dim=(-2, -1))  # (B, N)
+    numerator = num_dx + num_dy                         # (B, N)
+
+    # 分母: max(|∇W|, |∇X|) の和（x方向 + y方向）
+    den_dx = torch.maximum(torch.abs(dYdx), torch.abs(dXdx)).sum(dim=(-2, -1))  # (B, N)
+    den_dy = torch.maximum(torch.abs(dYdy), torch.abs(dXdy)).sum(dim=(-2, -1))  # (B, N)
+    denominator = den_dx + den_dy                                               # (B, N)
 
     s1_score = 100.0 * (numerator / (denominator + epsilon))
     return s1_score
@@ -640,16 +647,25 @@ def plot_final_distribution_summary(clusters: List[List[int]],
         for month, k in mon_c.items():
             month_dist_matrix.loc[name, month] = k
 
-    fig, axes = plt.subplots(2, 1, figsize=(16, 14))
+    # クラスタ数に応じて図の縦サイズを自動調整
+    # 2枚のヒートマップを積むので、クラスタ数×係数×2 + 余白で決定
+    height_per_cluster = 0.35  # 1枚のヒートマップあたりのクラスタ行の高さ（inch）
+    base_height = 2.0          # 余白分
+    fig_height = max(8.0, base_height + 2 * height_per_cluster * max(1, num_clusters))
+    fig_width = 16.0
+    fig, axes = plt.subplots(2, 1, figsize=(fig_width, fig_height))
     fig.suptitle('Final Cluster Distribution Summary (Basic Labels Only)', fontsize=20)
+
     sns.heatmap(label_dist_matrix, ax=axes[0], annot=True, fmt='d', cmap='viridis', linewidths=.5)
     axes[0].set_title('Label Distribution per Cluster', fontsize=16)
     axes[0].set_ylabel('Cluster')
     axes[0].set_xlabel('True Base Label')
+
     sns.heatmap(month_dist_matrix, ax=axes[1], annot=True, fmt='d', cmap='inferno', linewidths=.5)
     axes[1].set_title('Monthly Distribution per Cluster', fontsize=16)
     axes[1].set_ylabel('Cluster')
     axes[1].set_xlabel('Month')
+
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(save_path)
     plt.close()
@@ -680,7 +696,7 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
     for i in range(num_clusters):
         ax = axes[i]
         if medoids[i] is None:
-            ax.set_title(f'Cluster {i+1} (Empty)')
+            ax.set_title(f'Cluster {i+1} (Empty)', wrap=True)
             ax.axis("off")
             continue
         medoid_pattern_2d = spatial_anomaly_data[medoids[i]].reshape(len(lat_coords), len(lon_coords))
@@ -707,11 +723,14 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
             match_str = f" | MedoidMatch={rep == med_base}"
         elif med_base is not None:
             match_str = f" | MedoidBase={med_base}"
-        ax.set_title(
-            f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)\n'
-            f'Rep:{rep}  Medoid:{medoid_date} RawLbl:{med_raw} Base:{med_base}{match_str}',
-            fontsize=8
-        )
+
+        # タイトルを適切に改行して横方向のはみ出しを防止
+        title_lines = [
+            f'Cluster {i+1} (N={len(cluster_indices)}, Freq:{frequency:.1f}%)',
+            f'Rep:{rep}  Med:{medoid_date}',
+            f'Raw:{med_raw}  Base:{med_base}{match_str}',
+        ]
+        ax.set_title("\n".join(title_lines), fontsize=8, wrap=True)
 
     for i in range(num_clusters, len(axes)):
         axes[i].axis("off")

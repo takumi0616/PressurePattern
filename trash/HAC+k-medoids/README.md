@@ -57,3 +57,8 @@ rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePatter
 ```bash
 rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/clustering+som/results_v1 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/document
 ```
+
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/3type_som/outputs_som_fullperiod /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/3type_som
+
+
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/clustering+som/results_v1 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/clustering+som

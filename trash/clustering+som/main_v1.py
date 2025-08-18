@@ -34,7 +34,7 @@ from matplotlib.colors import Normalize
 
 # ============== ユーザ調整パラメータ（ここだけでOK） ==============
 SEED = 42                 # 乱数シード（再現性）
-TH_MERGE = 80             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
+TH_MERGE = 77             # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
 
 # 2段階クラスタリング用の行バッチと列チャンク
 CLUS_ROW_BATCH = 16        # 行バッチ（B）
@@ -52,7 +52,7 @@ S1_HIST_COL_CHUNK = 1024
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 
 # SOM学習のイテレーション回数
-SOM_MAX_ITERS_CAP = 10000
+SOM_MAX_ITERS_CAP = 300
 
 # ============== 固定：実験条件・パス等 ==============
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -60,7 +60,7 @@ RESULT_DIR = './results_v1'
 ONLY_BASE_DIR = os.path.join(RESULT_DIR, 'only_base_label')
 SOM_DIR = os.path.join(RESULT_DIR, 'som')
 
-START_DATE = '2000-01-01'
+START_DATE = '1991-01-01'
 END_DATE = '2000-12-31'
 
 BASE_LABELS = [
@@ -243,7 +243,7 @@ def main():
     hist_plot = os.path.join(ONLY_BASE_DIR, 'iteration_vs_metrics_only_base.png')
     plot_iteration_metrics(history_only_base, hist_plot)
 
-    # 分布サマリ・可視化
+    # 分布サマリ・可視化（縦サイズをクラスタ数に応じて自動拡大）
     dist_img = os.path.join(ONLY_BASE_DIR, 'final_distribution_summary_only_base.png')
     plot_final_distribution_summary(clusters, labels, ts, BASE_LABELS, dist_img)
     logging.info(f"分布サマリ保存: {dist_img}")
@@ -317,8 +317,8 @@ def main():
     except Exception as e:
         logging.warning(f"SOM量子化誤差履歴の保存に失敗: {e}")
 
-    # メドイドのBMUを予測（順序は medoid_data の行に対応）
-    bmu_xy = som.predict(medoid_data, batch_size=SOM_BATCH_SIZE)  # (M, 2)
+    # メドイドのBMUを予測（重複なし：1ノード1データ）
+    bmu_xy = som.predict_unique(medoid_data, batch_size=SOM_BATCH_SIZE)  # (M, 2), 一意割当て
 
     # 各メドイド行（medoid_dataのi番目）に対応する "元クラスタ番号" を回収
     medoid_to_cluster = []
@@ -332,7 +332,7 @@ def main():
                 cluster_ids_in_order.append(ci)
                 break
 
-    # BMU散布図を保存
+    # BMU散布図を保存（各ノードは最大1メドイドのみ）
     som_scatter = os.path.join(SOM_DIR, f'som_bmu_scatter_{som_x}x{som_y}.png')
     plt.figure(figsize=(max(6, som_y), max(6, som_x)))
     plt.title(f"SOM BMU Scatter (medoids)  size={som_x}x{som_y}")
@@ -534,7 +534,6 @@ def main():
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             # 注釈テキスト（rawラベルも併記）
             lines = [f"({ix},{iy}) | n={len(items)}"]
-            # 例: C3 | rep=1 | med=1996-01-12 | raw=4A+1 | base=4A
             for it in items:
                 lines.append(f"{it['cluster_id']} | rep={it['rep_label']} | med={it['date']} | raw={it['label_raw']} | base={it['label_base']}")
             txt = "\n".join(lines)

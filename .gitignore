@@ -50,6 +50,8 @@ nc/era5_msl/
 
 *.csv
 
+*.json
+
 *.pkl
 
 *.pt
