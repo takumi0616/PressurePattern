@@ -21,20 +21,20 @@ pkill -f "main_v2.py"
 81:25
 80:43
 79:53
-77:
+77:116
 
 # 結果を mac に転送
 
 ## wsl-ubuntu → mac
 
 ```bash
-rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/HAC+k-medoids/v4_clustering_results_83 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/HAC+k-medoids/document
+rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/results_v2 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
 ```
 
 ## via-tml2 → mac
 
 ```bash
-rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/HAC+k-medoids/v4_clustering_results_84 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/HAC+k-medoids/document
+rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/results_v2 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
 ```
 
 ## gpu01 → mac
@@ -43,7 +43,8 @@ rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePatter
 rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v2 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
 ```
 
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/3type_som/outputs_som_fullperiod /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/3type_som
+## gpu02 → mac
 
-
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v1 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+```bash
+rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v2 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+```

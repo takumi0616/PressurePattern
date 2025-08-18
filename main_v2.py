@@ -22,7 +22,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
-# s1クラスタリングのユーティリティ
+# s1クラスタリングのユーティリティ（評価・可視化）
 from s1_clustering import (
     two_stage_clustering,
     evaluate_clusters_only_base,
@@ -36,6 +36,7 @@ from s1_clustering import (
     summarize_cluster_info,
     basic_label_or_none,
     primary_base_label,
+    build_confusion_matrix_only_base,
 )
 
 # 3type版 SOM（Euclidean/SSIM/S1対応）
@@ -67,8 +68,8 @@ DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 SOM_MAX_ITERS_CAP = 1000
 
 # ============== 3種類のbatchSOM（全期間版）設定（3type_som側） ==============
-SOM_X, SOM_Y = 6, 6
-NUM_ITER = 1000
+SOM_X, SOM_Y = 6, 6       
+NUM_ITER = 800              # 収束性/比較性の両立（必要に応じ調整可）
 BATCH_SIZE = 512
 NODES_CHUNK = 16
 LOG_INTERVAL = 10
@@ -78,21 +79,19 @@ EVAL_SAMPLE_LIMIT = 2048
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
 
 # 期間指定（Noneでファイル全期間、日付文字列で範囲指定）
-TIME_START = '1991-01-01'   # 例: None にすれば全期間
-TIME_END   = '2000-12-31'   # 例: None にすれば全期間
+TIME_START = '1991-01-01'
+TIME_END   = '2000-12-31'
 
-# 出力先（元コードに合わせて保持）
+# 出力先
 RESULT_DIR = './results_v2'
 ONLY_BASE_DIR = os.path.join(RESULT_DIR, 'only_base_label')
 SOM_DIR = os.path.join(RESULT_DIR, 'som')  # クラスタリング側のSOM（メドイド用）
-OUTPUT_ROOT = './outputs_som_fullperiod'   # 3type_som側の出力（名称は元のまま）
+OUTPUT_ROOT = './results_v2/outputs_som_fullperiod'   # 3type_som側の出力
 
 # 基本ラベル（15）
 BASE_LABELS = [
     '1', '2A', '2B', '2C', '2D', '3A', '3B', '3C', '3D', '4A', '4B', '5', '6A', '6B', '6C'
 ]
-# 3type_som側で使う複合まとめラベル
-COMPOSITE_LABEL = 'COMPOSITE'
 
 
 # =====================================================
@@ -229,7 +228,7 @@ def load_and_prepare_data_unified(filepath: str,
 
 
 # =====================================================
-# 3type_som側のユーティリティ（ログ・ラベル処理・可視化 等）
+# 3type_som側のユーティリティ（ログ・評価・可視化）
 # =====================================================
 class Logger:
     def __init__(self, path):
@@ -242,23 +241,6 @@ class Logger:
     def close(self):
         self.f.close()
 
-def normalize_label(l):
-    if l is None:
-        return None
-    s = str(l).strip()
-    s = s.replace('＋','+').replace('－','-').replace('−','-').replace('　','').replace(' ','')
-    return s
-
-def map_to_base_or_composite(label_str):
-    """基本ラベルならそのまま、複合はCOMPOSITE、その他はCOMPOSITE扱い"""
-    s = normalize_label(label_str)
-    if not s:
-        return None
-    if s in BASE_LABELS:
-        return s
-    if ('+' in s) or ('-' in s):
-        return COMPOSITE_LABEL
-    return COMPOSITE_LABEL
 
 def winners_to_clusters(winners_xy, som_shape):
     clusters = [[] for _ in range(som_shape[0]*som_shape[1])]
@@ -267,84 +249,13 @@ def winners_to_clusters(winners_xy, som_shape):
         clusters[k].append(i)
     return clusters
 
-def choose_representative_labels_train(clusters, labels_mapped, base_labels, forbid_label):
-    rep = {}
-    for k, idxs in enumerate(clusters):
-        if len(idxs)==0:
-            rep[k] = None
-            continue
-        from collections import Counter
-        c = Counter()
-        for j in idxs:
-            lab = labels_mapped[j]
-            if lab is not None:
-                c[lab] += 1
-        if len(c)==0:
-            rep[k] = None
-            continue
-        max_lbl = None
-        max_cnt = -1
-        for bl in base_labels:
-            if c[bl] > max_cnt:
-                max_cnt = c[bl]
-                max_lbl = bl
-        if max_cnt > 0:
-            rep[k] = max_lbl
-        else:
-            rep[k] = None
-    return rep
-
-def macro_recall_train(clusters, labels_mapped, rep_labels, base_labels):
-    from collections import Counter
-    label_indices = {bl: [] for bl in base_labels}
-    for i,lab in enumerate(labels_mapped):
-        if lab in base_labels:
-            label_indices[lab].append(i)
-
-    recalls = []
-    for bl in base_labels:
-        total = len(label_indices[bl])
-        if total == 0:
-            continue
-        correct = 0
-        for j in label_indices[bl]:
-            found_k = None
-            for k,idxs in enumerate(clusters):
-                if j in idxs:
-                    found_k = k
-                    break
-            if found_k is None:
-                continue
-            if rep_labels.get(found_k, None) == bl:
-                correct += 1
-        recalls.append(correct/total)
-    macro = float(np.mean(recalls)) if len(recalls)>0 else 0.0
-    return macro, recalls
-
-def accuracy_on_dataset(winners_xy, labels_mapped, rep_labels, base_labels, som_shape):
-    correct = 0
-    total   = 0
-    per_label_total = {bl:0 for bl in base_labels}
-    per_label_correct = {bl:0 for bl in base_labels}
-
-    for i,(ix,iy) in enumerate(winners_xy):
-        true_lab = labels_mapped[i]
-        if true_lab not in base_labels:
-            continue
-        node_k = ix*som_shape[1] + iy
-        pred_lab = rep_labels.get(node_k, None)
-        per_label_total[true_lab] += 1
-        total += 1
-        if (pred_lab is not None) and (pred_lab == true_lab):
-            correct += 1
-            per_label_correct[true_lab] += 1
-
-    acc = correct/max(1,total)
-    per_label_acc = {bl:(per_label_correct[bl]/per_label_total[bl] if per_label_total[bl]>0 else None)
-                     for bl in base_labels}
-    return acc, total, per_label_acc
 
 def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, save_path, title):
+    """
+    可視化の統一：
+      - colormap, vmin/vmax, extent を daily_anomaly_maps に合わせる
+      - 等圧線は薄く、海岸線はやや太く
+    """
     H, W = len(lat), len(lon)
     X2 = data_flat.reshape(-1, H, W)  # 偏差[hPa]
 
@@ -359,11 +270,10 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
             if len(idxs)>0:
                 mean_patterns[ix,iy] = np.nanmean(X2[idxs], axis=0)
 
-    absmax = np.nanmax(np.abs(mean_patterns))
-    if not np.isfinite(absmax) or absmax==0:
-        absmax = 1.0
-    vmin,vmax = -absmax, absmax
+    # 表示レンジを統一
+    vmin, vmax = -40, 40
     levels = np.linspace(vmin, vmax, 21)
+    cmap = 'RdBu_r'
 
     # 並べ方（(x,y)→画像は列優先で回転）
     nrows, ncols = som_shape[1], som_shape[0]
@@ -380,10 +290,12 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
             mp = mean_patterns[ix,iy]
             if np.isnan(mp).all():
                 ax.set_axis_off(); continue
-            cf = ax.contourf(lon, lat, mp, levels=levels, cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, mp, levels=levels, colors='k', linewidth=0.3, transform=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.4)
-            ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], ccrs.PlateCarree())
+            cf = ax.contourf(lon, lat, mp, levels=levels, cmap=cmap, extend='both', transform=ccrs.PlateCarree())
+            # 等圧線を薄く
+            ax.contour(lon, lat, mp, levels=levels, colors='k', linewidths=0.3, transform=ccrs.PlateCarree())
+            # 海岸線はやや太く
+            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
+            ax.set_extent([120, 150, 20, 50], ccrs.PlateCarree())
             ax.text(0.02,0.96,f'({ix},{iy}) N={counts[ix,iy]}', transform=ax.transAxes,
                     fontsize=7, va='top', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
             ax.set_xticks([]); ax.set_yticks([])
@@ -391,17 +303,26 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
     if last_cf is not None:
         fig.subplots_adjust(right=0.88, top=0.94)
         cax = fig.add_axes([0.90, 0.12, 0.02, 0.72])
-        fig.colorbar(last_cf, cax=cax, label='SLP Anomaly (hPa)')
+        fig.colorbar(last_cf, cax=cax, label='Sea Level Pressure Anomaly (hPa)')
     plt.suptitle(title, fontsize=14)
     plt.tight_layout(rect=[0,0,0.88,0.94])
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
 
+
 def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_dir, prefix):
+    """
+    可視化の統一・読みやすさ改善
+    """
     os.makedirs(out_dir, exist_ok=True)
     H, W = len(lat), len(lon)
     X2 = data_flat.reshape(-1, H, W)  # 偏差[hPa]
     map_x, map_y = som_shape
+
+    vmin, vmax = -40, 40
+    levels = np.linspace(vmin, vmax, 21)
+    cmap = 'RdBu_r'
+
     for ix in range(map_x):
         for iy in range(map_y):
             mask = (winners_xy[:,0]==ix) & (winners_xy[:,1]==iy)
@@ -410,17 +331,15 @@ def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_di
                 mean_img = np.nanmean(X2[idxs], axis=0)
             else:
                 mean_img = np.full((H,W), np.nan, dtype=np.float32)
-            vmax = np.nanmax(np.abs(mean_img))
-            if not np.isfinite(vmax) or vmax == 0:
-                vmax = 1.0
-            vmin = -vmax
 
             fig = plt.figure(figsize=(4,3))
             ax = plt.axes(projection=ccrs.PlateCarree())
-            cf = ax.contourf(lon, lat, mean_img, 21, cmap='RdBu_r', vmin=vmin, vmax=vmax, transform=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.4)
-            ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], ccrs.PlateCarree())
-            plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label='SLP Anomaly (hPa)')
+            cf = ax.contourf(lon, lat, mean_img, levels=levels, cmap=cmap, transform=ccrs.PlateCarree(), extend='both')
+            # 薄い等圧線・やや太い海岸線
+            ax.contour(lon, lat, mean_img, levels=levels, colors='k', linewidths=0.3, transform=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.8, edgecolor='black')
+            ax.set_extent([120, 150, 20, 50], ccrs.PlateCarree())
+            plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label='Sea Level Pressure Anomaly (hPa)')
             ax.set_title(f'({ix},{iy}) N={len(idxs)}')
             ax.set_xticks([]); ax.set_yticks([])
             fpath = os.path.join(out_dir, f'{prefix}_node_{ix}_{iy}.png')
@@ -428,29 +347,36 @@ def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_di
             plt.savefig(fpath, dpi=180)
             plt.close(fig)
 
-def plot_label_distributions(winners_xy, labels_mapped, label_list, som_shape, save_dir, title_prefix):
+
+def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
+                                  base_labels: List[str], som_shape: Tuple[int,int],
+                                  save_dir: str, title_prefix: str):
+    """
+    基本ラベルのみの分布ヒートマップ（評価と整合）
+    """
     os.makedirs(save_dir, exist_ok=True)
-    node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in label_list}
+    node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
     for i,(ix,iy) in enumerate(winners_xy):
-        lab = labels_mapped[i]
+        lab = basic_label_or_none(labels_raw[i], base_labels)
         if lab in node_counts:
             node_counts[lab][ix,iy] += 1
     cols = 5
-    rows = int(np.ceil(len(label_list)/cols))
+    rows = int(np.ceil(len(base_labels)/cols))
     fig, axes = plt.subplots(rows, cols, figsize=(cols*2.6, rows*2.6))
     axes = np.atleast_2d(axes)
-    for idx,lbl in enumerate(label_list):
+    for idx,lbl in enumerate(base_labels):
         r = idx//cols; c=idx%cols
         ax = axes[r,c]
         im = ax.imshow(node_counts[lbl].T[::-1,:], cmap='viridis')
         ax.set_title(lbl); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    for k in range(len(label_list), rows*cols):
+    # 余白パネル
+    for k in range(len(base_labels), rows*cols):
         r = k//cols; c=k%cols
         axes[r,c].axis('off')
-    plt.suptitle(f'{title_prefix} Label Distributions on SOM nodes', fontsize=14)
+    plt.suptitle(f'{title_prefix} Label Distributions on SOM nodes (Base only)', fontsize=14)
     plt.tight_layout(rect=[0,0,1,0.95])
-    fpath = os.path.join(save_dir, f'{title_prefix}_label_distributions.png')
+    fpath = os.path.join(save_dir, f'{title_prefix}_label_distributions_base.png')
     plt.savefig(fpath, dpi=250)
     plt.close(fig)
 
@@ -529,55 +455,34 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                               out_dir=pernode_dir_all, prefix='all')
     log.write(f'Per-node mean images (all) -> {pernode_dir_all}\n')
 
-    # 評価（ラベルがあれば）
+    # ===== 評価（ラベルがあれば）を ④と同じ関数で統一 =====
     if labels_all is not None:
-        labels_all_mapped = [map_to_base_or_composite(l) for l in labels_all]
         clusters_all = winners_to_clusters(winners_all, (SOM_X,SOM_Y))
-        rep_labels = choose_representative_labels_train(
-            clusters=clusters_all, labels_mapped=labels_all_mapped,
-            base_labels=BASE_LABELS, forbid_label=COMPOSITE_LABEL
-        )
-        rep_json = os.path.join(out_dir, f'{method_name}_representative_labels.json')
-        with open(rep_json, 'w', encoding='utf-8') as f:
-            json.dump({str(k): rep_labels[k] for k in sorted(rep_labels.keys())}, f, ensure_ascii=False, indent=2)
-        log.write(f'Representative labels per node (saved) -> {rep_json}\n')
 
-        macro, per_label_recalls = macro_recall_train(clusters_all, labels_all_mapped, rep_labels, BASE_LABELS)
-        log.write('\n[All period] Macro Recall (base only): {:.4f}\n'.format(macro))
-        for bl,rc in zip(BASE_LABELS, per_label_recalls):
-            log.write(f'  Recall[{bl}]: {rc:.4f}\n')
-
-        acc, total, per_label_acc = accuracy_on_dataset(
-            winners_all, labels_all_mapped, rep_labels, BASE_LABELS, (SOM_X,SOM_Y)
-        )
-        log.write('\n[All period] Accuracy (base only): {:.4f}  [N={}]\n'.format(acc, total))
-        for bl in BASE_LABELS:
-            v = per_label_acc[bl]
-            if v is None:
-                log.write(f'  Acc[{bl}]: None (no sample)\n')
-            else:
-                log.write(f'  Acc[{bl}]: {v:.4f}\n')
-
-        # 混同行列（基本ラベル vs 代表基本ラベル）
-        conf_cols = BASE_LABELS + ['None']
-        conf_mat = pd.DataFrame(0, index=BASE_LABELS, columns=conf_cols, dtype=int)
-        for i,(ix,iy) in enumerate(winners_all):
-            t = labels_all_mapped[i]
-            if t not in BASE_LABELS:
-                continue
-            k = ix*SOM_Y + iy
-            p = rep_labels.get(k, None)
-            p_col = p if p in BASE_LABELS else 'None'
-            conf_mat.loc[t, p_col] += 1
+        # 混同行列（基本ラベルのみ）を構築・保存
+        cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS)
         conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_all.csv')
-        conf_mat.to_csv(conf_csv, encoding='utf-8-sig')
-        log.write(f'Confusion matrix (base vs predicted) -> {conf_csv}\n')
+        cm.to_csv(conf_csv, encoding='utf-8-sig')
+        log.write(f'Confusion matrix (base vs clusters) -> {conf_csv}\n')
 
-        # ラベル分布ヒートマップ
+        # 同一の評価関数で指標を取得（ログは標準ロガーに出ます）
+        metrics = evaluate_clusters_only_base(
+            clusters=clusters_all,
+            all_labels=labels_all,
+            base_labels=BASE_LABELS,
+            title=f"[{method_name.upper()}] SOM Evaluation (Base labels)"
+        )
+        # 指標の保存
+        if metrics is not None:
+            metrics_path = os.path.join(out_dir, f'{method_name}_metrics.json')
+            with open(metrics_path, 'w', encoding='utf-8') as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+            log.write(f'Metrics saved -> {metrics_path}\n')
+
+        # ラベル分布ヒートマップ（基本ラベルのみ）
         dist_dir_all = os.path.join(out_dir, f'{method_name}_label_dist_all')
-        plot_label_distributions(winners_all, labels_all_mapped, BASE_LABELS+[COMPOSITE_LABEL],
-                                 (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
-        log.write(f'Label-distribution heatmaps (all) -> {dist_dir_all}\n')
+        plot_label_distributions_base(winners_all, labels_all, BASE_LABELS, (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
+        log.write(f'Label-distribution heatmaps (base only) -> {dist_dir_all}\n')
     else:
         log.write('Labels not found; skip evaluation.\n')
 
@@ -661,12 +566,10 @@ def main():
         'iteration': [],
         'num_clusters': [],
         'MacroRecall_majority': [],
-        # MicroAccuracy / ARI / NMI は記録しない（削除指定）
         'MedoidMajorityMatchRate': []
     }
 
     def eval_callback(iter_idx: int, clusters: List[List[int]], medoids: List[Optional[int]]):
-        # 戻り値に他の指標が含まれても、ここでは記録しない（削除指定に従う）
         m = evaluate_clusters_only_base(
             clusters=clusters,
             all_labels=labels,
@@ -701,7 +604,7 @@ def main():
     torch.save({'clusters': clusters, 'medoids': medoids}, results_path)
     logging.info(f"クラスタリング結果保存: {results_path}")
 
-    # 評価推移の保存（Micro/ARI/NMIは含めない）
+    # 評価推移の保存
     hist_csv = os.path.join(ONLY_BASE_DIR, 'iteration_metrics_only_base.csv')
     save_metrics_history_to_csv(history_only_base, hist_csv)
     hist_plot = os.path.join(ONLY_BASE_DIR, 'iteration_vs_metrics_only_base.png')
@@ -950,8 +853,8 @@ def main():
                 continue
             pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
             last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
+            ax.contour(lon, lat, pat, colors='k', linewidths=0.3, levels=levels, transform=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.8)
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             ax.set_title(f"({ix},{iy})", fontsize=8)
     fig.tight_layout(rect=[0, 0, 0.9, 0.95])
@@ -974,7 +877,7 @@ def main():
             items = node_to_items.get((ix, iy), [])
             if len(items) == 0:
                 ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
-                ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.3)
+                ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.8)
                 txt = f"({ix},{iy}) | n=0\nNo medoids"
                 ax.text(0.02, 0.02, txt, transform=ax.transAxes, ha='left', va='bottom',
                         fontsize=6, color='black',
@@ -983,8 +886,8 @@ def main():
 
             pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
             last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
+            ax.contour(lon, lat, pat, colors='k', linewidths=0.3, levels=levels, transform=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.8)
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             lines = [f"({ix},{iy}) | n={len(items)}"]
             for it in items:
