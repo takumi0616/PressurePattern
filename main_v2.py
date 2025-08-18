@@ -22,7 +22,7 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
-# s1クラスタリングのユーティリティ（評価・可視化など）
+# s1クラスタリングのユーティリティ
 from s1_clustering import (
     two_stage_clustering,
     evaluate_clusters_only_base,
@@ -37,8 +37,6 @@ from s1_clustering import (
     basic_label_or_none,
     primary_base_label,
 )
-# 混同行列（基本ラベル×クラスタ）を出すために利用
-from s1_clustering import build_confusion_matrix_only_base
 
 # 3type版 SOM（Euclidean/SSIM/S1対応）
 from minisom import MiniSom as MultiDistMiniSom  # 3type_som/minisom.py
@@ -69,7 +67,7 @@ DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 SOM_MAX_ITERS_CAP = 1000
 
 # ============== 3種類のbatchSOM（全期間版）設定（3type_som側） ==============
-SOM_X, SOM_Y = 7, 7
+SOM_X, SOM_Y = 6, 6
 NUM_ITER = 1000
 BATCH_SIZE = 512
 NODES_CHUNK = 16
@@ -80,26 +78,21 @@ EVAL_SAMPLE_LIMIT = 2048
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
 
 # 期間指定（Noneでファイル全期間、日付文字列で範囲指定）
-TIME_START = '1991-01-01'
-TIME_END   = '2000-12-31'
+TIME_START = '1991-01-01'   # 例: None にすれば全期間
+TIME_END   = '2000-12-31'   # 例: None にすれば全期間
 
-# 出力先
+# 出力先（元コードに合わせて保持）
 RESULT_DIR = './results_v2'
 ONLY_BASE_DIR = os.path.join(RESULT_DIR, 'only_base_label')
 SOM_DIR = os.path.join(RESULT_DIR, 'som')  # クラスタリング側のSOM（メドイド用）
-OUTPUT_ROOT = './outputs_som_fullperiod'   # 3type_som側の出力
+OUTPUT_ROOT = './outputs_som_fullperiod'   # 3type_som側の出力（名称は元のまま）
 
 # 基本ラベル（15）
 BASE_LABELS = [
     '1', '2A', '2B', '2C', '2D', '3A', '3B', '3C', '3D', '4A', '4B', '5', '6A', '6B', '6C'
 ]
-
-# 可視化の標準設定（only_base_label/daily_anomaly_maps_only_baseに統一）
-MAP_EXTENT = [120, 150, 20, 50]
-VMIN, VMAX = -40, 40
-LEVELS = np.linspace(VMIN, VMAX, 21)
-LINE_LEVELS = np.arange(VMIN, VMAX + 1, 10)
-CBAR_LABEL = 'Sea Level Pressure Anomaly (hPa)'
+# 3type_som側で使う複合まとめラベル
+COMPOSITE_LABEL = 'COMPOSITE'
 
 
 # =====================================================
@@ -249,6 +242,24 @@ class Logger:
     def close(self):
         self.f.close()
 
+def normalize_label(l):
+    if l is None:
+        return None
+    s = str(l).strip()
+    s = s.replace('＋','+').replace('－','-').replace('−','-').replace('　','').replace(' ','')
+    return s
+
+def map_to_base_or_composite(label_str):
+    """基本ラベルならそのまま、複合はCOMPOSITE、その他はCOMPOSITE扱い"""
+    s = normalize_label(label_str)
+    if not s:
+        return None
+    if s in BASE_LABELS:
+        return s
+    if ('+' in s) or ('-' in s):
+        return COMPOSITE_LABEL
+    return COMPOSITE_LABEL
+
 def winners_to_clusters(winners_xy, som_shape):
     clusters = [[] for _ in range(som_shape[0]*som_shape[1])]
     for i,(ix,iy) in enumerate(winners_xy):
@@ -256,12 +267,84 @@ def winners_to_clusters(winners_xy, som_shape):
         clusters[k].append(i)
     return clusters
 
+def choose_representative_labels_train(clusters, labels_mapped, base_labels, forbid_label):
+    rep = {}
+    for k, idxs in enumerate(clusters):
+        if len(idxs)==0:
+            rep[k] = None
+            continue
+        from collections import Counter
+        c = Counter()
+        for j in idxs:
+            lab = labels_mapped[j]
+            if lab is not None:
+                c[lab] += 1
+        if len(c)==0:
+            rep[k] = None
+            continue
+        max_lbl = None
+        max_cnt = -1
+        for bl in base_labels:
+            if c[bl] > max_cnt:
+                max_cnt = c[bl]
+                max_lbl = bl
+        if max_cnt > 0:
+            rep[k] = max_lbl
+        else:
+            rep[k] = None
+    return rep
+
+def macro_recall_train(clusters, labels_mapped, rep_labels, base_labels):
+    from collections import Counter
+    label_indices = {bl: [] for bl in base_labels}
+    for i,lab in enumerate(labels_mapped):
+        if lab in base_labels:
+            label_indices[lab].append(i)
+
+    recalls = []
+    for bl in base_labels:
+        total = len(label_indices[bl])
+        if total == 0:
+            continue
+        correct = 0
+        for j in label_indices[bl]:
+            found_k = None
+            for k,idxs in enumerate(clusters):
+                if j in idxs:
+                    found_k = k
+                    break
+            if found_k is None:
+                continue
+            if rep_labels.get(found_k, None) == bl:
+                correct += 1
+        recalls.append(correct/total)
+    macro = float(np.mean(recalls)) if len(recalls)>0 else 0.0
+    return macro, recalls
+
+def accuracy_on_dataset(winners_xy, labels_mapped, rep_labels, base_labels, som_shape):
+    correct = 0
+    total   = 0
+    per_label_total = {bl:0 for bl in base_labels}
+    per_label_correct = {bl:0 for bl in base_labels}
+
+    for i,(ix,iy) in enumerate(winners_xy):
+        true_lab = labels_mapped[i]
+        if true_lab not in base_labels:
+            continue
+        node_k = ix*som_shape[1] + iy
+        pred_lab = rep_labels.get(node_k, None)
+        per_label_total[true_lab] += 1
+        total += 1
+        if (pred_lab is not None) and (pred_lab == true_lab):
+            correct += 1
+            per_label_correct[true_lab] += 1
+
+    acc = correct/max(1,total)
+    per_label_acc = {bl:(per_label_correct[bl]/per_label_total[bl] if per_label_total[bl]>0 else None)
+                     for bl in base_labels}
+    return acc, total, per_label_acc
+
 def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, save_path, title):
-    """
-    海面更正気圧の偏差[hPa]のノード平均を可視化
-    - カラー：RdBu_r、[-40,40]固定
-    - カラーバー表記・地図範囲をonly_baseの出力に合わせる
-    """
     H, W = len(lat), len(lon)
     X2 = data_flat.reshape(-1, H, W)  # 偏差[hPa]
 
@@ -276,8 +359,11 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
             if len(idxs)>0:
                 mean_patterns[ix,iy] = np.nanmean(X2[idxs], axis=0)
 
-    vmin, vmax = VMIN, VMAX
-    levels = LEVELS
+    absmax = np.nanmax(np.abs(mean_patterns))
+    if not np.isfinite(absmax) or absmax==0:
+        absmax = 1.0
+    vmin,vmax = -absmax, absmax
+    levels = np.linspace(vmin, vmax, 21)
 
     # 並べ方（(x,y)→画像は列優先で回転）
     nrows, ncols = som_shape[1], som_shape[0]
@@ -295,9 +381,9 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
             if np.isnan(mp).all():
                 ax.set_axis_off(); continue
             cf = ax.contourf(lon, lat, mp, levels=levels, cmap='RdBu_r', extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, mp, levels=LINE_LEVELS, colors='k', linewidth=0.3, transform=ccrs.PlateCarree())
+            ax.contour(lon, lat, mp, levels=levels, colors='k', linewidth=0.3, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.4)
-            ax.set_extent(MAP_EXTENT, ccrs.PlateCarree())
+            ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], ccrs.PlateCarree())
             ax.text(0.02,0.96,f'({ix},{iy}) N={counts[ix,iy]}', transform=ax.transAxes,
                     fontsize=7, va='top', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
             ax.set_xticks([]); ax.set_yticks([])
@@ -305,16 +391,13 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
     if last_cf is not None:
         fig.subplots_adjust(right=0.88, top=0.94)
         cax = fig.add_axes([0.90, 0.12, 0.02, 0.72])
-        fig.colorbar(last_cf, cax=cax, label=CBAR_LABEL)
+        fig.colorbar(last_cf, cax=cax, label='SLP Anomaly (hPa)')
     plt.suptitle(title, fontsize=14)
     plt.tight_layout(rect=[0,0,0.88,0.94])
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
 
 def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_dir, prefix):
-    """
-    节点ごとの平均偏差[hPa]を個別画像で保存（only_baseの表現に統一）
-    """
     os.makedirs(out_dir, exist_ok=True)
     H, W = len(lat), len(lon)
     X2 = data_flat.reshape(-1, H, W)  # 偏差[hPa]
@@ -327,16 +410,17 @@ def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_di
                 mean_img = np.nanmean(X2[idxs], axis=0)
             else:
                 mean_img = np.full((H,W), np.nan, dtype=np.float32)
-
-            vmin, vmax = VMIN, VMAX
+            vmax = np.nanmax(np.abs(mean_img))
+            if not np.isfinite(vmax) or vmax == 0:
+                vmax = 1.0
+            vmin = -vmax
 
             fig = plt.figure(figsize=(4,3))
             ax = plt.axes(projection=ccrs.PlateCarree())
-            cf = ax.contourf(lon, lat, mean_img, LEVELS, cmap='RdBu_r', vmin=vmin, vmax=vmax, transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, mean_img, levels=LINE_LEVELS, colors='k', linewidth=0.5, transform=ccrs.PlateCarree())
+            cf = ax.contourf(lon, lat, mean_img, 21, cmap='RdBu_r', vmin=vmin, vmax=vmax, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.4)
-            ax.set_extent(MAP_EXTENT, ccrs.PlateCarree())
-            plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label=CBAR_LABEL)
+            ax.set_extent([lon.min(), lon.max(), lat.min(), lat.max()], ccrs.PlateCarree())
+            plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label='SLP Anomaly (hPa)')
             ax.set_title(f'({ix},{iy}) N={len(idxs)}')
             ax.set_xticks([]); ax.set_yticks([])
             fpath = os.path.join(out_dir, f'{prefix}_node_{ix}_{iy}.png')
@@ -345,9 +429,6 @@ def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_di
             plt.close(fig)
 
 def plot_label_distributions(winners_xy, labels_mapped, label_list, som_shape, save_dir, title_prefix):
-    """
-    ノードごとのラベル分布ヒートマップ（基本ラベルのみ）
-    """
     os.makedirs(save_dir, exist_ok=True)
     node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in label_list}
     for i,(ix,iy) in enumerate(winners_xy):
@@ -413,7 +494,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     som.random_weights_init(data_all)
 
     # 学習
-    _ = som.train_batch(
+    qhist = som.train_batch(
         data_all, num_iteration=NUM_ITER,
         batch_size=BATCH_SIZE, verbose=True, log_interval=LOG_INTERVAL,
         update_per_iteration=False, shuffle=True
@@ -433,12 +514,12 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     }).to_csv(assign_csv_all, index=False, encoding='utf-8-sig')
     log.write(f'Assigned BMU (all) -> {assign_csv_all}\n')
 
-    # ノード平均パターン（偏差[hPa]）: only_baseの見た目に統一
+    # ノード平均パターン（偏差[hPa]）
     bigmap_all = os.path.join(out_dir, f'{method_name}_som_node_avg_all.png')
     plot_som_node_average_patterns(
         data_all, winners_all, lat, lon, (SOM_X,SOM_Y),
         save_path=bigmap_all,
-        title=f'{method_name.upper()} SOM Node Avg Sea Level Pressure Anomaly (All)'
+        title=f'{method_name.upper()} SOM Node Avg SLP Anomaly (All)'
     )
     log.write(f'Node average patterns (all) -> {bigmap_all}\n')
 
@@ -448,34 +529,55 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                               out_dir=pernode_dir_all, prefix='all')
     log.write(f'Per-node mean images (all) -> {pernode_dir_all}\n')
 
-    # 評価（ラベルがあれば）— basic_label_or_noneに統一、evaluate_clusters_only_baseを使用
+    # 評価（ラベルがあれば）
     if labels_all is not None:
+        labels_all_mapped = [map_to_base_or_composite(l) for l in labels_all]
         clusters_all = winners_to_clusters(winners_all, (SOM_X,SOM_Y))
-
-        # 統一評価（マクロ再現率・マイクロ精度）
-        metrics = evaluate_clusters_only_base(
-            clusters=clusters_all,
-            all_labels=labels_all,
-            base_labels=BASE_LABELS,
-            title='[All period] Evaluation (basic labels only)',
-            medoids=None
+        rep_labels = choose_representative_labels_train(
+            clusters=clusters_all, labels_mapped=labels_all_mapped,
+            base_labels=BASE_LABELS, forbid_label=COMPOSITE_LABEL
         )
-        if metrics:
-            log.write('\n[All period] Macro Recall (basic only): {:.4f}\n'.format(metrics.get('MacroRecall_majority', np.nan)))
-            log.write('[All period] Micro Accuracy (basic only): {:.4f}\n'.format(metrics.get('MicroAccuracy_majority', np.nan)))
+        rep_json = os.path.join(out_dir, f'{method_name}_representative_labels.json')
+        with open(rep_json, 'w', encoding='utf-8') as f:
+            json.dump({str(k): rep_labels[k] for k in sorted(rep_labels.keys())}, f, ensure_ascii=False, indent=2)
+        log.write(f'Representative labels per node (saved) -> {rep_json}\n')
 
-        # 混同行列（基本ラベル×クラスタ列）CSVを保存（evaluateと同じ定義）
-        cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS)
-        conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_clusters_all.csv')
-        cm.to_csv(conf_csv, encoding='utf-8-sig')
-        log.write(f'Confusion matrix (basic label vs cluster columns) -> {conf_csv}\n')
+        macro, per_label_recalls = macro_recall_train(clusters_all, labels_all_mapped, rep_labels, BASE_LABELS)
+        log.write('\n[All period] Macro Recall (base only): {:.4f}\n'.format(macro))
+        for bl,rc in zip(BASE_LABELS, per_label_recalls):
+            log.write(f'  Recall[{bl}]: {rc:.4f}\n')
 
-        # ラベル分布ヒートマップ（基本ラベルのみ）
-        labels_all_mapped = [basic_label_or_none(l, BASE_LABELS) for l in labels_all]
+        acc, total, per_label_acc = accuracy_on_dataset(
+            winners_all, labels_all_mapped, rep_labels, BASE_LABELS, (SOM_X,SOM_Y)
+        )
+        log.write('\n[All period] Accuracy (base only): {:.4f}  [N={}]\n'.format(acc, total))
+        for bl in BASE_LABELS:
+            v = per_label_acc[bl]
+            if v is None:
+                log.write(f'  Acc[{bl}]: None (no sample)\n')
+            else:
+                log.write(f'  Acc[{bl}]: {v:.4f}\n')
+
+        # 混同行列（基本ラベル vs 代表基本ラベル）
+        conf_cols = BASE_LABELS + ['None']
+        conf_mat = pd.DataFrame(0, index=BASE_LABELS, columns=conf_cols, dtype=int)
+        for i,(ix,iy) in enumerate(winners_all):
+            t = labels_all_mapped[i]
+            if t not in BASE_LABELS:
+                continue
+            k = ix*SOM_Y + iy
+            p = rep_labels.get(k, None)
+            p_col = p if p in BASE_LABELS else 'None'
+            conf_mat.loc[t, p_col] += 1
+        conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_all.csv')
+        conf_mat.to_csv(conf_csv, encoding='utf-8-sig')
+        log.write(f'Confusion matrix (base vs predicted) -> {conf_csv}\n')
+
+        # ラベル分布ヒートマップ
         dist_dir_all = os.path.join(out_dir, f'{method_name}_label_dist_all')
-        plot_label_distributions(winners_all, labels_all_mapped, BASE_LABELS,
+        plot_label_distributions(winners_all, labels_all_mapped, BASE_LABELS+[COMPOSITE_LABEL],
                                  (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
-        log.write(f'Label-distribution heatmaps (all, base only) -> {dist_dir_all}\n')
+        log.write(f'Label-distribution heatmaps (all) -> {dist_dir_all}\n')
     else:
         log.write('Labels not found; skip evaluation.\n')
 
@@ -559,10 +661,12 @@ def main():
         'iteration': [],
         'num_clusters': [],
         'MacroRecall_majority': [],
+        # MicroAccuracy / ARI / NMI は記録しない（削除指定）
         'MedoidMajorityMatchRate': []
     }
 
     def eval_callback(iter_idx: int, clusters: List[List[int]], medoids: List[Optional[int]]):
+        # 戻り値に他の指標が含まれても、ここでは記録しない（削除指定に従う）
         m = evaluate_clusters_only_base(
             clusters=clusters,
             all_labels=labels,
@@ -597,7 +701,7 @@ def main():
     torch.save({'clusters': clusters, 'medoids': medoids}, results_path)
     logging.info(f"クラスタリング結果保存: {results_path}")
 
-    # 評価推移の保存
+    # 評価推移の保存（Micro/ARI/NMIは含めない）
     hist_csv = os.path.join(ONLY_BASE_DIR, 'iteration_metrics_only_base.csv')
     save_metrics_history_to_csv(history_only_base, hist_csv)
     hist_plot = os.path.join(ONLY_BASE_DIR, 'iteration_vs_metrics_only_base.png')
@@ -608,12 +712,12 @@ def main():
     plot_final_distribution_summary(clusters, labels, ts, BASE_LABELS, dist_img)
     logging.info(f"分布サマリ保存: {dist_img}")
 
-    # メドイド・クラスタの空間偏差図（only_baseの見た目に統一）
+    # メドイド・クラスタの空間偏差図
     final_clusters_img = os.path.join(ONLY_BASE_DIR, f'final_clusters_anomaly_th{TH_MERGE}_only_base.png')
     plot_final_clusters_medoids(medoids, clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, final_clusters_img)
     logging.info(f"メドイド図保存: {final_clusters_img}")
 
-    # 日次マップ出力（only_baseの見た目に統一済み関数）
+    # 日次マップ出力
     daily_dir = os.path.join(ONLY_BASE_DIR, 'daily_anomaly_maps_only_base')
     save_daily_maps_per_cluster(clusters, X_anomaly_hpa, lat, lon, ts, labels, BASE_LABELS, daily_dir, per_cluster_limit=DAILY_MAPS_PER_CLUSTER_LIMIT)
     logging.info(f"日次マップ保存先: {daily_dir}")
@@ -833,9 +937,9 @@ def main():
     fig, axes = plt.subplots(som_x, som_y, figsize=(som_y * 3, som_x * 3), subplot_kw={"projection": ccrs.PlateCarree()})
     axes = np.atleast_2d(axes)
     cmap = plt.get_cmap('RdBu_r')
-    vmin, vmax = VMIN, VMAX
+    vmin, vmax = -40, 40
     norm = Normalize(vmin=vmin, vmax=vmax)
-    levels = LEVELS
+    levels = np.linspace(vmin, vmax, 21)
     last_cont = None
     for ix in range(som_x):
         for iy in range(som_y):
@@ -846,14 +950,14 @@ def main():
                 continue
             pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
             last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=LINE_LEVELS, transform=ccrs.PlateCarree())
+            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
-            ax.set_extent(MAP_EXTENT, crs=ccrs.PlateCarree())
+            ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             ax.set_title(f"({ix},{iy})", fontsize=8)
     fig.tight_layout(rect=[0, 0, 0.9, 0.95])
     cbar_ax = fig.add_axes([0.91, 0.15, 0.02, 0.7])
     if last_cont is not None:
-        fig.colorbar(last_cont, cax=cbar_ax, label=CBAR_LABEL)
+        fig.colorbar(last_cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
     fig.suptitle(f"SOM Codebook Maps (size={som_x}x{som_y})", fontsize=14)
     plt.savefig(som_codebook_img)
     plt.close()
@@ -869,7 +973,7 @@ def main():
             ax = axes[ix, iy]
             items = node_to_items.get((ix, iy), [])
             if len(items) == 0:
-                ax.set_extent(MAP_EXTENT, crs=ccrs.PlateCarree())
+                ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
                 ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.3)
                 txt = f"({ix},{iy}) | n=0\nNo medoids"
                 ax.text(0.02, 0.02, txt, transform=ax.transAxes, ha='left', va='bottom',
@@ -879,9 +983,9 @@ def main():
 
             pat = weights_grid[ix, iy].reshape(d_lat, d_lon)
             last_cont = ax.contourf(lon, lat, pat, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=LINE_LEVELS, transform=ccrs.PlateCarree())
+            ax.contour(lon, lat, pat, colors='k', linewidth=0.3, levels=levels, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.4)
-            ax.set_extent(MAP_EXTENT, crs=ccrs.PlateCarree())
+            ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             lines = [f"({ix},{iy}) | n={len(items)}"]
             for it in items:
                 lines.append(f"{it['cluster_id']} | rep={it['rep_label']} | med={it['date']} | raw={it['label_raw']} | base={it['label_base']}")
@@ -892,7 +996,7 @@ def main():
     fig.tight_layout(rect=[0, 0, 0.9, 0.95])
     cbar_ax = fig.add_axes([0.91, 0.15, 0.02, 0.7])
     if last_cont is not None:
-        fig.colorbar(last_cont, cax=cbar_ax, label=CBAR_LABEL)
+        fig.colorbar(last_cont, cax=cbar_ax, label="Sea Level Pressure Anomaly (hPa)")
     fig.suptitle(f"SOM Codebook Maps Annotated (size={som_x}x{som_y})", fontsize=14)
     plt.savefig(som_codebook_annotated_img)
     plt.close()
