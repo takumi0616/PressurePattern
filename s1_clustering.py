@@ -185,9 +185,19 @@ def analyze_cluster_distribution(clusters: List[List[int]],
 
 def build_confusion_matrix_only_base(clusters: List[List[int]],
                                      all_labels: List[Optional[str]],
-                                     base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+                                     base_labels: List[str],
+                                     cluster_names: Optional[List[str]] = None) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    混同行列（基本ラベルのみ）を構築。
+    cluster_names を渡した場合は列名に用いる（SOMノード名などの表示に利用）。
+    """
     num_clusters = len(clusters)
-    cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
+    if cluster_names is None:
+        cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
+    else:
+        if len(cluster_names) != num_clusters:
+            raise ValueError(f'cluster_names の長さ {len(cluster_names)} がクラスタ数 {num_clusters} と一致しません。')
+
     cm = pd.DataFrame(0, index=base_labels, columns=cluster_names, dtype=int)
     for i, idxs in enumerate(clusters):
         col = cluster_names[i]
@@ -205,7 +215,8 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
                                 all_labels: List[Optional[str]],
                                 base_labels: List[str],
                                 title: str = "評価（基本ラベルのみ）",
-                                medoids: Optional[List[Optional[int]]] = None) -> Optional[Dict[str, float]]:
+                                medoids: Optional[List[Optional[int]]] = None,
+                                cluster_names: Optional[List[str]] = None) -> Optional[Dict[str, float]]:
     """
     - 各クラスタの代表（多数決）ラベルを base_labels のみで決定（複数クラスタが同一ラベルも可）
     - マクロ平均再現率を「各基本ラベル l に対して、代表ラベルが l であるクラスタ群に入った l の件数 / l 全体の件数」の平均で算出
@@ -213,13 +224,14 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     - マイクロ精度は「各クラスタの多数派件数の総和 / 基本ラベル総件数」
     - ARI/NMI は、基本ラベルを持ち、かつクラスタの代表ラベルが None でないサンプルのみで算出
     - 代表ラベルとメドイドの真ラベルの一致状況もログ出力（medoids 指定時）
+    - cluster_names を渡すと列表示に反映（SOMノード名等）
     """
     logger.info(f"\n--- {title} ---")
     if not all_labels:
         logger.warning("ラベル無しのため評価をスキップします。")
         return None
 
-    cm, cluster_names = build_confusion_matrix_only_base(clusters, all_labels, base_labels)
+    cm, col_names = build_confusion_matrix_only_base(clusters, all_labels, base_labels, cluster_names=cluster_names)
     present_labels = [l for l in base_labels if cm.loc[l].sum() > 0]
     if len(present_labels) == 0:
         logger.warning("基本ラベルに該当するサンプルがありません。評価をスキップします。")
@@ -233,8 +245,8 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     logger.info("\n【各クラスタの多数決（代表ラベル）】")
     total_count = int(cm.values.sum())
     micro_correct_sum = 0
-    for k in range(len(cluster_names)):
-        col = cluster_names[k]
+    for k in range(len(col_names)):
+        col = col_names[k]
         col_counts = cm[col]
         col_sum = int(col_counts.sum())
         if col_sum == 0:
@@ -257,7 +269,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         logger.info("\n【メドイドと代表ラベルの一致状況】")
         matches = 0
         valid = 0
-        for k, (col, med_idx) in enumerate(zip(cluster_names, medoids)):
+        for k, (col, med_idx) in enumerate(zip(col_names, medoids)):
             rep = cluster_majority.get(k, None)
             if med_idx is None:
                 logger.info(f" - {col:<12}: 代表={rep}, メドイド=None")
@@ -281,7 +293,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     per_label = {}
     for lbl in present_labels:
         row_sum = int(cm.loc[lbl, :].sum())
-        cols_for_lbl = [cluster_names[k] for k in range(len(cluster_names)) if cluster_majority.get(k, None) == lbl]
+        cols_for_lbl = [col_names[k] for k in range(len(col_names)) if cluster_majority.get(k, None) == lbl]
         correct = int(cm.loc[lbl, cols_for_lbl].sum()) if cols_for_lbl else 0
         recall = correct / row_sum if row_sum > 0 else 0.0
         per_label[lbl] = {'N': row_sum, 'Correct': correct, 'Recall': recall}
