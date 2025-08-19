@@ -37,7 +37,7 @@ from s1_clustering import (
     basic_label_or_none,
     primary_base_label,
     build_confusion_matrix_only_base,
-    extract_base_components,   # 追加: 複合ラベル成分抽出
+    extract_base_components,  # 追加: 複合ラベル成分抽出をSOM用の集計でも使用
 )
 
 # 3type版 SOM（Euclidean/SSIM/S1対応）
@@ -414,98 +414,114 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
     log.write(f'--- {title} 終了 ---\n')
 
 
-def _node_name(ix: int, iy: int) -> str:
-    return f"Node({ix},{iy})"
-
-
-def _summarize_som_per_label_recalls_to_method_log(
+# 追加: 3種類SOMのログに「代表ノード群ベース再現率（基本/複合）」と「各ラベルの代表ノード一覧」を出す
+def log_som_recall_by_label_with_nodes(
     log: Logger,
     winners_xy: np.ndarray,
     labels_all: List[Optional[str]],
     base_labels: List[str],
     som_shape: Tuple[int, int],
-    header: str
+    section_title: str
 ):
     """
-    3種類のSOM（フル期間）用: 各基本ラベルの
-      - 代表ノード群（そのノードで多数決がそのラベル）
-      - 再現率（基本）
-      - 複合ラベル考慮の再現率（基本+応用）
-    を method専用ログに追記。
+    - 各ノードの多数決（基本ラベル）を決定
+    - 各ラベルの代表ノード一覧（= そのラベルがノード多数決で代表になっているノード）を列挙
+    - 代表ノード群ベースの再現率をラベルごとに算出
+    - 複合ラベル（基本+応用）を考慮した再現率もラベルごとに算出
+    -> 3種類SOMの各 results.log に出力する
     """
-    if labels_all is None:
-        log.write("\nラベルが無いためSOMノード別再現率の詳細は出力しません。\n")
+    if labels_all is None or len(labels_all) == 0:
+        log.write("\nラベルが無いため、代表ノード群ベースの再現率出力をスキップします。\n")
         return
 
-    M = som_shape[0] * som_shape[1]
-    clusters = winners_to_clusters(winners_xy, som_shape)
+    H_nodes, W_nodes = som_shape
+    n_nodes = H_nodes * W_nodes
+    node_index_arr = winners_xy[:, 0] * W_nodes + winners_xy[:, 1]  # (N,)
 
-    # 各ノードの基本ラベル構成と代表ラベル
-    cluster_counters: List[Counter] = []
-    cluster_rep: List[Optional[str]] = []
-    for k in range(M):
-        cnt = Counter()
-        for j in clusters[k]:
-            bl = basic_label_or_none(labels_all[j], base_labels)
-            if bl is not None:
-                cnt[bl] += 1
-        cluster_counters.append(cnt)
-        rep = cnt.most_common(1)[0][0] if cnt else None
-        cluster_rep.append(rep)
+    # ノード毎の基本ラベル分布
+    node_counters = [Counter() for _ in range(n_nodes)]
+    for i, k in enumerate(node_index_arr):
+        bl = basic_label_or_none(labels_all[i], base_labels)
+        if bl is not None:
+            node_counters[int(k)][bl] += 1
 
-    # 総数（基本）
-    totals_basic = Counter()
-    for lab in labels_all:
-        b = basic_label_or_none(lab, base_labels)
-        if b is not None:
-            totals_basic[b] += 1
+    # ノードの代表（多数決）ラベル
+    node_majority: List[Optional[str]] = [None] * n_nodes
+    for k in range(n_nodes):
+        if len(node_counters[k]) > 0:
+            node_majority[k] = node_counters[k].most_common(1)[0][0]
 
-    # 代表ノード群に入った分の正解数（基本）
-    correct_basic = Counter()
-    rep_nodes_by_label: Dict[str, List[str]] = {bl: [] for bl in base_labels}
-    for k in range(M):
-        rep = cluster_rep[k]
+    # ラベル→代表ノード一覧
+    label_to_nodes: Dict[str, List[Tuple[int, int]]] = {lbl: [] for lbl in base_labels}
+    for k, rep in enumerate(node_majority):
         if rep is None:
             continue
-        ix, iy = k // som_shape[1], k % som_shape[1]
-        rep_nodes_by_label[rep].append(_node_name(ix, iy))
-        cnt = cluster_counters[k]
-        correct_basic[rep] += cnt.get(rep, 0)
+        ix, iy = k // W_nodes, k % W_nodes
+        label_to_nodes[rep].append((ix, iy))
 
-    # 出力（基本）
-    log.write(f"\n【{header}】\n")
-    for bl in base_labels:
-        N = int(totals_basic.get(bl, 0))
-        correct = int(correct_basic.get(bl, 0))
-        recall = (correct / N) if N > 0 else 0.0
-        reps = rep_nodes_by_label.get(bl, [])
-        reps_str = str(reps) if len(reps) > 0 else 'なし'
-        log.write(f" - {bl:<3}: N={N:4d} Correct={correct:4d} Recall={recall:.4f} 代表={reps_str}\n")
-
-    # 複合（基本+応用）
-    # サンプル→所属ノード→そのノードの代表ラベル
-    sample_to_node = np.array([ix*som_shape[1] + iy for ix,iy in winners_xy], dtype=np.int32)
-    totals_comp = Counter()
-    correct_comp = Counter()
-    for j, raw in enumerate(labels_all):
-        comps = extract_base_components(raw, base_labels)
-        for c in comps:
-            totals_comp[c] += 1
-        if len(comps) == 0:
+    # 基本ラベルベースの再現率（代表ノード群ベース）
+    total_base = Counter()
+    correct_base = Counter()
+    for i, k in enumerate(node_index_arr):
+        bl = basic_label_or_none(labels_all[i], base_labels)
+        if bl is None:
             continue
-        nd = int(sample_to_node[j])
-        pred = cluster_rep[nd]
+        total_base[bl] += 1
+        pred = node_majority[int(k)]
         if pred is None:
             continue
+        if pred == bl:
+            correct_base[bl] += 1
+
+    # 複合ラベル（基本+応用）考慮の再現率（代表ノード群ベース）
+    total_comp = Counter()
+    correct_comp = Counter()
+    for i, k in enumerate(node_index_arr):
+        comps = extract_base_components(labels_all[i], base_labels)
+        if not comps:
+            continue
+        for c in comps:
+            total_comp[c] += 1
+        pred = node_majority[int(k)]
+        if pred is None:
+            continue
+        # 予測ラベル（=ノード代表ラベル）が複合成分に含まれていれば、その成分に対して的中
         if pred in comps:
             correct_comp[pred] += 1
 
-    log.write(f"\n【複合ラベル考慮の再現率（基本+応用）】\n")
-    for bl in base_labels:
-        N = int(totals_comp.get(bl, 0))
-        correct = int(correct_comp.get(bl, 0))
-        recall = (correct / N) if N > 0 else 0.0
-        log.write(f" - {bl:<3}: N={N:4d} Correct={correct:4d} Recall={recall:.4f}\n")
+    # 出力（代表ノード群と、再現率(基本/複合)）
+    log.write(f"\n【{section_title}】\n")
+    log.write("【各ラベルの再現率（代表ノード群ベース）】\n")
+    recalls_base = []
+    for lbl in base_labels:
+        N = int(total_base[lbl])
+        C = int(correct_base[lbl])
+        rec = (C / N) if N > 0 else 0.0
+        recalls_base.append(rec if N > 0 else np.nan)
+        nodes_disp = label_to_nodes.get(lbl, [])
+        if len(nodes_disp) == 0:
+            rep_str = "なし"
+        else:
+            rep_str = "[" + ", ".join([f"({ix},{iy})" for ix, iy in nodes_disp]) + "]"
+        log.write(f" - {lbl:<3}: N={N:4d} Correct={C:4d} Recall={rec:.4f} 代表={rep_str}\n")
+
+    # 複合の方
+    log.write("\n【複合ラベル考慮の再現率（基本+応用）】\n")
+    recalls_comp = []
+    for lbl in base_labels:
+        Nt = int(total_comp[lbl])
+        Ct = int(correct_comp[lbl])
+        rec_t = (Ct / Nt) if Nt > 0 else 0.0
+        if Nt > 0:
+            recalls_comp.append(rec_t)
+        log.write(f" - {lbl:<3}: N={Nt:4d} Correct={Ct:4d} Recall={rec_t:.4f}\n")
+
+    # マクロ平均（存在するラベルのみ）
+    base_valid = [r for r, lbl in zip(recalls_base, base_labels) if not np.isnan(r) and total_base[lbl] > 0]
+    macro_base = float(np.mean(base_valid)) if len(base_valid) > 0 else float('nan')
+    macro_comp = float(np.mean(recalls_comp)) if len(recalls_comp) > 0 else float('nan')
+    log.write(f"\n[Summary] Macro Recall (基本ラベル)   = {macro_base:.4f}\n")
+    log.write(f"[Summary] Macro Recall (基本+応用) = {macro_comp:.4f}\n")
 
 
 # =====================================================
@@ -573,16 +589,13 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         # 評価
         winners_now = som.predict(data_all, batch_size=max(64, BATCH_SIZE))
         clusters_now = winners_to_clusters(winners_now, (SOM_X, SOM_Y))
-        # ノード名を列に用いる（evaluate内部のログでも Node(x,y) が出力される）
-        node_names = [f"Node({k // SOM_Y},{k % SOM_Y})" for k in range(SOM_X * SOM_Y)]
         metrics = evaluate_clusters_only_base(
             clusters=clusters_now,
             all_labels=labels_all,
             base_labels=BASE_LABELS,
-            title=f"[{method_name.upper()}] Iteration={current_iter} Evaluation (Base labels)",
-            cluster_names=node_names
+            title=f"[{method_name.upper()}] Iteration={current_iter} Evaluation (Base labels)"
         )
-        # ログ（result.log）に集約指標を追記
+        # ログ（results.log）に集約指標を追記
         log.write(f'\n[Iteration {current_iter}] QuantizationError={qe_now:.6f}\n')
         if metrics is not None:
             metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
@@ -626,7 +639,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     plot_som_node_average_patterns(
         data_all, winners_all, lat, lon, (SOM_X,SOM_Y),
         save_path=bigmap_all,
-        title=f'{method_name.upper()} SOM Node Avg SLP Anomaly (All)'
+        title=f'{method_name.UPPER()} SOM Node Avg SLP Anomaly (All)'
     )
     log.write(f'Node average patterns (all) -> {bigmap_all}\n')
 
@@ -636,26 +649,23 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                               out_dir=pernode_dir_all, prefix='all')
     log.write(f'Per-node mean images (all) -> {pernode_dir_all}\n')
 
-    # ===== 評価（ラベルがあれば）を ④と同じ関数で統一 =====
+    # ===== 評価（ラベルがあれば） =====
     if labels_all is not None:
         clusters_all = winners_to_clusters(winners_all, (SOM_X,SOM_Y))
 
-        # 混同行列（基本ラベルのみ）を構築・保存（列名=Node(x,y)）
-        node_names = [f"Node({k // SOM_Y},{k % SOM_Y})" for k in range(SOM_X * SOM_Y)]
-        cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS, cluster_names=node_names)
+        # 混同行列（基本ラベルのみ）を構築・保存
+        cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS)
         conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_all.csv')
         cm.to_csv(conf_csv, encoding='utf-8-sig')
-        log.write(f'\nConfusion matrix (base vs nodes) -> {conf_csv}\n')
+        log.write(f'\nConfusion matrix (base vs clusters) -> {conf_csv}\n')
 
-        # 同一の評価関数で指標を取得（ログは標準ロガーに出ます）※列名はNode(x,y)
+        # 集約指標（基本/複合）を取得（ログはrun_v2.log）
         metrics = evaluate_clusters_only_base(
             clusters=clusters_all,
             all_labels=labels_all,
             base_labels=BASE_LABELS,
-            title=f"[{method_name.upper()}] SOM Final Evaluation (Base labels)",
-            cluster_names=node_names
+            title=f"[{method_name.UPPER()}] SOM Final Evaluation (Base labels)"
         )
-        # JSON保存はやめ、result.logに明示
         if metrics is not None:
             log.write('\n[Final Metrics]\n')
             metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
@@ -663,27 +673,26 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                 if k in metrics:
                     log.write(f'  {k} = {metrics[k]:.6f}\n')
 
-        # 追加: メソッド専用ログにも「代表ノード群ベースの再現率（基本/複合）」を出力
-        _summarize_som_per_label_recalls_to_method_log(
-            log=log,
-            winners_xy=winners_all,
-            labels_all=labels_all,
-            base_labels=BASE_LABELS,
-            som_shape=(SOM_X, SOM_Y),
-            header="各ラベルの再現率（代表ノード群ベース）"
-        )
-
         # ラベル分布ヒートマップ（基本ラベルのみ）
         dist_dir_all = os.path.join(out_dir, f'{method_name}_label_dist_all')
         plot_label_distributions_base(winners_all, labels_all, BASE_LABELS, (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
         log.write(f'Label-distribution heatmaps (base only) -> {dist_dir_all}\n')
 
-        # 各ノードの詳しい考察（構成・月分布など）を result.log に
+        # ノード詳細（構成・月分布など）を results.log に
         analyze_nodes_detail_to_log(
             clusters_all, labels_all, times_all, BASE_LABELS, (SOM_X, SOM_Y),
             log, title=f'[{method_name.UPPER()}] SOM Node-wise Analysis'
         )
 
+        # 追加: 代表ノード群ベースの再現率（基本/複合）と、各ラベルの代表ノード一覧を results.log に出力
+        log_som_recall_by_label_with_nodes(
+            log=log,
+            winners_xy=winners_all,
+            labels_all=labels_all,
+            base_labels=BASE_LABELS,
+            som_shape=(SOM_X, SOM_Y),
+            section_title='SOM代表ノード群ベースの再現率（基本/複合）'
+        )
     else:
         log.write('Labels not found; skip evaluation.\n')
 
@@ -724,9 +733,11 @@ def plot_two_stage_label_distributions_on_som(node_to_medoid_idx: Dict[Tuple[int
     os.makedirs(save_dir, exist_ok=True)
     node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
 
+    # ノードに割り当てられたクラスタID群を構成
+    node_to_clusters: Dict[Tuple[int,int], List[int]] = defaultdict(list)
+
     # node→cluster の対応を zip で構築
     node_keys = list(node_to_medoid_idx.keys())  # bmu_xy の順に構築されている想定
-    node_to_clusters: Dict[Tuple[int,int], List[int]] = defaultdict(list)
     for (x, y), cid0 in zip(node_keys, cluster_ids_in_order):
         node_to_clusters[(x, y)].append(cid0)
 
@@ -1094,77 +1105,6 @@ def main():
             logging.info(f"  Cluster_{cid0+1}: BMU=({ix},{iy}) 代表={rep_lbl}")
 
     logging.info("--- SOM配置詳細ログ 終了 ---\n")
-
-    # 追加: ノード代表ラベルに基づく各ラベル再現率（基本/複合）を表示（全サンプル集約）
-    # node -> sample indices
-    node_to_samples: Dict[Tuple[int,int], List[int]] = defaultdict(list)
-    for cid0, node in cid_to_node.items():
-        for j in clusters[cid0]:
-            node_to_samples[node].append(j)
-
-    # 各ノードの基本ラベル分布と代表ラベル
-    node_label_counts: Dict[Tuple[int,int], Counter] = {}
-    node_rep_label: Dict[Tuple[int,int], Optional[str]] = {}
-    for node, sidx in node_to_samples.items():
-        cnt = Counter()
-        for j in sidx:
-            bl = basic_label_or_none(labels[j], BASE_LABELS)
-            if bl is not None:
-                cnt[bl] += 1
-        node_label_counts[node] = cnt
-        node_rep_label[node] = cnt.most_common(1)[0][0] if cnt else None
-
-    # 総数（基本）
-    totals_basic = Counter()
-    for raw in labels:
-        bl = basic_label_or_none(raw, BASE_LABELS)
-        if bl is not None:
-            totals_basic[bl] += 1
-
-    # 正解（代表ノード群に入った分）
-    correct_basic = Counter()
-    rep_nodes_list: Dict[str, List[str]] = {bl: [] for bl in BASE_LABELS}
-    for node, rep in node_rep_label.items():
-        if rep is None:
-            continue
-        correct_basic[rep] += node_label_counts[node].get(rep, 0)
-        rep_nodes_list[rep].append(_node_name(node[0], node[1]))
-
-    logging.info("\n【各ラベルの再現率（代表ノード群ベース, Medoid SOM）】")
-    for bl in BASE_LABELS:
-        N = int(totals_basic.get(bl, 0))
-        correct = int(correct_basic.get(bl, 0))
-        recall = (correct / N) if N > 0 else 0.0
-        reps = rep_nodes_list.get(bl, [])
-        reps_str = str(reps) if len(reps) > 0 else 'なし'
-        logging.info(f" - {bl:<3}: N={N:4d} Correct={correct:4d} Recall={recall:.4f} 代表={reps_str}")
-
-    # 複合（基本+応用）
-    # サンプル毎の予測 = そのサンプルが属するクラスタのBMUノードの代表ラベル
-    sample_pred: List[Optional[str]] = [None] * len(labels)
-    for cid0, node in cid_to_node.items():
-        pred = node_rep_label.get(node, None)
-        for j in clusters[cid0]:
-            sample_pred[j] = pred
-
-    totals_comp = Counter()
-    correct_comp = Counter()
-    for j, raw in enumerate(labels):
-        comps = extract_base_components(raw, BASE_LABELS)
-        for c in comps:
-            totals_comp[c] += 1
-        pred = sample_pred[j]
-        if pred is None:
-            continue
-        if pred in comps:
-            correct_comp[pred] += 1
-
-    logging.info("\n【複合ラベル考慮の再現率（基本+応用, Medoid SOM）】")
-    for bl in BASE_LABELS:
-        N = int(totals_comp.get(bl, 0))
-        correct = int(correct_comp.get(bl, 0))
-        recall = (correct / N) if N > 0 else 0.0
-        logging.info(f" - {bl:<3}: N={N:4d} Correct={correct:4d} Recall={recall:.4f}")
 
     # コードブック図（学習重みではなく『割当メドイドの実データ』を描画）
     def _plot_codebook_from_assigned_medoids(save_path: str, annotated: bool):
