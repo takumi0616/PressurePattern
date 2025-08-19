@@ -664,7 +664,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
             clusters=clusters_all,
             all_labels=labels_all,
             base_labels=BASE_LABELS,
-            title=f"[{method_name.UPPER()}] SOM Final Evaluation (Base labels)"
+            title=f"[{method_name.upper()}] SOM Final Evaluation (Base labels)"
         )
         if metrics is not None:
             log.write('\n[Final Metrics]\n')
@@ -681,7 +681,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         # ノード詳細（構成・月分布など）を results.log に
         analyze_nodes_detail_to_log(
             clusters_all, labels_all, times_all, BASE_LABELS, (SOM_X, SOM_Y),
-            log, title=f'[{method_name.UPPER()}] SOM Node-wise Analysis'
+            log, title=f'[{method_name.upper()}] SOM Node-wise Analysis'
         )
 
         # 追加: 代表ノード群ベースの再現率（基本/複合）と、各ラベルの代表ノード一覧を results.log に出力
