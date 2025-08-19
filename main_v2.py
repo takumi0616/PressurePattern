@@ -66,11 +66,11 @@ S1_HIST_COL_CHUNK = 1024
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 
 # メドイドSOM学習のイテレーション上限
-SOM_MAX_ITERS_CAP = 100000
+SOM_MAX_ITERS_CAP = 10000
 
 # ============== 3種類のbatchSOM（全期間版）設定（3type_som側） ==============
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 100000
+NUM_ITER = 10000
 BATCH_SIZE = 512
 NODES_CHUNK = 16
 LOG_INTERVAL = 10
@@ -270,7 +270,7 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
     nrows, ncols = som_shape[1], som_shape[0]
     figsize=(ncols*2.6, nrows*2.6)
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize,
-                                 subplot_kw={'projection': ccrs.PlateCarree()})
+                                   subplot_kw={'projection': ccrs.PlateCarree()})
     axes = np.atleast_2d(axes)
     axes = axes.T[::-1,:]
 
@@ -340,8 +340,8 @@ def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_di
 
 
 def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
-                                    base_labels: List[str], som_shape: Tuple[int,int],
-                                    save_dir: str, title_prefix: str):
+                                  base_labels: List[str], som_shape: Tuple[int,int],
+                                  save_dir: str, title_prefix: str):
     """
     基本ラベルのみの分布ヒートマップ（評価と整合）
     """
@@ -441,7 +441,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         sigma=2.5, learning_rate=0.5,
         neighborhood_function='gaussian',
         topology='rectangular',
-        activation_distance=activation_distance,               # 'euclidean'/'ssim'/'s1'
+        activation_distance=activation_distance,                # 'euclidean'/'ssim'/'s1'
         random_seed=SEED,
         sigma_decay='asymptotic_decay',
         s1_field_shape=field_shape,
@@ -454,7 +454,8 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     # ====== 学習を区切って実施し、各区切りで評価（履歴プロット用） ======
     step = max(1, NUM_ITER // SOM_EVAL_SEGMENTS)
     iter_history: Dict[str, List[float]] = {
-        'iteration': [], 'MacroRecall_majority': [], 'MicroAccuracy_majority': [],
+        'iteration': [], 'MacroRecall_majority': [], 'MacroRecall_composite': [],
+        'MicroAccuracy_majority': [],
         'ARI_majority': [], 'NMI_majority': [], 'QuantizationError': []
     }
 
@@ -486,7 +487,8 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         # ログ（result.log）に集約指標を追記
         log.write(f'\n[Iteration {current_iter}] QuantizationError={qe_now:.6f}\n')
         if metrics is not None:
-            for k in ['MacroRecall_majority', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']:
+            metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
+            for k in metric_keys:
                 if k in metrics:
                     log.write(f'  {k} = {metrics[k]:.6f}\n')
 
@@ -494,13 +496,13 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         iter_history['iteration'].append(current_iter)
         iter_history['QuantizationError'].append(qe_now)
         if metrics is not None:
-            iter_history['MacroRecall_majority'].append(metrics.get('MacroRecall_majority', np.nan))
-            iter_history['MicroAccuracy_majority'].append(metrics.get('MicroAccuracy_majority', np.nan))
-            iter_history['ARI_majority'].append(metrics.get('ARI_majority', np.nan))
-            iter_history['NMI_majority'].append(metrics.get('NMI_majority', np.nan))
+            metric_keys_for_history = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
+            for k in metric_keys_for_history:
+                iter_history[k].append(metrics.get(k, np.nan))
         else:
-            for k in ['MacroRecall_majority', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']:
+            for k in ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']:
                 iter_history[k].append(np.nan)
+
 
     # イテレーション履歴の保存（CSV/PNG）
     iter_csv = os.path.join(out_dir, f'{method_name}_iteration_metrics.csv')
@@ -556,7 +558,8 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         # JSON保存はやめ、result.logに明示
         if metrics is not None:
             log.write('\n[Final Metrics]\n')
-            for k in ['MacroRecall_majority', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']:
+            metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
+            for k in metric_keys:
                 if k in metrics:
                     log.write(f'  {k} = {metrics[k]:.6f}\n')
 
@@ -729,6 +732,7 @@ def main():
         'iteration': [],
         'num_clusters': [],
         'MacroRecall_majority': [],
+        'MacroRecall_composite': [],
         'MedoidMajorityMatchRate': []
     }
 
@@ -744,6 +748,7 @@ def main():
             history_only_base['iteration'].append(iter_idx)
             history_only_base['num_clusters'].append(len(clusters))
             history_only_base['MacroRecall_majority'].append(m.get('MacroRecall_majority', np.nan))
+            history_only_base['MacroRecall_composite'].append(m.get('MacroRecall_composite', np.nan))
             history_only_base['MedoidMajorityMatchRate'].append(m.get('MedoidMajorityMatchRate', np.nan))
 
     logging.info("二段階クラスタリング開始...")
@@ -912,7 +917,7 @@ def main():
         x = int(x); y = int(y)
         cid0 = cluster_ids_in_order[k]
         cid = cid0 + 1
-        mi = medoid_indices[k]           # 元データインデックス
+        mi = medoid_indices[k]        # 元データインデックス
         date_str = pd.to_datetime(str(ts[mi])).strftime('%Y-%m-%d')
         raw_lbl = labels[mi] if labels else None
         base_lbl = primary_base_label(raw_lbl, BASE_LABELS)

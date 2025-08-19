@@ -62,12 +62,12 @@ def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
     # 分子: |∇W − ∇X| の和（x方向 + y方向）
     num_dx = torch.abs(dYdx - dXdx).sum(dim=(-2, -1))  # (B, N)
     num_dy = torch.abs(dYdy - dXdy).sum(dim=(-2, -1))  # (B, N)
-    numerator = num_dx + num_dy                       # (B, N)
+    numerator = num_dx + num_dy                      # (B, N)
 
     # 分母: max(|∇W|, |∇X|) の和（x方向 + y方向）
     den_dx = torch.maximum(torch.abs(dYdx), torch.abs(dXdx)).sum(dim=(-2, -1))  # (B, N)
     den_dy = torch.maximum(torch.abs(dYdy), torch.abs(dXdy)).sum(dim=(-2, -1))  # (B, N)
-    denominator = den_dx + den_dy                                               # (B, N)
+    denominator = den_dx + den_dy                                              # (B, N)
 
     s1_score = 100.0 * (numerator / (denominator + epsilon))
     return s1_score
@@ -184,8 +184,8 @@ def analyze_cluster_distribution(clusters: List[List[int]],
 
 
 def build_confusion_matrix_only_base(clusters: List[List[int]],
-                                       all_labels: List[Optional[str]],
-                                       base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+                                     all_labels: List[Optional[str]],
+                                     base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     num_clusters = len(clusters)
     cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
     cm = pd.DataFrame(0, index=base_labels, columns=cluster_names, dtype=int)
@@ -209,10 +209,10 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     """
     - 各クラスタの代表（多数決）ラベルを base_labels のみで決定（複数クラスタが同一ラベルも可）
     - マクロ平均再現率を「各基本ラベル l に対して、代表ラベルが l であるクラスタ群に入った l の件数 / l 全体の件数」の平均で算出
+    - [追加] 複合ラベル考慮のマクロ平均再現率：複合ラベルを展開して各成分をカウント
     - マイクロ精度は「各クラスタの多数派件数の総和 / 基本ラベル総件数」
     - ARI/NMI は、基本ラベルを持ち、かつクラスタの代表ラベルが None でないサンプルのみで算出
     - 代表ラベルとメドイドの真ラベルの一致状況もログ出力（medoids 指定時）
-      注: メドイド真ラベルは raw（複合含む）を表示し、判定用には primary_base_label（主要成分）を用いる
     """
     logger.info(f"\n--- {title} ---")
     if not all_labels:
@@ -274,6 +274,9 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         medoid_match_rate = (matches / valid) if valid > 0 else np.nan
         logger.info(f"メドイド-代表ラベル一致率: {medoid_match_rate:.4f}")
 
+    # ==========================================================
+    # 評価1: Macro Recall (基本ラベル)
+    # ==========================================================
     logger.info("\n【各ラベルの再現率（代表クラスタ群ベース）】")
     per_label = {}
     for lbl in present_labels:
@@ -283,12 +286,10 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         recall = correct / row_sum if row_sum > 0 else 0.0
         per_label[lbl] = {'N': row_sum, 'Correct': correct, 'Recall': recall}
         logger.info(f" - {lbl:<3}: N={row_sum:4d} Correct={correct:4d} Recall={recall:.4f} 代表={cols_for_lbl if cols_for_lbl else 'なし'}")
-
     macro_recall = float(np.mean([per_label[l]['Recall'] for l in present_labels]))
+    
+    # Micro Accuracy (基本ラベル)
     micro_accuracy = micro_correct_sum / total_count if total_count > 0 else 0.0
-    logger.info("\n【集計】")
-    logger.info(f"Macro Recall (基本ラベル) = {macro_recall:.4f}")
-    logger.info(f"Micro Accuracy (基本ラベル) = {micro_accuracy:.4f}")
 
     # ARI/NMI 計算（基本ラベルを持ち、かつクラスタ代表ラベルが有効なサンプルのみ）
     n_samples = len(all_labels)
@@ -310,7 +311,7 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
             continue  # Unassignedは評価から除外
         y_true.append(lbl)
         y_pred.append(rep)
-
+    
     metrics: Dict[str, float] = {
         'MacroRecall_majority': macro_recall,
         'MicroAccuracy_majority': micro_accuracy,
@@ -325,8 +326,62 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         nmi = normalized_mutual_info_score(y_true_idx, y_pred_idx)
         metrics['ARI_majority'] = float(ari)
         metrics['NMI_majority'] = float(nmi)
-        logger.info(f"Adjusted Rand Index (基本ラベル) = {ari:.4f}")
-        logger.info(f"Normalized Mutual Info (基本ラベル) = {nmi:.4f}")
+    
+    # ==========================================================
+    # 追加評価: 複合ラベル考慮のマクロ平均再現率 (基本+応用)
+    # ==========================================================
+    logger.info("\n【複合ラベル考慮の再現率（基本+応用）】")
+    # 1. 複合ラベルを展開して、各基本ラベルの真の総数を計算
+    composite_totals = Counter()
+    for j, raw_label in enumerate(all_labels):
+        components = extract_base_components(raw_label, base_labels)
+        for comp in components:
+            composite_totals[comp] += 1
+    present_labels_composite = sorted([l for l in base_labels if composite_totals[l] > 0])
+    
+    macro_recall_composite = np.nan
+    if not present_labels_composite:
+        logger.warning("複合ラベル考慮での評価対象ラベルがありません。")
+    else:
+        # 2. 各基本ラベルについて、正しく分類された数を計算
+        #    正分類 = 予測ラベル(クラスタの多数派)が、真ラベルの成分のいずれかと一致
+        composite_correct_recall = Counter()
+        for j, raw_label in enumerate(all_labels):
+            components = extract_base_components(raw_label, base_labels)
+            if not components:
+                continue
+            ci = sample_to_cluster[j]
+            if ci < 0: continue
+            pred_label = cluster_majority.get(ci)
+            if pred_label is None: continue
+            # 予測ラベルが、そのサンプルの持つ真の基本成分のいずれかに含まれていれば、
+            # その成分ラベルにとって「正しく分類された」とカウント
+            if pred_label in components:
+                composite_correct_recall[pred_label] += 1
+
+        # 3. ラベル毎の再現率とマクロ平均を計算
+        recalls_composite = []
+        for lbl in present_labels_composite:
+            total = composite_totals[lbl]
+            correct = composite_correct_recall[lbl]
+            recall = correct / total if total > 0 else 0.0
+            recalls_composite.append(recall)
+            logger.info(f" - {lbl:<3}: N={total:4d} Correct={correct:4d} Recall={recall:.4f}")
+        if recalls_composite:
+            macro_recall_composite = float(np.mean(recalls_composite))
+    metrics['MacroRecall_composite'] = macro_recall_composite
+
+    # ==========================================================
+    # 最終集計ログ
+    # ==========================================================
+    logger.info("\n【集計】")
+    logger.info(f"Macro Recall (基本ラベル) = {macro_recall:.4f}")
+    logger.info(f"Macro Recall (基本+応用) = {macro_recall_composite:.4f}")
+    logger.info(f"Micro Accuracy (基本ラベル) = {micro_accuracy:.4f}")
+    if 'ARI_majority' in metrics:
+        logger.info(f"Adjusted Rand Index (基本ラベル) = {metrics['ARI_majority']:.4f}")
+    if 'NMI_majority' in metrics:
+        logger.info(f"Normalized Mutual Info (基本ラベル) = {metrics['NMI_majority']:.4f}")
     else:
         logger.info("評価対象サンプルが少ないため ARI/NMI を計算しません。")
 
@@ -399,7 +454,7 @@ def two_stage_clustering(X: torch.Tensor,
     """
     2段階クラスタリング
       1) HAC: 相互最近傍(MNN) & S1 < th_merge を満たすペアをマージ
-         -> 距離行列を持たず、行×列チャンクで各行の最小相手のみ追跡（メモリ節約）
+        -> 距離行列を持たず、行×列チャンクで各行の最小相手のみ追跡（メモリ節約）
       2) k-medoids: メドイド中心の再割当てでクラスタを再構成（割当も列チャンクでBMU探索）
 
     戻り値: (clusters, medoids)
@@ -417,7 +472,7 @@ def two_stage_clustering(X: torch.Tensor,
         logger.info("ステップ1: HAC - MNNマージ開始（列チャンクで近傍探索）...")
         # 有効メドイドのみ抽出
         index_map = [i for i, m in enumerate(medoids) if m is not None]  # cluster index -> medoid row index in following array
-        medoid_ids = [m for m in medoids if m is not None]               # 元データindex
+        medoid_ids = [m for m in medoids if m is not None]        # 元データindex
         C = len(medoid_ids)
         if C == 0:
             logger.info("有効メドイドがありません。終了します。")
@@ -588,12 +643,12 @@ def two_stage_clustering(X: torch.Tensor,
 
 
 def plot_s1_distribution_histogram(X: torch.Tensor,
-                                     d_lat: int,
-                                     d_lon: int,
-                                     save_path: str,
-                                     row_batch_size: int = 4,
-                                     col_chunk_size: int = 64,
-                                     max_samples: Optional[int] = 1200) -> None:
+                                   d_lat: int,
+                                   d_lon: int,
+                                   save_path: str,
+                                   row_batch_size: int = 4,
+                                   col_chunk_size: int = 64,
+                                   max_samples: Optional[int] = 1200) -> None:
     """
     S1スコアの分布を可視化。上三角のみ、行×列チャンクで収集（メモリ節約）
     """
