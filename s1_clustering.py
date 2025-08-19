@@ -26,10 +26,10 @@ TIE_EPS = 1e-12
 
 @torch.no_grad()
 def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
-                                y_all: torch.Tensor,
-                                d_lat: int,
-                                d_lon: int,
-                                epsilon: float = EPSILON) -> torch.Tensor:
+                                  y_all: torch.Tensor,
+                                  d_lat: int,
+                                  d_lon: int,
+                                  epsilon: float = EPSILON) -> torch.Tensor:
     """
     Teweles–WobusのS1スコア（小さいほど類似）をバッチで計算する。
 
@@ -62,7 +62,7 @@ def calculate_s1_pairwise_batch(x_batch: torch.Tensor,
     # 分子: |∇W − ∇X| の和（x方向 + y方向）
     num_dx = torch.abs(dYdx - dXdx).sum(dim=(-2, -1))  # (B, N)
     num_dy = torch.abs(dYdy - dXdy).sum(dim=(-2, -1))  # (B, N)
-    numerator = num_dx + num_dy                         # (B, N)
+    numerator = num_dx + num_dy                       # (B, N)
 
     # 分母: max(|∇W|, |∇X|) の和（x方向 + y方向）
     den_dx = torch.maximum(torch.abs(dYdx), torch.abs(dXdx)).sum(dim=(-2, -1))  # (B, N)
@@ -184,8 +184,8 @@ def analyze_cluster_distribution(clusters: List[List[int]],
 
 
 def build_confusion_matrix_only_base(clusters: List[List[int]],
-                                     all_labels: List[Optional[str]],
-                                     base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+                                       all_labels: List[Optional[str]],
+                                       base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     num_clusters = len(clusters)
     cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
     cm = pd.DataFrame(0, index=base_labels, columns=cluster_names, dtype=int)
@@ -393,7 +393,8 @@ def two_stage_clustering(X: torch.Tensor,
                          col_chunk_size: int,
                          d_lat: int,
                          d_lon: int,
-                         eval_callback: Optional[Callable[[int, List[List[int]], List[Optional[int]]], None]] = None
+                         eval_callback: Optional[Callable[[int, List[List[int]], List[Optional[int]]], None]] = None,
+                         stop_merge_num: Optional[int] = None
                          ) -> Tuple[List[List[int]], List[Optional[int]]]:
     """
     2段階クラスタリング
@@ -503,6 +504,23 @@ def two_stage_clustering(X: torch.Tensor,
         clusters = new_clusters
         logger.info(f"マージ後クラスタ数: {len(clusters)}")
 
+        # 理想のクラスタ数に達したら停止
+        if stop_merge_num is not None and len(clusters) <= stop_merge_num:
+            logger.info(f"クラスタ数が目標の {stop_merge_num} 以下になったため、HACマージを停止します。")
+            # k-medoidsの再構成はせず、この時点のクラスタで最終メドイドを計算して終了する
+            logger.info("最終メドイドを計算しています...")
+            medoids = []
+            for c in tqdm(clusters, desc="最終メドイド計算", leave=False):
+                m = find_medoid_torch(c, X, row_batch_size, col_chunk_size, d_lat, d_lon)
+                medoids.append(m)
+
+            if eval_callback is not None:
+                try:
+                    eval_callback(iteration, clusters, medoids)
+                except Exception as e:
+                    logger.warning(f"評価コールバックで例外: {e}")
+            break  # whileループを抜ける
+
         # 一時メドイド（クラスごとに安全に算出）
         temp_medoids: List[Optional[int]] = []
         for c in tqdm(clusters, desc="HAC: 一時メドイド", leave=False):
@@ -570,12 +588,12 @@ def two_stage_clustering(X: torch.Tensor,
 
 
 def plot_s1_distribution_histogram(X: torch.Tensor,
-                                   d_lat: int,
-                                   d_lon: int,
-                                   save_path: str,
-                                   row_batch_size: int = 4,
-                                   col_chunk_size: int = 64,
-                                   max_samples: Optional[int] = 1200) -> None:
+                                     d_lat: int,
+                                     d_lon: int,
+                                     save_path: str,
+                                     row_batch_size: int = 4,
+                                     col_chunk_size: int = 64,
+                                     max_samples: Optional[int] = 1200) -> None:
     """
     S1スコアの分布を可視化。上三角のみ、行×列チャンクで収集（メモリ節約）
     """
@@ -702,8 +720,8 @@ def plot_final_clusters_medoids(medoids: List[Optional[int]],
         medoid_pattern_2d = spatial_anomaly_data[medoids[i]].reshape(len(lat_coords), len(lon_coords))
         cont = ax.contourf(lon_coords, lat_coords, medoid_pattern_2d, levels=levels, cmap=cmap, extend="both", norm=norm, transform=ccrs.PlateCarree())
         last_cont = cont
-        ax.contour(lon_coords, lat_coords, medoid_pattern_2d, colors="k", linewidth=0.5, levels=levels, transform=ccrs.PlateCarree())
-        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.5)
+        ax.contour(lon_coords, lat_coords, medoid_pattern_2d, colors="k", linewidths=0.3, levels=levels, transform=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.8)
         ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
 
         cluster_indices = clusters[i]
@@ -780,8 +798,8 @@ def save_daily_maps_per_cluster(clusters: List[List[int]],
             ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
             pressure_map = spatial_anomaly_data[data_idx].reshape(len(lat), len(lon))
             cont = ax.contourf(lon, lat, pressure_map, levels=levels, cmap=cmap, norm=norm, extend='both', transform=ccrs.PlateCarree())
-            ax.contour(lon, lat, pressure_map, levels=line_levels, colors='k', linewidths=0.5, transform=ccrs.PlateCarree())
-            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.5)
+            ax.contour(lon, lat, pressure_map, levels=line_levels, colors='k', linewidths=0.3, transform=ccrs.PlateCarree())
+            ax.add_feature(cfeature.COASTLINE.with_scale("50m"), edgecolor="black", linewidth=0.8)
             ax.set_extent([120, 150, 20, 50], crs=ccrs.PlateCarree())
             cbar = fig.colorbar(cont, ax=ax, orientation='vertical', pad=0.05, aspect=20)
             cbar.set_label('Sea Level Pressure Anomaly (hPa)')
