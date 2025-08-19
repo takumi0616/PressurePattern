@@ -46,9 +46,9 @@ from s1_minisom import MiniSom as S1MiniSom, grid_auto_size
 
 
 # ============== ユーザ調整パラメータ（クラスタリング側） ==============
-SEED = 42               # 乱数シード（再現性）
-TH_MERGE = 81           # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
-STOP_MERGE_NUM: Optional[int] = 35 # このクラスタ数になったらマージを停止 (Noneで無効)
+SEED = 1               # 乱数シード（再現性）
+TH_MERGE = 78.5           # HACのマージ停止しきい値（S1スコア, 小さいほど類似）
+STOP_MERGE_NUM: Optional[int] = 100 # このクラスタ数になったらマージを停止 (Noneで無効)
 
 # 2段階クラスタリング用 行×列チャンク
 CLUS_ROW_BATCH = 16
@@ -66,11 +66,11 @@ S1_HIST_COL_CHUNK = 1024
 DAILY_MAPS_PER_CLUSTER_LIMIT: Optional[int] = None
 
 # メドイドSOM学習のイテレーション上限
-SOM_MAX_ITERS_CAP = 500
+SOM_MAX_ITERS_CAP = 100000
 
 # ============== 3種類のbatchSOM（全期間版）設定（3type_som側） ==============
-SOM_X, SOM_Y = 6, 6
-NUM_ITER = 500
+SOM_X, SOM_Y = 10, 10
+NUM_ITER = 100000
 BATCH_SIZE = 512
 NODES_CHUNK = 16
 LOG_INTERVAL = 10
