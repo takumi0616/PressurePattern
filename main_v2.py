@@ -639,7 +639,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     plot_som_node_average_patterns(
         data_all, winners_all, lat, lon, (SOM_X,SOM_Y),
         save_path=bigmap_all,
-        title=f'{method_name.UPPER()} SOM Node Avg SLP Anomaly (All)'
+        title=f'{method_name.upper()} SOM Node Avg SLP Anomaly (All)'
     )
     log.write(f'Node average patterns (all) -> {bigmap_all}\n')
 
