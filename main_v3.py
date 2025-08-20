@@ -32,12 +32,12 @@ SEED = 1
 
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 10000
-BATCH_SIZE = 512
+NUM_ITER = 1000
+BATCH_SIZE = 1024 # VRAM16GB:512, VRAM24GB:1024
 NODES_CHUNK = 16
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 2048
-SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価
+SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価（100区切り）
 
 # データ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -100,6 +100,36 @@ def setup_logging_v3():
         handlers=[logging.FileHandler(log_path), logging.StreamHandler()]
     )
     logging.info("ログ初期化完了（run_v3.log）。")
+
+
+# =====================================================
+# 共通ユーティリティ
+# =====================================================
+def format_date_yyyymmdd(ts_val) -> str:
+    """
+    ndarrayのdatetime64や文字列混在に対しても YYYY/MM/DD に整形。
+    失敗時は str(ts_val) を返す。
+    """
+    if ts_val is None:
+        return ''
+    try:
+        ts = pd.to_datetime(ts_val)
+        if pd.isna(ts):
+            return ''
+        return ts.strftime('%Y/%m/%d')
+    except Exception:
+        try:
+            s = str(ts_val)
+            # 1991-01-24T00:00:00.000000000 → 1991/01/24
+            if 'T' in s:
+                s = s.split('T')[0]
+            s = s.replace('-', '/')
+            # 長さチェック (YYYY/MM/DD の 10 桁に切る)
+            if len(s) >= 10:
+                return s[:10]
+            return s
+        except Exception:
+            return str(ts_val)
 
 
 # =====================================================
@@ -252,7 +282,6 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
                                 all_labels: List[Optional[str]],
                                 base_labels: List[str],
                                 title: str = "評価（基本ラベルのみ）") -> Optional[Dict[str, float]]:
-    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
     logging.info(f"\n--- {title} ---")
     if not all_labels:
         logging.warning("ラベル無しのため評価をスキップします。")
@@ -269,8 +298,6 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     # 各クラスタの多数決（代表ラベル）
     cluster_majority: Dict[int, Optional[str]] = {}
     logging.info("\n【各クラスタの多数決（代表ラベル）】")
-    total_count = int(cm.values.sum())
-    micro_correct_sum = 0
     for k in range(len(cluster_names)):
         col = cluster_names[k]
         col_counts = cm[col]
@@ -281,7 +308,6 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
             continue
         top_label = col_counts.idxmax()
         top_count = int(col_counts.max())
-        micro_correct_sum += top_count
         share = top_count / col_sum if col_sum > 0 else 0.0
         top3 = col_counts.sort_values(ascending=False)[:3]
         top3_str = ", ".join([f"{lbl}:{int(cnt)}" for lbl, cnt in top3.items()])
@@ -299,44 +325,6 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         per_label[lbl] = {'N': row_sum, 'Correct': correct, 'Recall': recall}
         logging.info(f" - {lbl:<3}: N={row_sum:4d} Correct={correct:4d} Recall={recall:.4f} 代表={cols_for_lbl if cols_for_lbl else 'なし'}")
     macro_recall = float(np.mean([per_label[l]['Recall'] for l in present_labels]))
-    
-    # Micro Accuracy
-    micro_accuracy = micro_correct_sum / total_count if total_count > 0 else 0.0
-
-    # ARI/NMI
-    n_samples = len(all_labels)
-    sample_to_cluster = [-1] * n_samples
-    for ci, idxs in enumerate(clusters):
-        for j in idxs:
-            sample_to_cluster[j] = ci
-
-    y_true, y_pred = [], []
-    for j in range(n_samples):
-        lbl = basic_label_or_none(all_labels[j], base_labels)
-        if lbl is None:
-            continue
-        ci = sample_to_cluster[j]
-        if ci < 0:
-            continue
-        rep = cluster_majority.get(ci, None)
-        if rep is None:
-            continue
-        y_true.append(lbl)
-        y_pred.append(rep)
-
-    metrics: Dict[str, float] = {
-        'MacroRecall_majority': macro_recall,
-        'MicroAccuracy_majority': micro_accuracy
-    }
-    if len(y_true) > 1:
-        uniq_true = {l: i for i, l in enumerate(sorted(set(y_true)))}
-        uniq_pred = {l: i for i, l in enumerate(sorted(set(y_pred)))}
-        y_true_idx = [uniq_true[l] for l in y_true]
-        y_pred_idx = [uniq_pred[l] for l in y_pred]
-        ari = adjusted_rand_score(y_true_idx, y_pred_idx)
-        nmi = normalized_mutual_info_score(y_true_idx, y_pred_idx)
-        metrics['ARI_majority'] = float(ari)
-        metrics['NMI_majority'] = float(nmi)
 
     # 複合ラベル考慮（基本+応用）
     logging.info("\n【複合ラベル考慮の再現率（基本+応用）】")
@@ -350,14 +338,24 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
     macro_recall_composite = np.nan
     if present_labels_composite:
         composite_correct_recall = Counter()
+        # 各サンプルの予測＝割当クラスタの代表（基本ラベル）
+        # 代表が複合ラベルの構成に含まれていれば正解
+        n_samples = sum(len(idxs) for idxs in clusters)
+        sample_to_cluster = {}
+        for ci, idxs in enumerate(clusters):
+            for j in idxs:
+                sample_to_cluster[j] = ci
+
         for j, raw_label in enumerate(all_labels):
             comps = extract_base_components(raw_label, base_labels)
             if not comps:
                 continue
-            ci = sample_to_cluster[j]
-            if ci < 0: continue
+            ci = sample_to_cluster.get(j, -1)
+            if ci < 0:
+                continue
             pred = cluster_majority.get(ci)
-            if pred is None: continue
+            if pred is None:
+                continue
             if pred in comps:
                 composite_correct_recall[pred] += 1
 
@@ -371,18 +369,16 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
         if recalls_composite:
             macro_recall_composite = float(np.mean(recalls_composite))
     else:
-        logging.warning("複合ラベル考慮での評価対象ラベルがありません。")
+        logging.warning("複合ラベル考慮での評価対象ラベルがありません.")
 
-    metrics['MacroRecall_composite'] = macro_recall_composite
+    metrics: Dict[str, float] = {
+        'MacroRecall_majority': macro_recall,
+        'MacroRecall_composite': macro_recall_composite
+    }
 
     logging.info("\n【集計】")
     logging.info(f"Macro Recall (基本ラベル) = {macro_recall:.4f}")
     logging.info(f"Macro Recall (基本+応用) = {macro_recall_composite:.4f}")
-    logging.info(f"Micro Accuracy (基本ラベル) = {micro_accuracy:.4f}")
-    if 'ARI_majority' in metrics:
-        logging.info(f"Adjusted Rand Index (基本ラベル) = {metrics['ARI_majority']:.4f}")
-    if 'NMI_majority' in metrics:
-        logging.info(f"Normalized Mutual Info (基本ラベル) = {metrics['NMI_majority']:.4f}")
     logging.info(f"--- {title} 終了 ---\n")
     return metrics
 
@@ -462,7 +458,7 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
     nrows, ncols = som_shape[1], som_shape[0]
     figsize=(ncols*2.6, nrows*2.6)
     fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize,
-                                   subplot_kw={'projection': ccrs.PlateCarree()})
+                               subplot_kw={'projection': ccrs.PlateCarree()})
     axes = np.atleast_2d(axes)
     axes = axes.T[::-1,:]
 
@@ -568,7 +564,7 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
                                 log: Logger,
                                 title: str):
     """
-    ノードごとの詳細（基本ラベル構成・月別分布・純度など）を results.log に追記。
+    ノードごとの詳細（基本ラベル構成・月別分布・純度・代表ラベル[raw]）を results.log に追記。
     """
     log.write(f'\n--- {title} ---\n')
     for k, idxs in enumerate(clusters):
@@ -577,6 +573,12 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
         if n == 0:
             continue
         log.write(f'\n[Node ({ix},{iy})] N={n}\n')
+        # 代表ラベル（元ラベル：複合を含む）
+        cnt_raw = Counter([labels[j] for j in idxs if labels[j] is not None])
+        if len(cnt_raw) > 0:
+            top_raw, top_count_raw = cnt_raw.most_common(1)[0]
+            log.write(f'  - 代表ラベル（元ラベル）: {top_raw}  ({top_count_raw}/{n}, {top_count_raw/n*100:5.1f}%)\n')
+
         # 基本ラベル構成
         cnt = Counter()
         for j in idxs:
@@ -588,7 +590,8 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
             for lbl, c in sorted(cnt.items(), key=lambda x: x[1], reverse=True):
                 log.write(f'    {lbl:<3}: {c:4d} ({c/n*100:5.1f}%)\n')
             purity = max(cnt.values()) / n
-            log.write(f'  - ノード純度: {purity:.3f}\n')
+            log.write(f'  - ノード純度（基本ラベル多数決）: {purity:.3f}\n')
+
         # 月別分布
         if timestamps is not None and n > 0:
             months = pd.to_datetime(timestamps[idxs]).month
@@ -790,11 +793,13 @@ def plot_som_node_medoid_patterns(
     node_to_medoid_idx: Dict[Tuple[int,int], int],
     lat: np.ndarray, lon: np.ndarray,
     som_shape: Tuple[int,int],
+    times_all: Optional[np.ndarray],
     save_path: str,
     title: str
 ):
     """
-    ノードmedoid（重心に最も近いサンプル）の○×○マップを保存
+    ノードmedoid（重心に最も近いサンプル）のマップを保存
+    各サブプロットのタイトルを (x,y)_YYYY/MM/DD にする。
     """
     H, W = len(lat), len(lon)
 
@@ -824,7 +829,9 @@ def plot_som_node_medoid_patterns(
             ax.contour(lon, lat, pat, levels=levels, colors='k', linewidths=0.3, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
             ax.set_extent([115, 155, 15, 55], ccrs.PlateCarree())
-            ax.set_title(f'({ix},{iy})')
+            # タイトルに日付を追加（YYYY/MM/DD）
+            dstr = format_date_yyyymmdd(times_all[mi]) if times_all is not None and len(times_all)>mi else ''
+            ax.set_title(f'({ix},{iy})_{dstr}')
             ax.set_xticks([]); ax.set_yticks([])
             last_cf = cf
 
@@ -875,6 +882,121 @@ def save_each_node_medoid_image(
             plt.close(fig)
 
 
+def plot_nodewise_match_map(
+    winners_xy: np.ndarray,
+    labels_all: List[str],
+    node_to_medoid_idx: Dict[Tuple[int,int], int],
+    times_all: np.ndarray,
+    som_shape: Tuple[int,int],
+    save_path: str,
+    title: str
+):
+    """
+    各ノードについて、
+      - ノード内の最頻出ラベル（元ラベル、複合含む）= majority
+      - medoid の元ラベル
+    が一致すれば「薄い緑」でノード四角を塗り、不一致なら「薄い赤」にする。
+    N, majority, medoid, date(YYYY/MM/DD) を少し大きめに表示。
+    """
+    # ノードごとのサンプルリスト
+    clusters = winners_to_clusters(winners_xy, som_shape)
+    node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
+    node_to_count: Dict[Tuple[int,int], int] = {}
+
+    for k, idxs in enumerate(clusters):
+        ix, iy = k // som_shape[1], k % som_shape[1]
+        node_to_count[(ix,iy)] = len(idxs)
+        if len(idxs) == 0:
+            node_to_majority_raw[(ix,iy)] = None
+            continue
+        cnt = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
+        if len(cnt) == 0:
+            node_to_majority_raw[(ix,iy)] = None
+        else:
+            node_to_majority_raw[(ix,iy)] = cnt.most_common(1)[0][0]
+
+    # グリッド図
+    map_x, map_y = som_shape
+    nrows, ncols = map_y, map_x
+    figsize = (ncols*2.6, nrows*2.6)
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
+    axes = np.atleast_2d(axes)
+    axes = axes.T[::-1, :]
+
+    for ix in range(map_x):
+        for iy in range(map_y):
+            ax = axes[ix, iy]
+            ax.set_xticks([]); ax.set_yticks([])
+            maj = node_to_majority_raw.get((ix,iy), None)
+            if (ix,iy) not in node_to_medoid_idx:
+                # データ無し
+                ax.set_facecolor((0.95, 0.95, 0.95, 1.0))  # 薄い灰色
+                ax.text(0.5, 0.5, '-', ha='center', va='center', fontsize=16, color='gray')
+                ax.text(0.02, 0.98, f'({ix},{iy}) N={node_to_count.get((ix,iy),0)}',
+                        transform=ax.transAxes, ha='left', va='top', fontsize=10)
+                continue
+            mi = node_to_medoid_idx[(ix,iy)]
+            med_raw = labels_all[mi] if labels_all is not None else None
+            dstr = format_date_yyyymmdd(times_all[mi]) if times_all is not None and len(times_all)>mi else ''
+            match = (med_raw == maj) if (med_raw is not None and maj is not None) else False
+
+            # 背景色を一致/不一致で塗る（薄い緑/薄い赤）
+            if match:
+                ax.set_facecolor((0.85, 1.00, 0.85, 1.0))  # light green
+            else:
+                ax.set_facecolor((1.00, 0.85, 0.85, 1.0))  # light red
+
+            # ヘッダ
+            ax.text(0.02, 0.98, f'({ix},{iy}) N={node_to_count.get((ix,iy),0)}',
+                    transform=ax.transAxes, ha='left', va='top', fontsize=10, fontweight='bold')
+            # 付記（少し大きめ）
+            ax.text(0.02, 0.78, f'Majority: {maj}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
+            ax.text(0.02, 0.62, f'Medoid  : {med_raw}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
+            ax.text(0.02, 0.46, f'Date    : {dstr}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
+
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout(rect=[0,0,1,0.95])
+    plt.savefig(save_path, dpi=300)
+    plt.close(fig)
+
+
+# =====================================================
+# Nodewise match rate（rawラベルでの一致率）計算ユーティリティ
+# =====================================================
+def compute_nodewise_match_rate(
+    winners_xy: np.ndarray,
+    labels_all: List[Optional[str]],
+    node_to_medoid_idx: Dict[Tuple[int,int], int],
+    som_shape: Tuple[int, int]
+) -> Tuple[float, int, int]:
+    """
+    ノード代表ラベル（raw: 複合含む）と medoid の raw ラベルの一致率。
+    戻り値: (match_rate, matched_nodes, counted_nodes)
+    """
+    clusters = winners_to_clusters(winners_xy, som_shape)
+    node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
+    for k, idxs in enumerate(clusters):
+        ix, iy = k // som_shape[1], k % som_shape[1]
+        if len(idxs) == 0:
+            node_to_majority_raw[(ix,iy)] = None
+        else:
+            cnt_raw = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
+            node_to_majority_raw[(ix,iy)] = cnt_raw.most_common(1)[0][0] if len(cnt_raw)>0 else None
+
+    matched = 0
+    counted = 0
+    for key, mi in node_to_medoid_idx.items():
+        maj = node_to_majority_raw.get(key, None)
+        med_raw = labels_all[mi] if labels_all is not None else None
+        if maj is None or med_raw is None:
+            continue
+        counted += 1
+        if maj == med_raw:
+            matched += 1
+    rate = (matched / counted) if counted > 0 else np.nan
+    return float(rate), matched, counted
+
+
 # =====================================================
 # 3種類のbatchSOM（全期間・1方式分）
 # =====================================================
@@ -916,9 +1038,11 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     # ====== 学習を区切って実施し、各区切りで評価（履歴プロット用） ======
     step = max(1, NUM_ITER // SOM_EVAL_SEGMENTS)
     iter_history: Dict[str, List[float]] = {
-        'iteration': [], 'MacroRecall_majority': [], 'MacroRecall_composite': [],
-        'MicroAccuracy_majority': [],
-        'ARI_majority': [], 'NMI_majority': [], 'QuantizationError': []
+        'iteration': [],
+        'MacroRecall_majority': [],
+        'MacroRecall_composite': [],
+        'QuantizationError': [],
+        'NodewiseMatchRate': []  # 追加：ノード代表（raw）vs medoid（raw）の一致率
     }
 
     current_iter = 0
@@ -945,24 +1069,42 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
             base_labels=BASE_LABELS,
             title=f"[{method_name.upper()}] Iteration={current_iter} Evaluation (Base labels)"
         )
+
+        # 追加: 現時点のmedoidを再計算して、match rate を算出
+        node_to_medoid_idx_now, _ = compute_node_medoids_by_centroid(
+            method_name=method_name,
+            data_flat=data_all, winners_xy=winners_now,
+            som_shape=(SOM_X, SOM_Y), field_shape=field_shape
+        )
+        match_rate_now, matched_nodes_now, counted_nodes_now = compute_nodewise_match_rate(
+            winners_xy=winners_now,
+            labels_all=labels_all,
+            node_to_medoid_idx=node_to_medoid_idx_now,
+            som_shape=(SOM_X, SOM_Y)
+        )
+
         # ログ（results.log）に集約指標を追記
         log.write(f'\n[Iteration {current_iter}] QuantizationError={qe_now:.6f}\n')
         if metrics is not None:
-            metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
-            for k in metric_keys:
+            for k in ['MacroRecall_majority', 'MacroRecall_composite']:
                 if k in metrics:
                     log.write(f'  {k} = {metrics[k]:.6f}\n')
+        # 追加: match rate
+        if not np.isnan(match_rate_now):
+            log.write(f'  NodewiseMatchRate = {match_rate_now:.6f} (matched {matched_nodes_now}/{counted_nodes_now} nodes)\n')
+        else:
+            log.write(f'  NodewiseMatchRate = NaN (no countable nodes)\n')
 
         # 履歴に保存
         iter_history['iteration'].append(current_iter)
         iter_history['QuantizationError'].append(qe_now)
         if metrics is not None:
-            metric_keys_for_history = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
-            for k in metric_keys_for_history:
+            for k in ['MacroRecall_majority', 'MacroRecall_composite']:
                 iter_history[k].append(metrics.get(k, np.nan))
         else:
-            for k in ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']:
+            for k in ['MacroRecall_majority', 'MacroRecall_composite']:
                 iter_history[k].append(np.nan)
+        iter_history['NodewiseMatchRate'].append(match_rate_now if not np.isnan(match_rate_now) else np.nan)
 
     # イテレーション履歴の保存（CSV/PNG）
     iter_csv = os.path.join(out_dir, f'{method_name}_iteration_metrics.csv')
@@ -998,18 +1140,31 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                               out_dir=pernode_dir_all, prefix='all')
     log.write(f'Per-node mean images (all) -> {pernode_dir_all}\n')
 
-    # ===== 新規: ノードmedoid（重心に最も近いサンプル）マップ =====
+    # ===== ノードの多数決（元ラベル：複合含む）を先に作っておく =====
+    clusters_all = winners_to_clusters(winners_all, (SOM_X, SOM_Y))
+    node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
+    for k, idxs in enumerate(clusters_all):
+        ix, iy = k // SOM_Y, k % SOM_Y
+        if len(idxs) == 0:
+            node_to_majority_raw[(ix,iy)] = None
+        else:
+            cnt_raw = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
+            node_to_majority_raw[(ix,iy)] = cnt_raw.most_common(1)[0][0] if len(cnt_raw)>0 else None
+
+    # ===== ノードmedoid（重心に最も近いサンプル） =====
     node_to_medoid_idx, node_to_medoid_dist = compute_node_medoids_by_centroid(
         method_name=method_name,
         data_flat=data_all, winners_xy=winners_all,
         som_shape=(SOM_X, SOM_Y), field_shape=field_shape
     )
-    # ○×○マップ（medoid）
+
+    # ○×可視化（背景色で一致/不一致を表現、日付も表示）
     medoid_bigmap = os.path.join(out_dir, f'{method_name}_som_node_medoid_all.png')
     plot_som_node_medoid_patterns(
         data_flat=data_all,
         node_to_medoid_idx=node_to_medoid_idx,
         lat=lat, lon=lon, som_shape=(SOM_X, SOM_Y),
+        times_all=times_all,
         save_path=medoid_bigmap,
         title=f'{method_name.upper()} SOM Node Medoid (closest-to-centroid)'
     )
@@ -1025,30 +1180,60 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     )
     log.write(f'Per-node medoid images (all) -> {pernode_medoid_dir}\n')
 
-    # medoid選定結果のCSV
+    # medoid選定結果のCSV（labelは基本ラベル or None、rawは元ラベル）
     rows = []
     for (ix, iy), mi in sorted(node_to_medoid_idx.items()):
-        t = str(times_all[mi]) if len(times_all)>0 else ''
+        t_str = format_date_yyyymmdd(times_all[mi]) if len(times_all)>0 else ''
         raw = labels_all[mi] if labels_all is not None else ''
-        base = basic_label_or_none(raw, BASE_LABELS)
+        label_base_or_none = basic_label_or_none(raw, BASE_LABELS)
         dist = node_to_medoid_dist.get((ix,iy), np.nan)
+        majority_raw = node_to_majority_raw.get((ix,iy), None)
+        match = (raw == majority_raw) if (raw is not None and majority_raw is not None) else False
         rows.append({
             'node_x': ix, 'node_y': iy, 'node_flat': ix*SOM_Y+iy,
-            'medoid_index': mi, 'time': t, 'label_raw': raw, 'label_base': base, 'distance': dist
+            'medoid_index': mi, 'time': t_str,
+            'label_raw': raw,           # 元ラベル（複合含む）
+            'label': label_base_or_none,  # 基本ラベル or None（複合なら None）
+            'majority_label': majority_raw,      # 互換性維持：ノードの代表ラベル（元ラベル）
+            'representative_label': majority_raw, # 別名（代表ラベル）も追加
+            'match': match,
+            'distance': dist
         })
     medoid_csv = os.path.join(out_dir, f'{method_name}_node_medoids.csv')
     pd.DataFrame(rows).to_csv(medoid_csv, index=False, encoding='utf-8-sig')
     log.write(f'Node medoid selection CSV -> {medoid_csv}\n')
 
-    # ログに概要（いくつか）
-    log.write('\n[Node medoid summary (first 20)]\n')
-    for r in rows[:20]:
-        log.write(f"({r['node_x']},{r['node_y']}): idx={r['medoid_index']}, time={r['time']}, base={r['label_base']}, dist={r['distance']:.4f}\n")
+    # ログに概要（全ノード表示）: label_raw と 代表ラベルを出力（複合ラベルも可視化）
+    log.write('\n[Node medoid summary]\n')
+    for r in rows:
+        log.write(
+            f"({r['node_x']},{r['node_y']}): idx={r['medoid_index']}, "
+            f"time={r['time']}, label_raw={r['label_raw']}, rep_label={r['representative_label']}, "
+            f"match={r['match']}, dist={r['distance']:.4f}\n"
+        )
+
+    # ===== 「SOM Node-wise Analysis」の一致可視化（背景色） =====
+    nodewise_vis_path = os.path.join(out_dir, f'{method_name}_nodewise_analysis_match.png')
+    plot_nodewise_match_map(
+        winners_xy=winners_all,
+        labels_all=labels_all,
+        node_to_medoid_idx=node_to_medoid_idx,
+        times_all=times_all,
+        som_shape=(SOM_X, SOM_Y),
+        save_path=nodewise_vis_path,
+        title=f'{method_name.upper()} SOM Node-wise Analysis (background: green=match / red=not)'
+    )
+    log.write(f'Node-wise match visualization -> {nodewise_vis_path}\n')
 
     # ===== 評価（ラベルがあれば） =====
-    if labels_all is not None:
-        clusters_all = winners_to_clusters(winners_all, (SOM_X,SOM_Y))
+    final_match_rate, final_matched_nodes, final_counted_nodes = compute_nodewise_match_rate(
+        winners_xy=winners_all,
+        labels_all=labels_all,
+        node_to_medoid_idx=node_to_medoid_idx,
+        som_shape=(SOM_X, SOM_Y)
+    )
 
+    if labels_all is not None:
         # 混同行列（基本ラベルのみ）を構築・保存
         cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS)
         conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_all.csv')
@@ -1064,17 +1249,21 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
         )
         if metrics is not None:
             log.write('\n[Final Metrics]\n')
-            metric_keys = ['MacroRecall_majority', 'MacroRecall_composite', 'MicroAccuracy_majority', 'ARI_majority', 'NMI_majority']
-            for k in metric_keys:
+            for k in ['MacroRecall_majority', 'MacroRecall_composite']:
                 if k in metrics:
                     log.write(f'  {k} = {metrics[k]:.6f}\n')
+            # 追加：match rate
+            if not np.isnan(final_match_rate):
+                log.write(f'  NodewiseMatchRate = {final_match_rate:.6f} (matched {final_matched_nodes}/{final_counted_nodes} nodes)\n')
+            else:
+                log.write(f'  NodewiseMatchRate = NaN (no countable nodes)\n')
 
         # ラベル分布ヒートマップ（基本ラベルのみ）
         dist_dir_all = os.path.join(out_dir, f'{method_name}_label_dist_all')
         plot_label_distributions_base(winners_all, labels_all, BASE_LABELS, (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
         log.write(f'Label-distribution heatmaps (base only) -> {dist_dir_all}\n')
 
-        # ノード詳細（構成・月分布など）を results.log に
+        # ノード詳細（構成・月分布など）を results.log に（代表ラベルrawも出力）
         analyze_nodes_detail_to_log(
             clusters_all, labels_all, times_all, BASE_LABELS, (SOM_X, SOM_Y),
             log, title=f'[{method_name.upper()}] SOM Node-wise Analysis'
@@ -1090,7 +1279,11 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
             section_title='SOM代表ノード群ベースの再現率（基本/複合）'
         )
     else:
+        # ラベルが無いケースでも match rate は NaN になるだけ
         log.write('Labels not found; skip evaluation.\n')
+        if not np.isnan(final_match_rate):
+            log.write('\n[Final Metrics]\n')
+            log.write(f'  NodewiseMatchRate = {final_match_rate:.6f} (matched {final_matched_nodes}/{final_counted_nodes} nodes)\n')
 
     log.write('\n=== Done (full period) ===\n')
     log.close()
