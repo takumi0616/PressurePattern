@@ -2,7 +2,7 @@
 *.log
 
 # Result directories
-result_test_acs*/
+result_*/
 
 # Python cache
 __pycache__/

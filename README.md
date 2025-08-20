@@ -19,23 +19,23 @@ pkill -f "main_v3.py"
 ## wsl-ubuntu → mac
 
 ```bash
-rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_wsl-ubuntu
 ```
 
 ## via-tml2 → mac
 
 ```bash
-rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_via-tml2
 ```
 
 ## gpu01 → mac
 
 ```bash
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu01
 ```
 
 ## gpu02 → mac
 
 ```bash
-rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern
+rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v3 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
 ```
