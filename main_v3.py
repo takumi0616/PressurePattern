@@ -32,21 +32,26 @@ SEED = 1
 
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 1000
-BATCH_SIZE = 1024 # VRAM16GB:512, VRAM24GB:1024
+NUM_ITER = 100000
+BATCH_SIZE = 512 # VRAM16GB:512, VRAM24GB:1024
 NODES_CHUNK = 16
 LOG_INTERVAL = 10
-EVAL_SAMPLE_LIMIT = 2048
-SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価（100区切り）
+EVAL_SAMPLE_LIMIT = 4000
+SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（100区切り）
 
 # データ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
-TIME_START = '1991-01-01'
-TIME_END   = '2000-12-31'
+
+# 期間（学習/検証）
+LEARN_START = '1991-01-01'
+LEARN_END   = '1999-12-31'
+VALID_START = '2000-01-01'
+VALID_END   = '2000-12-31'
 
 # 出力先（v3）
-RESULT_DIR = './results_v3'
-OUTPUT_ROOT = os.path.join(RESULT_DIR, 'outputs_som_fullperiod_v3')
+RESULT_DIR   = './results_v3'
+LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
+VERIF_ROOT    = os.path.join(RESULT_DIR, 'verification_results')
 
 # 基本ラベル（15）
 BASE_LABELS = [
@@ -89,7 +94,7 @@ def set_reproducibility(seed: int = 42):
 
 
 def setup_logging_v3():
-    for d in [RESULT_DIR, OUTPUT_ROOT]:
+    for d in [RESULT_DIR, LEARNING_ROOT, VERIF_ROOT]:
         os.makedirs(d, exist_ok=True)
     log_path = os.path.join(RESULT_DIR, 'run_v3.log')
     if os.path.exists(log_path):
@@ -120,11 +125,9 @@ def format_date_yyyymmdd(ts_val) -> str:
     except Exception:
         try:
             s = str(ts_val)
-            # 1991-01-24T00:00:00.000000000 → 1991/01/24
             if 'T' in s:
                 s = s.split('T')[0]
             s = s.replace('-', '/')
-            # 長さチェック (YYYY/MM/DD の 10 桁に切る)
             if len(s) >= 10:
                 return s[:10]
             return s
@@ -405,6 +408,28 @@ def plot_iteration_metrics(history: Dict[str, List[float]], save_path: str) -> N
     plt.close()
 
 
+def plot_iteration_metrics_single(history: Dict[str, List[float]], out_dir: str, filename_prefix: str) -> None:
+    """
+    各指標ごとに1枚の画像を保存する（従来の4指標まとめ画像に加えて出力）
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    iters = history.get('iteration', [])
+    for mname, values in history.items():
+        if mname == 'iteration':
+            continue
+        fig = plt.figure(figsize=(6, 4))
+        ax = plt.gca()
+        ax.plot(iters, values, marker='o')
+        ax.set_title(mname)
+        ax.set_xlabel('Iteration')
+        ax.set_ylabel(mname)
+        ax.grid(True)
+        fpath = os.path.join(out_dir, f'{filename_prefix}_iteration_vs_{mname}.png')
+        plt.tight_layout()
+        plt.savefig(fpath, dpi=200)
+        plt.close(fig)
+
+
 def save_metrics_history_to_csv(history: Dict[str, List[float]], out_csv: str) -> None:
     df = pd.DataFrame(history)
     df.to_csv(out_csv, index=False)
@@ -528,7 +553,7 @@ def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
                                   base_labels: List[str], som_shape: Tuple[int,int],
                                   save_dir: str, title_prefix: str):
     """
-    基本ラベルのみの分布ヒートマップ
+    基本ラベルのみの分布ヒートマップ（15種類を1枚にまとめる）
     """
     os.makedirs(save_dir, exist_ok=True)
     node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
@@ -556,6 +581,31 @@ def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
     plt.close(fig)
 
 
+def save_label_distributions_base_individual(winners_xy, labels_raw: List[Optional[str]],
+                                             base_labels: List[str], som_shape: Tuple[int,int],
+                                             save_dir: str, title_prefix: str):
+    """
+    基本ラベルのみの分布ヒートマップ（各ラベルごとの個別画像を追加保存）
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
+    for i,(ix,iy) in enumerate(winners_xy):
+        lab = basic_label_or_none(labels_raw[i], base_labels)
+        if lab in node_counts:
+            node_counts[lab][ix,iy] += 1
+    for lbl in base_labels:
+        fig = plt.figure(figsize=(4, 3))
+        ax = plt.gca()
+        im = ax.imshow(node_counts[lbl].T[::-1,:], cmap='viridis')
+        ax.set_title(lbl)
+        ax.set_xticks([]); ax.set_yticks([])
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fpath = os.path.join(save_dir, f'{title_prefix}_label_dist_base_{lbl}.png')
+        plt.tight_layout()
+        plt.savefig(fpath, dpi=200)
+        plt.close(fig)
+
+
 def analyze_nodes_detail_to_log(clusters: List[List[int]],
                                 labels: List[Optional[str]],
                                 timestamps: np.ndarray,
@@ -573,7 +623,7 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
         if n == 0:
             continue
         log.write(f'\n[Node ({ix},{iy})] N={n}\n')
-        # 代表ラベル（元ラベル：複合を含む）
+        # 代表ラベル（元ラベル：複合含む）
         cnt_raw = Counter([labels[j] for j in idxs if labels[j] is not None])
         if len(cnt_raw) > 0:
             top_raw, top_count_raw = cnt_raw.most_common(1)[0]
@@ -998,18 +1048,197 @@ def compute_nodewise_match_rate(
 
 
 # =====================================================
-# 3種類のbatchSOM（全期間・1方式分）
+# 学習時のノード代表（raw/基本）ラベルを構築
 # =====================================================
-def run_one_method(method_name, activation_distance, data_all, labels_all, times_all,
-                   field_shape, lat, lon, out_dir):
+def compute_training_node_majorities(
+    winners_xy: np.ndarray,
+    labels_all: List[Optional[str]],
+    base_labels: List[str],
+    som_shape: Tuple[int, int]
+) -> Tuple[Dict[Tuple[int,int], Optional[str]], Dict[Tuple[int,int], Optional[str]]]:
     """
-    method_name: 'euclidean' | 'ssim' | 's1'
+    学習データ上で、各ノードの代表ラベルを raw と基本の2種類で計算
+    戻り値: (node_to_majority_raw, node_to_majority_base)
+    """
+    clusters = winners_to_clusters(winners_xy, som_shape)
+    node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
+    node_to_majority_base: Dict[Tuple[int,int], Optional[str]] = {}
+
+    for k, idxs in enumerate(clusters):
+        ix, iy = k // som_shape[1], k % som_shape[1]
+        # raw
+        cnt_raw = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
+        node_to_majority_raw[(ix, iy)] = cnt_raw.most_common(1)[0][0] if len(cnt_raw) > 0 else None
+        # base
+        cnt_base = Counter()
+        for j in idxs:
+            bl = basic_label_or_none(labels_all[j], base_labels)
+            if bl is not None:
+                cnt_base[bl] += 1
+        node_to_majority_base[(ix, iy)] = cnt_base.most_common(1)[0][0] if len(cnt_base) > 0 else None
+
+    return node_to_majority_raw, node_to_majority_base
+
+
+# =====================================================
+# 検証（学習時代表ラベルに基づく推論）ユーティリティ
+# =====================================================
+def evaluate_verification_with_training_majority(
+    winners_xy_valid: np.ndarray,
+    labels_valid: List[Optional[str]],
+    times_valid: np.ndarray,
+    base_labels: List[str],
+    som_shape: Tuple[int, int],
+    node_to_majority_base_train: Dict[Tuple[int,int], Optional[str]],
+    out_dir: str,
+    method_name: str,
+    logger: Logger
+):
+    """
+    学習時の「ノード代表（基本ラベル）」を予測ラベルとして使用し、検証データの正解率を評価。
+    - 混同行列（基本ラベル vs クラスタ列）CSV
+    - per-label 再現率（基本/複合）CSV
+    - 割当CSV（予測/正誤フラグ含む）
+    - 棒グラフ（基本/複合）PNG
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    Hn, Wn = som_shape
+
+    # 混同行列（基本ラベル vs クラスタ列）: 検証データベース
+    clusters_val = winners_to_clusters(winners_xy_valid, som_shape)
+    cm_val, cluster_names = build_confusion_matrix_only_base(clusters_val, labels_valid, base_labels)
+    conf_csv = os.path.join(out_dir, f'{method_name}_verification_confusion_matrix.csv')
+    cm_val.to_csv(conf_csv, encoding='utf-8-sig')
+
+    # 学習代表（基本）を予測ラベルとして、検証の per-label 再現率（基本/複合）を算出
+    total_base = Counter()
+    correct_base = Counter()
+    total_comp = Counter()
+    correct_comp = Counter()
+
+    # 割当CSV用
+    rows_assign = []
+
+    for i, (ix, iy) in enumerate(winners_xy_valid):
+        # 実ラベル（基本/複合）
+        raw = labels_valid[i]
+        bl = basic_label_or_none(raw, base_labels)
+        comps = extract_base_components(raw, base_labels)
+
+        # 予測（学習時の代表基本ラベル）
+        pred = node_to_majority_base_train.get((int(ix), int(iy)), None)
+
+        # 基本ラベル再現率用
+        if bl is not None:
+            total_base[bl] += 1
+            if pred is not None and pred == bl:
+                correct_base[bl] += 1
+
+        # 複合ラベル再現率用
+        if comps:
+            for c in comps:
+                total_comp[c] += 1
+            if pred is not None and pred in comps:
+                correct_comp[pred] += 1
+
+        # 割当CSV 1行
+        rows_assign.append({
+            'time': format_date_yyyymmdd(times_valid[i]),
+            'bmu_x': int(ix), 'bmu_y': int(iy),
+            'label_raw': raw if raw is not None else '',
+            'actual_base': bl if bl is not None else '',
+            'pred_base_from_train': pred if pred is not None else '',
+            'correct_base': int(1 if (bl is not None and pred == bl) else 0),
+            'correct_composite': int(1 if (pred is not None and pred in comps) else 0)
+        })
+
+    # per-label 再現率テーブルとマクロ平均
+    per_label_rows = []
+    recalls_base = []
+    recalls_comp = []
+    for lbl in base_labels:
+        N_base = int(total_base[lbl])
+        C_base = int(correct_base[lbl])
+        rec_base = (C_base / N_base) if N_base > 0 else np.nan
+
+        N_comp = int(total_comp[lbl])
+        C_comp = int(correct_comp[lbl])
+        rec_comp = (C_comp / N_comp) if N_comp > 0 else np.nan
+
+        per_label_rows.append({
+            'label': lbl,
+            'N_base': N_base, 'Correct_base': C_base, 'Recall_base': rec_base,
+            'N_composite': N_comp, 'Correct_composite': C_comp, 'Recall_composite': rec_comp
+        })
+        if not np.isnan(rec_base):
+            recalls_base.append(rec_base)
+        if not np.isnan(rec_comp):
+            recalls_comp.append(rec_comp)
+
+    macro_base = float(np.mean(recalls_base)) if len(recalls_base) > 0 else float('nan')
+    macro_comp = float(np.mean(recalls_comp)) if len(recalls_comp) > 0 else float('nan')
+
+    # 保存（CSV）
+    assign_csv = os.path.join(out_dir, f'{method_name}_verification_assign.csv')
+    pd.DataFrame(rows_assign).to_csv(assign_csv, index=False, encoding='utf-8-sig')
+
+    per_label_csv = os.path.join(out_dir, f'{method_name}_verification_per_label_recall.csv')
+    df_pl = pd.DataFrame(per_label_rows)
+    df_pl.to_csv(per_label_csv, index=False, encoding='utf-8-sig')
+
+    # 棒グラフ出力
+    def plot_per_label_bars(labels, values, title, out_png):
+        fig = plt.figure(figsize=(max(8, 0.5*len(labels)+2), 4))
+        ax = plt.gca()
+        ax.bar(labels, values, color='steelblue')
+        ax.set_ylim(0, 1.0)
+        ax.set_ylabel('Recall')
+        ax.set_title(title)
+        for i, v in enumerate(values):
+            if not np.isnan(v):
+                ax.text(i, v+0.02, f"{v:.2f}", ha='center', va='bottom', fontsize=8)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(out_png, dpi=200)
+        plt.close(fig)
+
+    base_vals = [float(df_pl.loc[df_pl['label']==lbl, 'Recall_base'].values[0]) if lbl in df_pl['label'].values else np.nan for lbl in base_labels]
+    comp_vals = [float(df_pl.loc[df_pl['label']==lbl, 'Recall_composite'].values[0]) if lbl in df_pl['label'].values else np.nan for lbl in base_labels]
+    plot_per_label_bars(base_labels, base_vals, f'{method_name.upper()} Verification Recall (Base)', os.path.join(out_dir, f'{method_name}_verification_per_label_recall_base.png'))
+    plot_per_label_bars(base_labels, comp_vals, f'{method_name.upper()} Verification Recall (Composite)', os.path.join(out_dir, f'{method_name}_verification_per_label_recall_composite.png'))
+
+    # ログ出力（詳細）
+    logger.write("\n=== [Verification Evaluation] ===\n")
+    logger.write(f"Confusion matrix (base vs clusters) -> {conf_csv}\n")
+    logger.write(f"Assignments with prediction/flags -> {assign_csv}\n")
+    logger.write(f"Per-label recall CSV -> {per_label_csv}\n")
+    logger.write("\n【各ラベルの再現率（学習時の代表基本ラベルを予測として）】\n")
+    for r in per_label_rows:
+        logger.write(f" - {r['label']:<3}: N_base={r['N_base']:4d} Correct_base={r['Correct_base']:4d} Recall_base={0.0 if np.isnan(r['Recall_base']) else r['Recall_base']:.4f} | "
+                     f"N_comp={r['N_composite']:4d} Correct_comp={r['Correct_composite']:4d} Recall_comp={0.0 if np.isnan(r['Recall_composite']) else r['Recall_composite']:.4f}\n")
+    logger.write(f"\n[Summary] Macro Recall (基本ラベル)   = {macro_base:.4f}\n")
+    logger.write(f"[Summary] Macro Recall (基本+応用) = {macro_comp:.4f}\n")
+    logger.write("=== [Verification Evaluation End] ===\n")
+
+    return {
+        'MacroRecall_majority': macro_base,
+        'MacroRecall_composite': macro_comp
+    }
+
+
+# =====================================================
+# 3種類のbatchSOM（学習：一方式分）
+# =====================================================
+def run_one_method_learning(method_name, activation_distance, data_all, labels_all, times_all,
+                            field_shape, lat, lon, out_dir):
+    """
+    学習（learning）：method_name: 'euclidean' | 'ssim' | 's1'
     activation_distance: 同上
     data_all は「空間平均を引いた偏差[hPa]」（N,D）
     """
     os.makedirs(out_dir, exist_ok=True)
     log = Logger(os.path.join(out_dir, f'{method_name}_results.log'))
-    log.write(f'=== {method_name} SOM (Full period) ===\n')
+    log.write(f'=== {method_name} SOM (Learning period) ===\n')
     log.write(f'Device CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}\n')
     log.write(f'SOM size: {SOM_X} x {SOM_Y}, iter={NUM_ITER}, batch={BATCH_SIZE}, nodes_chunk={NODES_CHUNK}\n')
     log.write(f'All samples: {data_all.shape[0]}\n')
@@ -1111,7 +1340,10 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
     save_metrics_history_to_csv(iter_history, iter_csv)
     iter_png = os.path.join(out_dir, f'{method_name}_iteration_vs_metrics.png')
     plot_iteration_metrics(iter_history, iter_png)
-    log.write(f'\nIteration metrics saved: CSV={iter_csv}, PNG={iter_png}\n')
+    # 追加：各メトリクスの単独画像
+    plot_iteration_metrics_single(iter_history, out_dir, filename_prefix=method_name)
+
+    log.write(f'\nIteration metrics saved: CSV={iter_csv}, PNG={iter_png} and per-metric PNGs\n')
 
     # ====== 最終モデルでの割当 ======
     winners_all = som.predict(data_all, batch_size=max(64, BATCH_SIZE))
@@ -1140,16 +1372,10 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
                               out_dir=pernode_dir_all, prefix='all')
     log.write(f'Per-node mean images (all) -> {pernode_dir_all}\n')
 
-    # ===== ノードの多数決（元ラベル：複合含む）を先に作っておく =====
-    clusters_all = winners_to_clusters(winners_all, (SOM_X, SOM_Y))
-    node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
-    for k, idxs in enumerate(clusters_all):
-        ix, iy = k // SOM_Y, k % SOM_Y
-        if len(idxs) == 0:
-            node_to_majority_raw[(ix,iy)] = None
-        else:
-            cnt_raw = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
-            node_to_majority_raw[(ix,iy)] = cnt_raw.most_common(1)[0][0] if len(cnt_raw)>0 else None
+    # ===== ノードの多数決（元ラベル/基本ラベル） =====
+    node_to_majority_raw, node_to_majority_base = compute_training_node_majorities(
+        winners_all, labels_all, BASE_LABELS, (SOM_X, SOM_Y)
+    )
 
     # ===== ノードmedoid（重心に最も近いサンプル） =====
     node_to_medoid_idx, node_to_medoid_dist = compute_node_medoids_by_centroid(
@@ -1235,6 +1461,7 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
 
     if labels_all is not None:
         # 混同行列（基本ラベルのみ）を構築・保存
+        clusters_all = winners_to_clusters(winners_all, (SOM_X, SOM_Y))
         cm, cluster_names = build_confusion_matrix_only_base(clusters_all, labels_all, BASE_LABELS)
         conf_csv = os.path.join(out_dir, f'{method_name}_confusion_matrix_all.csv')
         cm.to_csv(conf_csv, encoding='utf-8-sig')
@@ -1258,9 +1485,12 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
             else:
                 log.write(f'  NodewiseMatchRate = NaN (no countable nodes)\n')
 
-        # ラベル分布ヒートマップ（基本ラベルのみ）
+        # ラベル分布ヒートマップ（基本ラベルのみ） 1枚
         dist_dir_all = os.path.join(out_dir, f'{method_name}_label_dist_all')
         plot_label_distributions_base(winners_all, labels_all, BASE_LABELS, (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
+        # 追加：基本ラベルごとの個別画像
+        save_label_distributions_base_individual(winners_all, labels_all, BASE_LABELS, (SOM_X,SOM_Y), dist_dir_all, title_prefix='All')
+
         log.write(f'Label-distribution heatmaps (base only) -> {dist_dir_all}\n')
 
         # ノード詳細（構成・月分布など）を results.log に（代表ラベルrawも出力）
@@ -1285,8 +1515,88 @@ def run_one_method(method_name, activation_distance, data_all, labels_all, times
             log.write('\n[Final Metrics]\n')
             log.write(f'  NodewiseMatchRate = {final_match_rate:.6f} (matched {final_matched_nodes}/{final_counted_nodes} nodes)\n')
 
-    log.write('\n=== Done (full period) ===\n')
+    # 学習時ノード代表（raw/基本）ラベルをJSONに保存（検証時に利用）
+    majority_rows = []
+    for ix in range(SOM_X):
+        for iy in range(SOM_Y):
+            majority_rows.append({
+                'node_x': ix, 'node_y': iy,
+                'majority_raw': node_to_majority_raw.get((ix,iy)),
+                'majority_base': node_to_majority_base.get((ix,iy))
+            })
+    maj_json = os.path.join(out_dir, 'node_majorities.json')
+    with open(maj_json, 'w', encoding='utf-8') as f:
+        json.dump(majority_rows, f, ensure_ascii=False, indent=2)
+    log.write(f'Node majorities (raw/base) saved -> {maj_json}\n')
+
+    log.write('\n=== Done (learning) ===\n')
     log.close()
+
+    # 検証で使用するためにSOMインスタンスと学習代表（raw/基本）辞書を返却
+    return som, node_to_majority_raw, node_to_majority_base
+
+
+# =====================================================
+# 検証（学習済モデルを使って、検証期間データで評価）
+# =====================================================
+def run_one_method_verification(method_name: str,
+                                som: MultiDistMiniSom,
+                                train_majority_raw: Dict[Tuple[int,int], Optional[str]],
+                                train_majority_base: Dict[Tuple[int,int], Optional[str]],
+                                data_valid: np.ndarray,
+                                labels_valid: Optional[List[Optional[str]]],
+                                times_valid: np.ndarray,
+                                field_shape: Tuple[int,int],
+                                lat: np.ndarray, lon: np.ndarray,
+                                out_dir: str):
+    """
+    学習済み SOM を用いて検証データをBMU割当し、学習時のノード代表（基本）ラベルで検証を評価
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    vlog = Logger(os.path.join(out_dir, f'{method_name}_verification.log'))
+    vlog.write(f'=== {method_name} SOM (Verification period) ===\n')
+    vlog.write(f'Verification samples: {data_valid.shape[0]}\n')
+    if len(times_valid) > 0:
+        tmin = pd.to_datetime(times_valid.min()).strftime('%Y-%m-%d')
+        tmax = pd.to_datetime(times_valid.max()).strftime('%Y-%m-%d')
+        vlog.write(f'Verification Period: {tmin} to {tmax}\n')
+
+    # 検証データのBMU予測
+    winners_val = som.predict(data_valid, batch_size=max(64, BATCH_SIZE))
+
+    # ラベルがあれば、検証評価（学習代表基本ラベルを予測とする）
+    if labels_valid is not None and len(labels_valid) == len(winners_val):
+        # 混同行列や per-label 再現率など
+        metrics = evaluate_verification_with_training_majority(
+            winners_xy_valid=winners_val,
+            labels_valid=labels_valid,
+            times_valid=times_valid,
+            base_labels=BASE_LABELS,
+            som_shape=(SOM_X, SOM_Y),
+            node_to_majority_base_train=train_majority_base,
+            out_dir=out_dir,
+            method_name=method_name,
+            logger=vlog
+        )
+        # ラベル分布ヒートマップ（基本/個別）
+        dist_dir_val = os.path.join(out_dir, f'{method_name}_verification_label_dist')
+        plot_label_distributions_base(winners_val, labels_valid, BASE_LABELS, (SOM_X, SOM_Y), dist_dir_val, title_prefix='Verification')
+        save_label_distributions_base_individual(winners_val, labels_valid, BASE_LABELS, (SOM_X, SOM_Y), dist_dir_val, title_prefix='Verification')
+        vlog.write(f'Label-distribution heatmaps for verification -> {dist_dir_val}\n')
+    else:
+        vlog.write('Labels not found for verification; skip evaluation.\n')
+
+    # 参考：検証データのノード平均（必要であれば）
+    avg_map_path = os.path.join(out_dir, f'{method_name}_verification_node_avg.png')
+    plot_som_node_average_patterns(
+        data_valid, winners_val, lat, lon, (SOM_X,SOM_Y),
+        save_path=avg_map_path,
+        title=f'{method_name.upper()} SOM Node Avg SLP Anomaly (Verification)'
+    )
+    vlog.write(f'Verification node average patterns -> {avg_map_path}\n')
+
+    vlog.write('=== Done (verification) ===\n')
+    vlog.close()
 
 
 # =====================================================
@@ -1299,15 +1609,25 @@ def main():
     logging.info(f"使用デバイス: {device.upper()}")
     logging.info(f"SOM(3type): size={SOM_X}x{SOM_Y}, iters={NUM_ITER}, batch={BATCH_SIZE}, nodes_chunk={NODES_CHUNK}")
 
-    # 共通の前処理（hPa偏差）
-    X_for_s1, X_original_hpa, X_anomaly_hpa, lat, lon, d_lat, d_lon, ts, labels = load_and_prepare_data_unified(
-        DATA_FILE, TIME_START, TIME_END, device
+    # 学習データ（1991-01-01〜1999-12-31）
+    X_for_s1_L, X_original_hpa_L, X_anomaly_hpa_L, lat, lon, d_lat, d_lon, ts_L, labels_L = load_and_prepare_data_unified(
+        DATA_FILE, LEARN_START, LEARN_END, device
     )
-    # 3type_SOM用の2次元表現（numpy）
-    data_all = X_anomaly_hpa.reshape(X_anomaly_hpa.shape[0], -1).astype(np.float32)
+    data_learn = X_anomaly_hpa_L.reshape(X_anomaly_hpa_L.shape[0], -1).astype(np.float32)
+
+    # 検証データ（2000-01-01〜2000-12-31）
+    X_for_s1_V, X_original_hpa_V, X_anomaly_hpa_V, lat2, lon2, d_lat2, d_lon2, ts_V, labels_V = load_and_prepare_data_unified(
+        DATA_FILE, VALID_START, VALID_END, device
+    )
+    data_valid = X_anomaly_hpa_V.reshape(X_anomaly_hpa_V.shape[0], -1).astype(np.float32)
+
+    # 次元・座標は同じはずだが、保険で確認
+    assert d_lat == d_lat2 and d_lon == d_lon2, "学習/検証でグリッドサイズが異なります。"
+    assert np.allclose(lat, lat2) and np.allclose(lon, lon2), "学習/検証でlat/lonが異なります。"
+
     field_shape = (d_lat, d_lon)
 
-    # 3種類のbatchSOM（全期間）を実行
+    # 3種類のbatchSOM（学習→検証）
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -1319,14 +1639,29 @@ def main():
         ('s1',        's1')
     ]
     for mname, adist in methods:
-        out_dir = os.path.join(OUTPUT_ROOT, f'{mname}_som')
-        run_one_method(
+        # 学習
+        out_dir_learn = os.path.join(LEARNING_ROOT, f'{mname}_som')
+        som, majority_raw_train, majority_base_train = run_one_method_learning(
             method_name=mname, activation_distance=adist,
-            data_all=data_all, labels_all=labels, times_all=ts,
-            field_shape=field_shape, lat=lat, lon=lon, out_dir=out_dir
+            data_all=data_learn, labels_all=labels_L, times_all=ts_L,
+            field_shape=field_shape, lat=lat, lon=lon, out_dir=out_dir_learn
+        )
+        # 検証
+        out_dir_verif = os.path.join(VERIF_ROOT, f'{mname}_som')
+        run_one_method_verification(
+            method_name=mname,
+            som=som,
+            train_majority_raw=majority_raw_train,
+            train_majority_base=majority_base_train,
+            data_valid=data_valid,
+            labels_valid=labels_V,
+            times_valid=ts_V,
+            field_shape=field_shape,
+            lat=lat, lon=lon,
+            out_dir=out_dir_verif
         )
 
-    logging.info("全処理完了。")
+    logging.info("全処理完了（学習＋検証）。")
 
 
 if __name__ == '__main__':
