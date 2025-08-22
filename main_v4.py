@@ -1411,10 +1411,6 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         eval_idx = rng.choice(data_all.shape[0], size=n_eval, replace=False)
         som.set_eval_indices(eval_idx)
 
-    # 非ユークリッド/複合距離ではメドイド置換を周期的に適用（距離一貫性の改善）
-    if method_name in ('s1', 'ssim', 'ssim5', 's1ssim'):
-        som.set_medoid_replace_every(max(1, NUM_ITER // 8))
-
     # ====== 学習を区切って実施し、各区切りで評価（履歴プロット用） ======
     step = max(1, NUM_ITER // SOM_EVAL_SEGMENTS)
     iter_history: Dict[str, List[float]] = {
