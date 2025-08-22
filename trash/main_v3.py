@@ -23,7 +23,7 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
 # 3type版 SOM（Euclidean/SSIM/S1対応, batchSOM）
-from minisom import MiniSom as MultiDistMiniSom
+from PressurePattern.trash.minisom import MiniSom as MultiDistMiniSom
 
 # =====================================================
 # ユーザ調整パラメータ
