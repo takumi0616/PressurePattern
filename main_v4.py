@@ -24,7 +24,7 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
 # 3type版 SOM（Euclidean/SSIM/S1対応, batchSOM）
-from PressurePattern.trash.minisom import MiniSom as MultiDistMiniSom
+from minisom import MiniSom as MultiDistMiniSom
 
 # =====================================================
 # ユーザ調整パラメータ
@@ -889,6 +889,93 @@ def compute_node_medoids_by_centroid(
     return node_to_medoid_idx, node_to_medoid_dist
 
 
+def compute_node_true_medoids(
+    method_name: str,
+    data_flat: np.ndarray,
+    winners_xy: np.ndarray,
+    som_shape: Tuple[int, int],
+    field_shape: Tuple[int, int],
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    fusion_alpha: float = 0.5
+) -> Tuple[Dict[Tuple[int,int], int], Dict[Tuple[int,int], float]]:
+    """
+    各ノードについて「総距離最小（true medoid）」のサンプルを選ぶ。
+    - 各ノードの割当集合 Ic の中で、候補 i∈Ic について cost(i) = Σ_{j∈Ic} d(X_j, X_i) を計算し最小の i を選ぶ。
+    - method_name: 'euclidean' | 'ssim' | 'ssim5' | 's1' | 's1ssim'
+    - 戻りの距離は、選ばれたメドイドに対する平均距離（sum/|Ic|）。
+    """
+    H, W = field_shape
+    X2 = data_flat.reshape(-1, H, W)
+    X_t = torch.as_tensor(X2, device=device, dtype=torch.float32)
+
+    node_to_medoid_idx: Dict[Tuple[int,int], int] = {}
+    node_to_medoid_avgdist: Dict[Tuple[int,int], float] = {}
+
+    def pairwise_euclidean(Xc: torch.Tensor) -> torch.Tensor:
+        C = Xc.shape[0]
+        Xf = Xc.reshape(C, -1)
+        x2 = (Xf * Xf).sum(dim=1, keepdim=True)           # (C,1)
+        d2 = x2 + x2.T - 2.0 * (Xf @ Xf.T)                # (C,C)
+        d2 = torch.clamp(d2, min=0.0)
+        return torch.sqrt(d2 + 1e-12)
+
+    def pairwise_by_ref(dist_fn, Xc: torch.Tensor) -> torch.Tensor:
+        # 行ごとに「ref=Xc[i]」として距離ベクトルを計算して積み上げる
+        C = Xc.shape[0]
+        D = torch.empty((C, C), device=Xc.device, dtype=Xc.dtype)
+        for i in range(C):
+            ref = Xc[i]
+            D[i] = dist_fn(Xc, ref)  # (C,)
+        return D
+
+    for ix in range(som_shape[0]):
+        for iy in range(som_shape[1]):
+            mask = (winners_xy[:, 0] == ix) & (winners_xy[:, 1] == iy)
+            idxs = np.where(mask)[0]
+            if len(idxs) == 0:
+                continue
+            Xcand = X_t[idxs]  # (C,H,W)
+            Ccand = Xcand.shape[0]
+
+            if Ccand == 1:
+                node_to_medoid_idx[(ix, iy)] = int(idxs[0])
+                node_to_medoid_avgdist[(ix, iy)] = 0.0
+                continue
+
+            # 距離行列 D (C,C) を作る
+            if method_name == 'euclidean':
+                D = pairwise_euclidean(Xcand)
+            elif method_name == 'ssim':
+                D = pairwise_by_ref(lambda Xb, ref: _ssim_dist_to_ref(Xb, ref), Xcand)
+            elif method_name == 'ssim5':
+                D = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+            elif method_name == 's1':
+                D = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
+            elif method_name == 's1ssim':
+                # まず個別の距離行列
+                D1 = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
+                D2 = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+                # 行ごとにmin-max正規化（i行に対して）
+                eps = 1e-12
+                d1_min = D1.min(dim=1, keepdim=True).values
+                d1_max = D1.max(dim=1, keepdim=True).values
+                d2_min = D2.min(dim=1, keepdim=True).values
+                d2_max = D2.max(dim=1, keepdim=True).values
+                D1n = (D1 - d1_min) / (d1_max - d1_min + eps)
+                D2n = (D2 - d2_min) / (d2_max - d2_min + eps)
+                D = fusion_alpha * D1n + (1.0 - fusion_alpha) * D2n
+            else:
+                raise ValueError(f'Unknown method_name: {method_name}')
+
+            # cost(i) = Σ_j D[i,j]
+            costs = D.sum(dim=1)  # (C,)
+            imin = int(torch.argmin(costs).item())
+            node_to_medoid_idx[(ix, iy)] = int(idxs[imin])
+            node_to_medoid_avgdist[(ix, iy)] = float((costs[imin] / Ccand).item())
+
+    return node_to_medoid_idx, node_to_medoid_avgdist
+
+
 def plot_som_node_medoid_patterns(
     data_flat: np.ndarray,
     node_to_medoid_idx: Dict[Tuple[int,int], int],
@@ -1469,6 +1556,54 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         out_dir=pernode_medoid_dir, prefix='all'
     )
     log.write(f'Per-node medoid images (all) -> {pernode_medoid_dir}\n')
+
+    # ===== True Medoid（総距離最小）も計算・保存 =====
+    node_to_true_medoid_idx, node_to_true_medoid_avgdist = compute_node_true_medoids(
+        method_name=method_name,
+        data_flat=data_all, winners_xy=winners_all,
+        som_shape=(SOM_X, SOM_Y), field_shape=field_shape,
+        fusion_alpha=0.5
+    )
+
+    # True Medoid マップ
+    true_medoid_bigmap = os.path.join(out_dir, f'{method_name}_som_node_true_medoid_all.png')
+    plot_som_node_medoid_patterns(
+        data_flat=data_all,
+        node_to_medoid_idx=node_to_true_medoid_idx,
+        lat=lat, lon=lon, som_shape=(SOM_X, SOM_Y),
+        times_all=times_all,
+        save_path=true_medoid_bigmap,
+        title=f'{method_name.upper()} SOM Node True Medoid (min-sum-of-distances)'
+    )
+    log.write(f'True medoid map (all) -> {true_medoid_bigmap}\n')
+
+    # True Medoid 個別図
+    pernode_true_medoid_dir = os.path.join(out_dir, f'{method_name}_pernode_true_medoid_all')
+    save_each_node_medoid_image(
+        data_flat=data_all,
+        node_to_medoid_idx=node_to_true_medoid_idx,
+        lat=lat, lon=lon, som_shape=(SOM_X, SOM_Y),
+        out_dir=pernode_true_medoid_dir, prefix='all_true'
+    )
+    log.write(f'Per-node true medoid images (all) -> {pernode_true_medoid_dir}\n')
+
+    # True Medoid CSV
+    rows_true = []
+    for (ix, iy), mi in sorted(node_to_true_medoid_idx.items()):
+        t_str = format_date_yyyymmdd(times_all[mi]) if len(times_all)>0 else ''
+        raw = labels_all[mi] if labels_all is not None else ''
+        label_base_or_none = basic_label_or_none(raw, BASE_LABELS)
+        avgdist = node_to_true_medoid_avgdist.get((ix,iy), np.nan)
+        rows_true.append({
+            'node_x': ix, 'node_y': iy, 'node_flat': ix*SOM_Y+iy,
+            'true_medoid_index': mi, 'time': t_str,
+            'label_raw': raw,
+            'label': label_base_or_none,
+            'avg_distance_in_node': avgdist
+        })
+    true_medoid_csv = os.path.join(out_dir, f'{method_name}_node_true_medoids.csv')
+    pd.DataFrame(rows_true).to_csv(true_medoid_csv, index=False, encoding='utf-8-sig')
+    log.write(f'Node true medoid CSV -> {true_medoid_csv}\n')
 
     # medoid選定結果のCSV（labelは基本ラベル or None、rawは元ラベル）
     rows = []
