@@ -1,6 +1,6 @@
 # 類似度指標とクラスタリング手法の比較を通じた気圧配置パターン分類の高度化（v3）
 
-本稿は、総観場（海面更正気圧：SLP）の類似度指標とクラスタリング手法を比較し、気圧配置パターン分類の精度・頑健性・解釈性を同時に高めるための研究計画と実装設計（v3）をまとめたものである。v3 では、先行研究で示された SSIM/S1 類似度や medoid 表現、二段階クラスタリングの知見を踏まえ、GPU 最適化した Batch‑SOM に対して 5 種の距離（EUC/SSIM/SSIM5/S1/S1+SSIM）を同一条件で比較できる実験基盤を整備した。結果・結論・考察は本稿では扱わず、背景・目的・方法・実装・評価設計を記述する。
+本稿は、総観場（海面更正気圧：SLP）の類似度指標とクラスタリング手法を比較し、気圧配置パターン分類の精度・頑健性・解釈性を同時に高めるための研究計画と実装設計（v3）をまとめたものである。v3 では、先行研究で示された SSIM/S1 類似度や medoid 表現、二段階クラスタリングの知見を踏まえ、GPU 最適化した Batch‑SOM に対して 5 種の距離（EUC/SSIM/SSIM5/S1/S1+SSIM）を同一条件で比較できる実験基盤を整備した。本文では背景・目的・方法・実装・評価設計に加え、§9–§11 に主要な実験結果・考察・まとめを併記する。
 
 ---
 
@@ -150,7 +150,7 @@
 - **BMU 距離（5 種）**：
   - **EUC**：ユークリッド距離（ベースライン）
   - **SSIM**：全体 1 窓の SSIM（C1=C2=1e‑8）
-  - **SSIM5**：5×5 移動窓・C=0（Doan 2021 の仕様に近い）
+  - **SSIM5**：5×5 移動窓の平均 SSIM（C1=C2=0，分母に ε を付与；Doan 2021 に準拠）
   - **S1**：Teweles–Wobus（水平/南北勾配の差の正規化比）
   - **S1+SSIM**：S1 と SSIM5 をサンプル毎に min‑max 正規化後に等重み合成
 - **medoid 置換**：任意間隔で各ノード重みを「距離的に最近傍の実サンプル」へ置換（距離一貫性・代表性を向上）。
@@ -185,7 +185,7 @@
 
 ### 5.3 ハイパーパラメータ（既定）
 
-- SOM 10×10、反復数 `NUM_ITER`（分割評価 `SOM_EVAL_SEGMENTS`）、バッチ 256、`nodes_chunk` 2–4（VRAM 依存）
+- SOM 10×10、反復数 `NUM_ITER`（分割評価 `SOM_EVAL_SEGMENTS`）、バッチ 128、`nodes_chunk` 2–4（VRAM 依存）
 - 評価サンプル上限 4000、ログ間隔 10、GPU/CPU 自動選択、乱数シード固定
 
 ---
@@ -206,14 +206,14 @@
    - シルエット係数・トポロジカルエラー（Doan 2021）
    - Jensen–Shannon 距離（Winderlich 2024；頻度・遷移・持続）
 
-> 本稿では評価設計のみを記し、数値結果・図表・考察は提示しない。
+> 評価設計に加え、§9–§11 に主要な数値結果・図表の要約と考察を示す（詳細な図表・追加実験は別稿／付録に委ねる）。
 
 ---
 
 ## 7. 再現性計画（Reproducibility Plan）
 
 - **コード**：`main_v4.py` / `minisom.py` に集約。乱数・BLAS スレッド・PyTorch の deterministic を固定。
-- **入出力**：NetCDF（ERA5 派生 prmsl）を `DATA_FILE` から読み込み。結果は `results_v4` 以下に自動保存（CSV/PNG/JSON/LOG）。
+- **入出力**：NetCDF（ERA5 の prmsl；例：`prmsl_era5_all_data_seasonal_large.nc`）を `DATA_FILE` から読み込み。…
 - **環境**：Python 3.x、PyTorch（CUDA/CPU 対応）、Cartopy/Matplotlib、xarray/pandas。VRAM 16–24GB を推奨（`nodes_chunk` で調整可）。
 - **パラメータ**：SOM サイズ・反復・バッチ・距離タイプは定数で管理。ログに全設定を出力。
 - **データ配布**：入力データの配布条件（ERA5/再解析のライセンス）を遵守し、前処理スクリプトを公開する。
@@ -230,59 +230,97 @@
 
 ---
 
-## 9. 今後の拡張（Future Work）
+## 9. 実験結果（Experimental Results）
 
-- **前処理強化**：日別季節正規化・面積重み・高緯度安定化。
-- **指標追加**：シルエット・TE・JS 距離の導入と報告テンプレート化。
-- **自動クラスタ**：SSIM 閾値の HAC→k‑medoids（Winderlich）や SOM とのハイブリッド。
-- **多変量化**：風ベクトル・相当温位・渦度傾度・地衡風・温度偏差の統合による梅雨・台風の識別力強化。
-- **季節別/領域別運用**：季節別 SOM、東アジア/北半球への拡張と汎化検証。
-- **オープンサイエンス**：コード・設定・前処理・出力テンプレを公開し、再現性パッケージ化。
+本節では，GPU 最適化 Batch‑SOM を共通基盤に，BMU 距離を 5 方式（EUC／SSIM／SSIM5／S1／S1+SSIM）で同条件比較した v3 実験の主要結果をまとめる．前処理は SLP を hPa に変換し，サンプル毎に空間平均を差し引いた偏差（anomaly）とした．学習期間は 1991–1999，検証は 2000 年である．評価は Macro Recall（基本ラベル 15／複合ラベル）を用いた．
+
+### 9.1 距離方式別の総合指標（Macro Recall）
+
+- 学習期間（1991–1999）の Macro Recall（基本／複合）
+
+  - Euclidean: 0.2544／0.1863
+  - SSIM（全体 1 窓）: 0.2459／0.1819
+  - SSIM5（5×5・C=0）: 0.2960／0.2060
+  - S1: 0.3466／0.2329
+  - S1+SSIM（等重み融合）: 0.3443／0.2361
+
+- 検証期間（2000 年）の Macro Recall（基本／複合）
+  - Euclidean: 0.1958／0.1595
+  - SSIM（全体 1 窓）: 0.2135／0.1500
+  - SSIM5（5×5・C=0）: 0.2531／0.1917
+  - S1: 0.2754／0.1850
+  - S1+SSIM（等重み融合）: 0.3501／0.2157
+
+→ 学習内では S1 が最良（0.3466），検証では S1+SSIM が最良（0.3501）で，SSIM5 は SSIM を一貫して上回った．EUC は両期間で最下位グループであった．
+
+### 9.2 ラベル別の傾向（検証）
+
+- 高再現のラベル
+  - 1（冬型）: 0.878–0.951（方式間ばらつき小）
+  - 3B（西風系）: 0.736–0.895（S1／S1+SSIM で顕著）
+- 中位
+  - 4A（移動性高気圧）: 0.4–0.8（方式により振れ，S1 系で高め）
+- 低位（いずれの方式も低い）
+  - 2B，2C，3C，3D，5（乱流的・境界が曖昧／形状多様）
+  - 6A，6B，6C（サンプル希少で 0 付近）
+- SSIM5 は SSIM 比で 2D，3A，4A，3B の一部で改善．
+- S1+SSIM は S1 の水準を保ちつつ，2A／5 等の構造・位置のブレを併合で吸収し，総合で最良．
+
+### 9.3 可視化・代表性（概況）
+
+- ノード平均（centroid）に加え，medoid（closest‑to‑centroid）・true medoid（総距離最小）を出力した．ノードごとの多数決 raw と medoid raw の一致可視化では，S1／S1+SSIM で一致ノード（緑）が相対的に多く，EUC／SSIM では不一致（赤）が目立つ領域が残存した（とくに多峰性・遷移帯）．
+- ラベル分布ヒートマップでは，S1／S1+SSIM で 1，3B，4A の分化が明瞭で，SSIM5 は SSIM 比で局所勾配・コントラストの表現力が向上した．
 
 ---
 
-## 出力成果物（例：メソッドごとに `results_v4/learning_result/{method}_som` 配下）
+## 10. 実験考察（Discussion）
 
-- `*_iteration_metrics.csv/png`：QE・MacroRecall・NodewiseMatchRate の学習推移。
-- `*_assign_all.csv`：学習期間の BMU 割当（日時・BMU・raw ラベル）。
-- `*_som_node_avg_all.png`：centroid（ノード平均）大図。
-- `*_pernode_all/*.png`：ノード平均の個別図。
-- `*_som_node_medoid_all.png`：medoid（closest‑to‑centroid）大図。
-- `*_pernode_medoid_all/*.png`：medoid 個別図。
-- `*_som_node_true_medoid_all.png`：true medoid（総距離最小）大図。
-- `*_pernode_true_medoid_all/*.png`：true medoid 個別図。
-- `*_node_medoids.csv` / `*_node_true_medoids.csv`：medoid メタ情報（ノード座標、日付、raw/基本ラベル、距離）。
-- `*_nodewise_analysis_match.png`：多数決 raw vs medoid raw の一致可視化（緑/赤）。
-- `*_confusion_matrix_all.csv`：学習データの混同行列（基本ラベル）。
-- `*_label_dist_all/*.png`：ラベル分布ヒートマップ（全体/個別）。
-- `node_majorities.json`：学習時ノード多数決（raw/基本）の辞書（検証用）。
+1. **S1 と SSIM の補完性**  
+   S1 は水平方向・南北方向の勾配差を直接比較するため，前線帯や西風卓越（3B），冬型（1）など勾配構造が支配的な型で強い．一方，台風や移行型のように中心位置や形状が重要な場合は，構造類似度（SSIM）が有効である（Sato & Kusaka, 2021；Doan et al., 2021）．本実験でも SSIM5 が SSIM を上回り，局所窓の導入が有効だった．S1+SSIM（等重み）は，両者の長所を取り入れ検証 Macro を最大化した（0.3501）．
 
-**検証（`results_v4/verification_results/{method}_som` 配下）**
+2. **EUC の限界と medoid の効用**  
+   EUC は平均化に伴う代表型の“ぼけ”やスノーボール化を招きやすく（Wang & Bovik, 2009；Winderlich et al., 2024），本実験でも Macro が最下位グループにとどまった．一方，medoid/true‑medoid 表現は，極値勾配や中心位置を保持し，ノード多数決 raw と整合する可視化を提供した．これにより，運用・事例検索での解釈性が向上する（Winderlich の指摘と整合）．
 
-- `*_verification_confusion_matrix.csv`、`*_verification_per_label_recall.csv/png`：検証年の基本/複合再現率。
-- `*_verification_assign.csv`：検証期間の BMU 割当（予測・正誤フラグ含む）。
-- `*_verification_node_avg.png`：検証データの centroid 図。
-- ラベル分布ヒートマップ（検証）。
+3. **難ラベル（2B, 2C, 3C, 3D, 5, 6x）**  
+   これらは（i）多様性が大きく境界が曖昧，（ii）サンプル希少，（iii）単一変数 SLP では判別根拠が弱い，の複合要因がある．SOM 単独では分離が難しく，風ベクトル・温位・渦度等の多変量化，季節正規化・面積重み等の前処理強化が必要である（Takasuka et al., 2024；Jiang, 2013）．
+
+4. **SSIM の窓とコントラスト**  
+   SSIM5 は局所窓により等圧線の曲率・コアのコントラストを反映でき，SSIM を上回った．Doan（2021）の S‑SOM の結果とも整合的であり，BMU 探索における「構造の扱い」がクラスタ品質に直結する．
+
+5. **汎化と頑健性**  
+   検証年（2000 年）で S1+SSIM が最良となったのは，年変動に伴う勾配強度・中心位置の揺らぎを両者の併合が吸収したためと解釈できる．S1 単独は学習内では最良だが，年別では構造のドリフトに敏感な傾向がある．
 
 ---
 
-## 今後の拡張（設計上のオプション）
+## 11. まとめ（Conclusions）
 
-- **前処理**：日別の季節正規化（平均・標準偏差）と面積重み（緯度依存）を導入し、季節振幅・緯度面積のバイアスを低減。
-- **評価指標**：シルエット係数・トポロジカルエラー（Doan 2021）や Jensen–Shannon 距離（Winderlich 2024；頻度・遷移・持続）を追加。
-- **自動クラスタ**：SSIM しきい値に基づく HAC→k‑medoids（Winderlich）の導入や、SOM とのハイブリッド運用。
-- **多変量化**：風ベクトル・相当温位・渦度傾度・気温偏差などを併用し、梅雨・台風など多様パターンの識別力を強化。
-- **季節別学習・領域拡張**：季節別 SOM、領域の可変化（国内/東アジア/北半球）による一般性の検証。
+- GPU Batch‑SOM を共通基盤に，距離 5 方式を厳密比較した結果，**検証年の Macro Recall（基本）で S1+SSIM が最良（0.3501）**，学習では S1 が最良（0.3466）であった．SSIM5 は SSIM を一貫して上回り，局所窓の有効性を確認した．
+- ラベル別には 1（冬型），3B（西風系）が高再現，4A（移動性高気圧）は方式により改善しうる一方，2B/2C/3C/3D/5 と 6x は依然低く，多変量化と前処理強化が必要である．
+- centroid に加え medoid/true‑medoid を標準出力とする可視化は，代表性・解釈性を高め，運用上の検索・事例同定に有用である．
+
+---
+
+## 12. 今後の改善（Future Work）
+
+- **前処理強化**：日別季節正規化（日付ごとの μ・σ による標準化），緯度面積重み（cosφ），高緯度の安定化を導入し，季節振幅・面積のバイアスを低減．
+- **評価指標の拡充**：シルエット係数・トポロジカルエラー（Doan 2021）を追加し，SOM 配置の品質を定量化．参照分類に対する**Jensen–Shannon 距離（頻度・遷移・持続）**を導入し，循環表現の総合評価を実装（Winderlich 2024）．
+- **自動クラスタとハイブリッド**：SSIM 閾値に基づく **HAC→k‑medoids** を組み込み，クラス数を自動決定しつつ希少型を保持．SOM とのハイブリッド（SOM で粗分割 →HAC/k‑medoids で洗練）を検討．
+- **多変量化**：SLP に加え，10m 風ベクトル・相当温位・渦度傾度・地衡風・気温偏差等を統合した**多変量 S‑SOM**を実装し，梅雨・台風・前線型の識別力を補強．
+- **季節別・領域別運用**：季節別 SOM（DJF/MAM/JJA/SON）で季節性を陽に分離し，東アジア／北半球への領域拡張と汎化検証を行う．
+- **オープンサイエンスと再現性**：コード・設定・前処理・出力テンプレートを公開し，再現性パッケージ化．成果物（CSV/PNG/JSON/LOG）の自動カタログ化とドキュメント整備．
+
+> 付記：本稿で用いた成果物（例）  
+> `*_iteration_metrics.csv/png`（QE・MacroRecall・一致率の推移），`*_assign_all.csv`（BMU 割当），`*_som_node_avg_all.png`（centroid），`*_som_node_medoid_all.png`／`*_som_node_true_medoid_all.png`（代表パターン），`*_node_medoids.csv`／`*_node_true_medoids.csv`（代表メタ情報），`*_nodewise_analysis_match.png`（一致可視化），`*_confusion_matrix_all.csv`（学習混同行列），`*_label_dist_*.png`（分布ヒートマップ），`node_majorities.json`（学習ノード代表）．検証側は `*_verification_*` として同様に出力する．
 
 ---
 
 ## 参考文献
 
-1. 木村広希, 川島英之, 日下博幸, & 北川博之. (2009). サポートベクターマシンを用いた気圧配置検出手法の提案 ── 西高東低冬型を対象として ──. 地理学評論 Series A, 82(4), 323-331.
+1. 木村 広希, 川島 英之, 北川 博之 (2009): サポートベクターマシンを用いた気圧配置の自動分類. DEIM Forum 2009, B6-1.（関連：木村・川島・北川 (2008) DEWS など）
 
 2. 高須賀 匠, 高野 雄紀, 渡邊 正太郎, & 雲居 玄道. (2024). 自己組織化マップを用いた気圧配置のクラスタリングと 1km メッシュ天気データによる分析. 情報処理学会全国大会.
 
-3. Philippopoulos, K., Deligiorgi, D., & Kouroupetroglou, G. (2014). Performance comparison of self-organizing maps and k-means clustering techniques for atmospheric circulation classification. methods, 13, 14.
+3. Philippopoulos, K., Deligiorgi, D., and Kouroupetroglou, G. (2014):Performance Comparison of Self-Organizing Maps and k-means Clustering Techniques for Atmospheric Circulation Classification. International Journal of Energy and Environment, 8, 171–180.
 
 4. Jiang, N., Dirks, K. N., & Luo, K. (2013). Classification of synoptic weather types using the self-organising map and its application to climate and air quality data visualisation. Weather and Climate, 33, 52-75.
 
@@ -297,3 +335,171 @@
 - **SSIM**：構造類似度。輝度・コントラスト・構造（共分散）を同時に比較。
 - **S1**：Teweles–Wobus スコア。水平方向/南北方向の勾配差を正規化比で評価。
 - **medoid**：クラスタ内の「最も代表的な実サンプル」。centroid と異なり平均化の影響を受けにくい。
+
+## 付録（計算式：tex）
+
+本付録では，本研究の実装（main_v4.py／minisom.py）で用いた 5 種の距離（EUC／SSIM／SSIM5／S1／S1+SSIM）の計算式を，コードと一致する形で LaTeX 記法で整理する．
+対象は海面更正気圧の偏差場（各サンプルで空間平均を差し引いた hPa の 2 次元配列）であり，以下の記号を用いる．
+
+- 格子領域：Ω（画素数 |Ω| = H×W）
+- サンプル（観測／入力）: x(s), プロトタイプ（SOM ノード重み）: w(s), s∈Ω
+- 画素平均・分散・共分散：
+  μ*x = (1/|Ω|)∑*{s∈Ω} x(s), σ*x^2 = (1/|Ω|)∑*{s∈Ω} (x(s)-μ*x)^2, Cov(x,w) = (1/|Ω|)∑*{s∈Ω} (x(s)-μ_x)(w(s)-μ_w)
+- 数値安定化用の極小量：ε = 10^{-12}
+- 5×5 平均フィルタ核：K\_{5×5} = (1/25)・全要素 1 の 5×5 カーネル（畳み込みは反射パディング）
+
+以下，いずれも「距離」を返す関数 d(・,・) を定義する（SOM の BMU 探索やメドイド選定で使用）．SSIM 系は実装通り「1 − SSIM」を距離とする．
+
+---
+
+### 1) Euclidean（ユークリッド距離，EUC）
+
+実装: minisom.\_euclidean_distance_batch/\_euclidean_to_ref
+
+二乗和の平方根（数値安定化のため sqrt 内に ε を付与）．
+\[
+d*{\mathrm{EUC}}(x,w)
+= \left( \sum*{s\in\Omega} \bigl(x(s)-w(s)\bigr)^2 \right)^{1/2}
+= \sqrt{ \sum\_{s\in\Omega} \bigl(x(s)-w(s)\bigr)^2 + \varepsilon }.
+\]
+
+---
+
+### 2) SSIM（全体 1 窓，C1=C2=10^{-8}）
+
+実装: minisom.\_ssim_distance_batch/\_ssim_global_to_ref（定数 c1=c2=1e-8）
+
+中心化量を
+\(
+\tilde{x}(s)=x(s)-\mu*x,\ \tilde{w}(s)=w(s)-\mu_w
+\)
+とすると，
+\[
+\begin{aligned}
+\mathrm{SSIM}*{\mathrm{global}}(x,w)
+&= \frac{\bigl(2\,\mu*x \mu_w + C_1\bigr)\,\bigl(2\,\mathrm{Cov}(x,w) + C_2\bigr)}
+{\bigl(\mu_x^2 + \mu_w^2 + C_1\bigr)\,\bigl(\sigma_x^2 + \sigma_w^2 + C_2\bigr) + \varepsilon},\\
+d*{\mathrm{SSIM}}(x,w)
+&= 1 - \mathrm{SSIM}_{\mathrm{global}}(x,w),
+\end{aligned}
+\]
+ただし
+\(
+\mathrm{Cov}(x,w)=\frac{1}{|\Omega|}\sum_{s\in\Omega}\tilde{x}(s)\tilde{w}(s)
+\),
+\(C_1=C_2=10^{-8}\)．
+
+注）本式は Wang et al. (2004) の SSIM を「1 窓＝画像全体」で評価した形に一致し，Doan et al. (2021) の S‑SOM で用いられる SSIM の基本形と整合する（本実装は Winderlich et al. (2024) が推奨する小さな定数を採用）．
+
+---
+
+### 3) SSIM5（5×5 移動窓 SSIM，C1=C2=0，分母に ε）
+
+実装: minisom.\_ssim5_distance_batch/\_ssim5_to_ref（5×5 平均畳み込み，反射パディング，C1=C2=0，分母に ε，分散は 0 でクリップ）
+
+各画素 s に対して，5×5 平均により
+\[
+\begin{aligned}
+\mu*x(s) &= (K*{5\times5} _ x)(s),\quad
+\mu*w(s) = (K*{5\times5} _ w)(s),\\
+\mu*{x^2}(s) &= (K*{5\times5} _ x^2)(s),\quad
+\mu*{w^2}(s) = (K*{5\times5} _ w^2)(s),\\
+\mu*{xw}(s) &= (K*{5\times5} \* (x\cdot w))(s),
+\end{aligned}
+\]
+とおき，
+\[
+\begin{aligned}
+\sigma*x^2(s) &= \max\bigl\{\mu*{x^2}(s)-\mu*x(s)^2,\ 0\bigr\},\quad
+\sigma_w^2(s) = \max\bigl\{\mu*{w^2}(s)-\mu*w(s)^2,\ 0\bigr\},\\
+\mathrm{Cov}(x,w)(s) &= \mu*{xw}(s) - \mu*x(s)\mu_w(s).
+\end{aligned}
+\]
+このとき局所 SSIM マップ（C1=C2=0）は
+\[
+\mathrm{SSIM}*{\mathrm{loc}}(s)
+= \frac{\bigl(2\,\mu*x(s)\mu_w(s)\bigr)\,\bigl(2\,\mathrm{Cov}(x,w)(s)\bigr)}
+{\bigl(\mu_x(s)^2+\mu_w(s)^2\bigr)\,\bigl(\sigma_x^2(s)+\sigma_w^2(s)\bigr) + \varepsilon}.
+\]
+画像全体の SSIM はその空間平均：
+\[
+\mathrm{SSIM}*{5\times5}(x,w) = \frac{1}{|\Omega|}\sum*{s\in\Omega} \mathrm{SSIM}*{\mathrm{loc}}(s),
+\qquad
+d*{\mathrm{SSIM5}}(x,w) = 1 - \mathrm{SSIM}*{5\times5}(x,w).
+\]
+
+注）Doan et al. (2021)（S‑SOM）は C1=C2=0 とし，分母に数値安定化項 ε を付与した移動窓 SSIM を採用しており，本実装はこれに一致する．
+
+---
+
+### 4) S1（Teweles–Wobus スコア）
+
+実装: minisom.\_s1_distance_batch/\_s1_to_ref（前進差分，x/y 方向の格子「辺」上で和を評価，分母は成分ごとに max をとる，最後に 100 を乗ずる）
+
+格子の経度・緯度方向の前進差分を
+\[
+\Delta*x x(i,j) = x(i,j+1)-x(i,j),\quad
+\Delta_y x(i,j) = x(i+1,j)-x(i,j)
+\]
+（w も同様）と定義し，それぞれの全「辺」集合を \(E_x, E_y\) とする．すると，
+\[
+\begin{aligned}
+\mathrm{num}\_x &= \sum*{(i,j)\in E*x} \left| \Delta_x x(i,j) - \Delta_x w(i,j) \right|,\quad
+\mathrm{num}\_y = \sum*{(i,j)\in E*y} \left| \Delta_y x(i,j) - \Delta_y w(i,j) \right|,\\
+\mathrm{den}\_x &= \sum*{(i,j)\in E*x} \max\!\left( \left|\Delta_x x(i,j)\right|,\ \left|\Delta_x w(i,j)\right| \right),\\
+\mathrm{den}\_y &= \sum*{(i,j)\in E*y} \max\!\left( \left|\Delta_y x(i,j)\right|,\ \left|\Delta_y w(i,j)\right| \right).
+\end{aligned}
+\]
+Teweles–Wobus の S1 は
+\[
+S1(x,w) = 100 \times \frac{\mathrm{num}\_x+\mathrm{num}\_y}{\mathrm{den}\_x+\mathrm{den}\_y + \varepsilon},
+\qquad
+d*{\mathrm{S1}}(x,w) = S1(x,w).
+\]
+
+注）S1 は水平方向の勾配差に基づく正規化指標であり，Sato & Kusaka (2021) が SLP パターン選択で高性能であることを示した．本実装はその標準形（TW 指数）に一致する．
+
+---
+
+### 5) S1+SSIM（等重み融合距離；min–max 正規化後の平均）
+
+実装: minisom.\_distance_batch における 's1ssim'（BMU 探索），および medoid 選定関数（compute_node_medoids_by_centroid／compute_node_true_medoids）での融合．
+
+二つの距離
+\(
+d*{\mathrm{S1}}(x,w),\ d*{\mathrm{SSIM5}}(x,w)
+\)
+を「同一の比較集合内」で min–max 正規化したうえで等重み平均する．
+
+- BMU 探索（1 サンプル x に対し，全ノード j=1,\dots,m の距離を並べる場合）：
+  \[
+  \begin{aligned}
+  &d^{(j)}_1 = d_{\mathrm{S1}}(x,w*j),\quad
+  d^{(j)}\_2 = d*{\mathrm{SSIM5}}(x,w*j),\\
+  &\tilde d^{(j)}\_1 = \frac{d^{(j)}\_1 - \min*{k} d^{(k)}_1}{\max_{k} d^{(k)}_1 - \min_{k} d^{(k)}_1 + \varepsilon},\quad
+  \tilde d^{(j)}\_2 = \frac{d^{(j)}\_2 - \min_{k} d^{(k)}_2}{\max_{k} d^{(k)}_2 - \min_{k} d^{(k)}_2 + \varepsilon},\\
+  &d_{\mathrm{S1+SSIM}}(x,w_j) = \alpha\,\tilde d^{(j)}\_1 + (1-\alpha)\,\tilde d^{(j)}\_2,\qquad \alpha=0.5.
+  \end{aligned}
+  \]
+
+- ノード内 true‑medoid の行列融合（候補 i の行に対し，列 j 方向で正規化する場合）：
+  \[
+  \begin{aligned}
+  &D*1(i,j)=d*{\mathrm{S1}}(x*i,x_j),\quad D_2(i,j)=d*{\mathrm{SSIM5}}(x*i,x_j),\\
+  &\tilde D_1(i,j)=\frac{D_1(i,j)-\min*{j} D*1(i,j)}{\max*{j} D*1(i,j)-\min*{j} D*1(i,j)+\varepsilon},\quad
+  \tilde D_2(i,j)=\frac{D_2(i,j)-\min*{j} D*2(i,j)}{\max*{j} D*2(i,j)-\min*{j} D_2(i,j)+\varepsilon},\\
+  &D(i,j)=\alpha\,\tilde D_1(i,j) + (1-\alpha)\,\tilde D_2(i,j),\qquad \alpha=0.5.
+  \end{aligned}
+  \]
+  （i 行の総和 \(\sum_j D(i,j)\) が最小の i を true‑medoid とする．）
+
+注）融合は常に「比較集合内（BMU では全ノード，medoid では候補集合）」での min–max 正規化 → 等重み平均（α=0.5）であり，コードの実装と一致する．
+
+---
+
+【参考と整合性】
+
+- SSIM（全体 1 窓）は Wang et al. (2004) の定義に基づき，Winderlich et al. (2024) 等で推奨される小定数（C1=C2=10^{-8}）を用いた実装に一致．
+- SSIM5（5×5 移動窓）は Doan et al. (2021)（S‑SOM）の仕様（C1=C2=0，分母に ε）に準拠し，局所平均は反射パディングの 5×5 平均フィルタで計算（実装どおり分散は 0 でクリップ）．
+- S1 は Teweles–Wobus 指数の標準形（差分の絶対値と分母の max 和，×100）を用い，Sato & Kusaka (2021) で高精度だった設定に一致．
+- S1+SSIM は実装どおり sample（または行）内 min–max 正規化の等重み平均．
