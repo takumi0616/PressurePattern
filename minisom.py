@@ -26,7 +26,6 @@ class MiniSom:
     PyTorch GPU版 SOM（batchSOM）
       - activation_distance:
           'euclidean'（ユークリッド）
-          'ssim'     （全体1窓の簡略SSIM）
           'ssim5'    （論文仕様に近い 5x5 窓・C=0 のSSIM：移動窓平均）
           's1'       （Teweles–Wobus S1）
           's1ssim'   （S1とSSIM(5x5)の融合距離：サンプル毎min-max正規化後の等重み和）
@@ -82,8 +81,8 @@ class MiniSom:
 
         # 距離タイプ
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim', 'ssim5', 's1ssim'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim","ssim5","s1ssim"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -104,9 +103,6 @@ class MiniSom:
         if self.neighborhood_function != 'gaussian':
             self.neighborhood_function = 'gaussian'
 
-        # SSIM定数（簡略SSIM用：安定化）
-        self.c1 = 1e-8
-        self.c2 = 1e-8
 
         # 5x5移動窓SSIM用カーネル（平均フィルタ）
         self._kernel5: Optional[Tensor] = None
@@ -185,41 +181,6 @@ class MiniSom:
         d2 = x2 + w2 - 2 * cross
         d2 = torch.clamp(d2, min=0.0)
         return torch.sqrt(d2 + 1e-12)
-
-    @torch.no_grad()
-    def _ssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
-        """
-        簡略SSIM（全体1窓）
-        Xb: (B,H,W)
-        戻り: (B,m) の "距離" = 1 - SSIM
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        B, H, W = Xb.shape
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-
-        mu_x = Xb.mean(dim=(1, 2))                  # (B,)
-        Xc = Xb - mu_x.view(B, 1, 1)
-        var_x = (Xc * Xc).mean(dim=(1, 2))          # (B,)
-
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            Wc = self.weights[start:end]                       # (Mc,H,W)
-            mu_w = Wc.mean(dim=(1, 2))                         # (Mc,)
-            Wc2 = Wc - mu_w.view(-1, 1, 1)
-            var_w = (Wc2 * Wc2).mean(dim=(1, 2))               # (Mc,)
-
-            cov = (Xc.unsqueeze(1) * Wc2.unsqueeze(0)).mean(dim=(2, 3))  # (B,Mc)
-
-            l_num = (2 * mu_x.view(B, 1) * mu_w.view(1, -1) + self.c1)
-            l_den = (mu_x.view(B, 1) ** 2 + mu_w.view(1, -1) ** 2 + self.c1)
-            c_num = (2 * cov + self.c2)
-            c_den = (var_x.view(B, 1) + var_w.view(1, -1) + self.c2)
-            ssim = (l_num * c_num) / (l_den * c_den + 1e-12)
-            dist = 1.0 - ssim
-            out[:, start:end] = dist
-
-        return out
 
     @torch.no_grad()
     def _ensure_kernel5(self):
@@ -317,8 +278,6 @@ class MiniSom:
             return self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'euclidean':
             return self._euclidean_distance_batch(Xb)
-        elif self.activation_distance == 'ssim':
-            return self._ssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'ssim5':
             return self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 's1ssim':
@@ -349,23 +308,6 @@ class MiniSom:
         d2 = (diff * diff).sum(dim=(1, 2))
         return torch.sqrt(d2 + 1e-12)
 
-    @torch.no_grad()
-    def _ssim_global_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
-        # 1 - SSIM（全体1窓）
-        B, H, W = Xb.shape
-        mu_x = Xb.mean(dim=(1, 2))              # (B,)
-        xc = Xb - mu_x.view(B, 1, 1)
-        var_x = (xc * xc).mean(dim=(1, 2))      # (B,)
-        mu_r = ref.mean()
-        rc = ref - mu_r
-        var_r = (rc * rc).mean()
-        cov = (xc * rc.view(1, H, W)).mean(dim=(1, 2))  # (B,)
-        l_num = (2 * mu_x * mu_r + self.c1)
-        l_den = (mu_x ** 2 + mu_r ** 2 + self.c1)
-        c_num = (2 * cov + self.c2)
-        c_den = (var_x + var_r + self.c2)
-        ssim = (l_num * c_num) / (l_den * c_den + 1e-12)
-        return 1.0 - ssim
 
     @torch.no_grad()
     def _ssim5_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -419,8 +361,6 @@ class MiniSom:
         """
         if self.activation_distance == 'euclidean':
             return self._euclidean_to_ref(Xb, ref)
-        elif self.activation_distance == 'ssim':
-            return self._ssim_global_to_ref(Xb, ref)
         elif self.activation_distance == 'ssim5':
             return self._ssim5_to_ref(Xb, ref)
         elif self.activation_distance == 's1':

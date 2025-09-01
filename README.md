@@ -5,7 +5,7 @@
 ## プログラム実行
 
 ```bash
-notify-run -- nohup python main_v4.py > main_v4.log 2>&1 &
+notify-run wsl-ubuntu -- nohup python main_v4.py > main_v4.log 2>&1 &
 ```
 
 ## タスクの削除

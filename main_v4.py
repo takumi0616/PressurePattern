@@ -38,7 +38,7 @@ BATCH_SIZE = 128
 NODES_CHUNK = 4 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
-SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（100区切り）
+SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 
 # データ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -59,9 +59,6 @@ BASE_LABELS = [
     '1', '2A', '2B', '2C', '2D', '3A', '3B', '3C', '3D', '4A', '4B', '5', '6A', '6B', '6C'
 ]
 
-# SSIMの定数（ミニソムに合わせる）
-SSIM_C1 = 1e-8
-SSIM_C2 = 1e-8
 
 # =====================================================
 # 再現性・ログ
@@ -500,16 +497,18 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
             ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
             ax.set_extent([115, 155, 15, 55], ccrs.PlateCarree())
             ax.text(0.02,0.96,f'({ix},{iy}) N={counts[ix,iy]}', transform=ax.transAxes,
-                    fontsize=7, va='top', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+                    fontsize=9, va='top', bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
             ax.set_xticks([]); ax.set_yticks([])
             last_cf=cf
     if last_cf is not None:
-        fig.subplots_adjust(right=0.88, top=0.94)
-        cax = fig.add_axes([0.90, 0.12, 0.02, 0.72])
-        fig.colorbar(last_cf, cax=cax, label='Sea Level Pressure Anomaly (hPa)')
-    plt.suptitle(title, fontsize=14)
-    plt.tight_layout(rect=[0,0,0.88,0.94])
-    plt.savefig(save_path, dpi=300)
+        # よりコンパクトな余白と大きめの色バー文字
+        fig.subplots_adjust(left=0.04, right=0.88, top=0.95, bottom=0.04, wspace=0.05, hspace=0.05)
+        cax = fig.add_axes([0.90, 0.12, 0.02, 0.76])
+        cb = fig.colorbar(last_cf, cax=cax, label='Sea Level Pressure Anomaly (hPa)')
+        cb.ax.tick_params(labelsize=12)
+        cb.set_label('Sea Level Pressure Anomaly (hPa)', fontsize=42)
+    plt.suptitle(title, fontsize=42, fontweight='bold')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -569,7 +568,12 @@ def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
     for idx,lbl in enumerate(base_labels):
         r = idx//cols; c=idx%cols
         ax = axes[r,c]
-        im = ax.imshow(node_counts[lbl].T[::-1,:], cmap='viridis')
+        # SOMノードグリッドを90度右回転（現在の「左」を「上」に）
+        arr = node_counts[lbl]
+        arr_rot = np.rot90(arr, -1)  # 90° clockwise
+        local_max = int(arr_rot.max()) if arr_rot.size > 0 else 0
+        vmax_local = local_max if local_max > 0 else 1
+        im = ax.imshow(arr_rot, cmap='viridis', origin='upper', interpolation='nearest', aspect='equal', vmin=0, vmax=vmax_local)
         ax.set_title(lbl); ax.set_xticks([]); ax.set_yticks([])
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     for k in range(len(base_labels), rows*cols):
@@ -597,7 +601,10 @@ def save_label_distributions_base_individual(winners_xy, labels_raw: List[Option
     for lbl in base_labels:
         fig = plt.figure(figsize=(4, 3))
         ax = plt.gca()
-        im = ax.imshow(node_counts[lbl].T[::-1,:], cmap='viridis')
+        # SOMノードグリッドを90度右回転（現在の「左」を「上」に）
+        arr = node_counts[lbl]
+        arr_rot = np.rot90(arr, -1)  # 90° clockwise
+        im = ax.imshow(arr_rot, cmap='viridis', origin='upper', interpolation='nearest', aspect='equal', vmin=0)
         ax.set_title(lbl)
         ax.set_xticks([]); ax.set_yticks([])
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -750,7 +757,7 @@ def log_som_recall_by_label_with_nodes(
 
 
 # =====================================================
-# medoid（ノード重心に最も近いサンプル）を計算・保存する処理
+# True Medoid / 距離計算ユーティリティ（SSIM/S1等）
 # =====================================================
 def _euclidean_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     # Xb: (B,H,W), ref: (H,W) -> (B,)
@@ -759,22 +766,6 @@ def _euclidean_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(d2 + 1e-12)
 
 
-def _ssim_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor, c1: float = SSIM_C1, c2: float = SSIM_C2) -> torch.Tensor:
-    # 1 - SSIM (全体1窓の簡略SSIM)
-    B,H,W = Xb.shape
-    mu_x = Xb.mean(dim=(1,2))              # (B,)
-    xc = Xb - mu_x.view(B,1,1)
-    var_x = (xc*xc).mean(dim=(1,2))        # (B,)
-    mu_r = ref.mean()
-    rc = ref - mu_r
-    var_r = (rc*rc).mean()                 # scalar
-    cov = (xc * rc.view(1,H,W)).mean(dim=(1,2))  # (B,)
-    l_num = (2*mu_x*mu_r + c1)
-    l_den = (mu_x**2 + mu_r**2 + c1)
-    c_num = (2*cov + c2)
-    c_den = (var_x + var_r + c2)
-    ssim = (l_num*c_num) / (l_den*c_den + 1e-12)
-    return 1.0 - ssim
 
 
 def _ssim5_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -827,67 +818,6 @@ def _s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     den_dy = torch.maximum(torch.abs(dXdy), torch.abs(dRdy).view(1, *dRdy.shape)).sum(dim=(1,2))
     s1 = 100.0 * (num_dx + num_dy) / (den_dx + den_dy + 1e-12)
     return s1
-
-
-def compute_node_medoids_by_centroid(
-    method_name: str,
-    data_flat: np.ndarray,          # (N,D) hPa偏差（空間平均差し引き）
-    winners_xy: np.ndarray,         # (N,2)
-    som_shape: Tuple[int,int],
-    field_shape: Tuple[int,int],
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-) -> Tuple[Dict[Tuple[int,int], int], Dict[Tuple[int,int], float]]:
-    """
-    各ノードの「重心（平均画像）」に最も近いサンプルを、方式別距離で選ぶ。
-    戻り値:
-      - node_to_medoid_idx: {(ix,iy): sample_index}
-      - node_to_medoid_dist: {(ix,iy): distance_value}
-    """
-    H,W = field_shape
-    X2 = data_flat.reshape(-1, H, W)
-    X_t = torch.as_tensor(X2, device=device, dtype=torch.float32)
-
-    node_to_medoid_idx: Dict[Tuple[int,int], int] = {}
-    node_to_medoid_dist: Dict[Tuple[int,int], float] = {}
-
-    for ix in range(som_shape[0]):
-        for iy in range(som_shape[1]):
-            mask = (winners_xy[:,0]==ix) & (winners_xy[:,1]==iy)
-            idxs = np.where(mask)[0]
-            if len(idxs) == 0:
-                continue
-            # 重心（平均画像）
-            centroid = np.nanmean(X2[idxs], axis=0).astype(np.float32)  # (H,W)
-            centroid_t = torch.as_tensor(centroid, device=device, dtype=torch.float32)
-            # 距離
-            Xb = X_t[idxs]  # (B,H,W)
-            if method_name == 'euclidean':
-                d = _euclidean_dist_to_ref(Xb, centroid_t)
-            elif method_name == 'ssim':
-                d = _ssim_dist_to_ref(Xb, centroid_t)
-            elif method_name == 'ssim5':
-                d = _ssim5_dist_to_ref(Xb, centroid_t)
-            elif method_name == 's1':
-                d = _s1_dist_to_ref(Xb, centroid_t)
-            elif method_name == 's1ssim':
-                d1 = _s1_dist_to_ref(Xb, centroid_t)
-                d2 = _ssim5_dist_to_ref(Xb, centroid_t)
-                min1, _ = torch.min(d1, dim=0, keepdim=True)
-                max1, _ = torch.max(d1, dim=0, keepdim=True)
-                min2, _ = torch.min(d2, dim=0, keepdim=True)
-                max2, _ = torch.max(d2, dim=0, keepdim=True)
-                dn1 = (d1 - min1) / (max1 - min1 + 1e-12)
-                dn2 = (d2 - min2) / (max2 - min2 + 1e-12)
-                d = 0.5 * (dn1 + dn2)
-            else:
-                raise ValueError(f'Unknown method_name: {method_name}')
-            # 最小
-            pos = int(torch.argmin(d).item())
-            node_to_medoid_idx[(ix,iy)] = int(idxs[pos])
-            node_to_medoid_dist[(ix,iy)] = float(d[pos].item())
-
-    return node_to_medoid_idx, node_to_medoid_dist
-
 
 def compute_node_true_medoids(
     method_name: str,
@@ -945,8 +875,6 @@ def compute_node_true_medoids(
             # 距離行列 D (C,C) を作る
             if method_name == 'euclidean':
                 D = pairwise_euclidean(Xcand)
-            elif method_name == 'ssim':
-                D = pairwise_by_ref(lambda Xb, ref: _ssim_dist_to_ref(Xb, ref), Xcand)
             elif method_name == 'ssim5':
                 D = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
             elif method_name == 's1':
@@ -986,7 +914,7 @@ def plot_som_node_medoid_patterns(
     title: str
 ):
     """
-    ノードmedoid（重心に最も近いサンプル）のマップを保存
+    ノードのメドイド（代表サンプル）のマップを保存（標準は True Medoid）
     各サブプロットのタイトルを (x,y)_YYYY/MM/DD にする。
     """
     H, W = len(lat), len(lon)
@@ -1024,12 +952,14 @@ def plot_som_node_medoid_patterns(
             last_cf = cf
 
     if last_cf is not None:
-        fig.subplots_adjust(right=0.88, top=0.94)
-        cax = fig.add_axes([0.90, 0.12, 0.02, 0.72])
-        fig.colorbar(last_cf, cax=cax, label='Sea Level Pressure Anomaly (hPa)')
-    plt.suptitle(title, fontsize=14)
-    plt.tight_layout(rect=[0,0,0.88,0.94])
-    plt.savefig(save_path, dpi=300)
+        # よりコンパクトな余白と大きめの色バー文字
+        fig.subplots_adjust(left=0.04, right=0.88, top=0.95, bottom=0.04, wspace=0.05, hspace=0.05)
+        cax = fig.add_axes([0.90, 0.12, 0.02, 0.76])
+        cb = fig.colorbar(last_cf, cax=cax, label='Sea Level Pressure Anomaly (hPa)')
+        cb.ax.tick_params(labelsize=12)
+        cb.set_label('Sea Level Pressure Anomaly (hPa)', fontsize=42)
+    plt.suptitle(title, fontsize=42, fontweight='bold')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -1061,12 +991,14 @@ def save_each_node_medoid_image(
             ax.contour(lon, lat, pat, levels=levels, colors='k', linewidths=0.3, transform=ccrs.PlateCarree())
             ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.8, edgecolor='black')
             ax.set_extent([115, 155, 15, 55], ccrs.PlateCarree())
-            plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label='Sea Level Pressure Anomaly (hPa)')
-            ax.set_title(f'Medoid ({ix},{iy}) sample={mi}')
+            cb = plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04, label='Sea Level Pressure Anomaly (hPa)')
+            cb.ax.tick_params(labelsize=11)
+            cb.set_label('Sea Level Pressure Anomaly (hPa)', fontsize=13)
+            ax.set_title(f'Medoid ({ix},{iy}) sample={mi}', fontsize=12)
             ax.set_xticks([]); ax.set_yticks([])
             fpath = os.path.join(out_dir, f'{prefix}_node_{ix}_{iy}_medoid.png')
-            plt.tight_layout()
-            plt.savefig(fpath, dpi=180)
+            plt.tight_layout(pad=0.5)
+            plt.savefig(fpath, dpi=200, bbox_inches='tight')
             plt.close(fig)
 
 
@@ -1082,7 +1014,7 @@ def plot_nodewise_match_map(
     """
     各ノードについて、
       - ノード内の最頻出ラベル（元ラベル、複合含む）= majority
-      - medoid の元ラベル
+      - medoid（True Medoid）の元ラベル
     が一致すれば「薄い緑」でノード四角を塗り、不一致なら「薄い赤」にする。
     N, majority, medoid, date(YYYY/MM/DD) を少し大きめに表示。
     """
@@ -1370,7 +1302,7 @@ def evaluate_verification_with_training_majority(
 def run_one_method_learning(method_name, activation_distance, data_all, labels_all, times_all,
                             field_shape, lat, lon, out_dir):
     """
-    学習（learning）：method_name: 'euclidean' | 'ssim' | 's1'
+    学習（learning）：method_name: 'euclidean' | 'ssim5' | 's1' | 's1ssim'
     activation_distance: 同上
     data_all は「空間平均を引いた偏差[hPa]」（N,D）
     """
@@ -1446,16 +1378,17 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
             title=f"[{method_name.upper()}] Iteration={current_iter} Evaluation (Base labels)"
         )
 
-        # 追加: 現時点のmedoidを再計算して、match rate を算出
-        node_to_medoid_idx_now, _ = compute_node_medoids_by_centroid(
+        # 追加: 現時点の True Medoid を再計算して、match rate を算出
+        node_to_true_medoid_idx_now, _ = compute_node_true_medoids(
             method_name=method_name,
             data_flat=data_all, winners_xy=winners_now,
-            som_shape=(SOM_X, SOM_Y), field_shape=field_shape
+            som_shape=(SOM_X, SOM_Y), field_shape=field_shape,
+            fusion_alpha=0.5
         )
         match_rate_now, matched_nodes_now, counted_nodes_now = compute_nodewise_match_rate(
             winners_xy=winners_now,
             labels_all=labels_all,
-            node_to_medoid_idx=node_to_medoid_idx_now,
+            node_to_medoid_idx=node_to_true_medoid_idx_now,
             som_shape=(SOM_X, SOM_Y)
         )
 
@@ -1524,35 +1457,6 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         winners_all, labels_all, BASE_LABELS, (SOM_X, SOM_Y)
     )
 
-    # ===== ノードmedoid（重心に最も近いサンプル） =====
-    node_to_medoid_idx, node_to_medoid_dist = compute_node_medoids_by_centroid(
-        method_name=method_name,
-        data_flat=data_all, winners_xy=winners_all,
-        som_shape=(SOM_X, SOM_Y), field_shape=field_shape
-    )
-
-    # ○×可視化（背景色で一致/不一致を表現、日付も表示）
-    medoid_bigmap = os.path.join(out_dir, f'{method_name}_som_node_medoid_all.png')
-    plot_som_node_medoid_patterns(
-        data_flat=data_all,
-        node_to_medoid_idx=node_to_medoid_idx,
-        lat=lat, lon=lon, som_shape=(SOM_X, SOM_Y),
-        times_all=times_all,
-        save_path=medoid_bigmap,
-        title=f'{method_name.upper()} SOM Node Medoid (closest-to-centroid)'
-    )
-    log.write(f'Node medoid map (all) -> {medoid_bigmap}\n')
-
-    # 各ノードmedoid個別図
-    pernode_medoid_dir = os.path.join(out_dir, f'{method_name}_pernode_medoid_all')
-    save_each_node_medoid_image(
-        data_flat=data_all,
-        node_to_medoid_idx=node_to_medoid_idx,
-        lat=lat, lon=lon, som_shape=(SOM_X, SOM_Y),
-        out_dir=pernode_medoid_dir, prefix='all'
-    )
-    log.write(f'Per-node medoid images (all) -> {pernode_medoid_dir}\n')
-
     # ===== True Medoid（総距離最小）も計算・保存 =====
     node_to_true_medoid_idx, node_to_true_medoid_avgdist = compute_node_true_medoids(
         method_name=method_name,
@@ -1601,48 +1505,17 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
     pd.DataFrame(rows_true).to_csv(true_medoid_csv, index=False, encoding='utf-8-sig')
     log.write(f'Node true medoid CSV -> {true_medoid_csv}\n')
 
-    # medoid選定結果のCSV（labelは基本ラベル or None、rawは元ラベル）
-    rows = []
-    for (ix, iy), mi in sorted(node_to_medoid_idx.items()):
-        t_str = format_date_yyyymmdd(times_all[mi]) if len(times_all)>0 else ''
-        raw = labels_all[mi] if labels_all is not None else ''
-        label_base_or_none = basic_label_or_none(raw, BASE_LABELS)
-        dist = node_to_medoid_dist.get((ix,iy), np.nan)
-        majority_raw = node_to_majority_raw.get((ix,iy), None)
-        match = (raw == majority_raw) if (raw is not None and majority_raw is not None) else False
-        rows.append({
-            'node_x': ix, 'node_y': iy, 'node_flat': ix*SOM_Y+iy,
-            'medoid_index': mi, 'time': t_str,
-            'label_raw': raw,           # 元ラベル（複合含む）
-            'label': label_base_or_none,  # 基本ラベル or None（複合なら None）
-            'majority_label': majority_raw,      # 互換性維持：ノードの代表ラベル（元ラベル）
-            'representative_label': majority_raw, # 別名（代表ラベル）も追加
-            'match': match,
-            'distance': dist
-        })
-    medoid_csv = os.path.join(out_dir, f'{method_name}_node_medoids.csv')
-    pd.DataFrame(rows).to_csv(medoid_csv, index=False, encoding='utf-8-sig')
-    log.write(f'Node medoid selection CSV -> {medoid_csv}\n')
-
-    # ログに概要（全ノード表示）: label_raw と 代表ラベルを出力（複合ラベルも可視化）
-    log.write('\n[Node medoid summary]\n')
-    for r in rows:
-        log.write(
-            f"({r['node_x']},{r['node_y']}): idx={r['medoid_index']}, "
-            f"time={r['time']}, label_raw={r['label_raw']}, rep_label={r['representative_label']}, "
-            f"match={r['match']}, dist={r['distance']:.4f}\n"
-        )
 
     # ===== 「SOM Node-wise Analysis」の一致可視化（背景色） =====
     nodewise_vis_path = os.path.join(out_dir, f'{method_name}_nodewise_analysis_match.png')
     plot_nodewise_match_map(
         winners_xy=winners_all,
         labels_all=labels_all,
-        node_to_medoid_idx=node_to_medoid_idx,
+        node_to_medoid_idx=node_to_true_medoid_idx,
         times_all=times_all,
         som_shape=(SOM_X, SOM_Y),
         save_path=nodewise_vis_path,
-        title=f'{method_name.upper()} SOM Node-wise Analysis (background: green=match / red=not)'
+        title=f'{method_name.upper()} SOM Node-wise Analysis (True Medoid: green=match / red=not)'
     )
     log.write(f'Node-wise match visualization -> {nodewise_vis_path}\n')
 
@@ -1650,7 +1523,7 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
     final_match_rate, final_matched_nodes, final_counted_nodes = compute_nodewise_match_rate(
         winners_xy=winners_all,
         labels_all=labels_all,
-        node_to_medoid_idx=node_to_medoid_idx,
+        node_to_medoid_idx=node_to_true_medoid_idx,
         som_shape=(SOM_X, SOM_Y)
     )
 
@@ -1830,7 +1703,6 @@ def main():
 
     methods = [
         ('euclidean', 'euclidean'),
-        ('ssim',      'ssim'),
         ('ssim5',     'ssim5'),    # 論文仕様（5x5窓・C=0）版SSIM
         ('s1',        's1'),
         ('s1ssim',    's1ssim')    # S1とSSIM(5x5)の融合
