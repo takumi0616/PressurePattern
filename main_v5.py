@@ -1802,6 +1802,7 @@ def run_one_method_verification(method_name: str,
 # メイン
 # =====================================================
 def main():
+    global SEED, RESULT_DIR, LEARNING_ROOT, VERIF_ROOT
     parser = argparse.ArgumentParser(description="PressurePattern SOM v5")
     parser.add_argument('--seed', type=int, default=SEED, help='random seed')
     parser.add_argument('--gpu', type=int, default=None, help='GPU index to use (e.g., 0 or 1). Ignored if --device is set.')
@@ -1839,7 +1840,6 @@ def main():
         gpu_name = 'CPU'
 
     # グローバルを更新（SEEDと出力先）
-    global SEED, RESULT_DIR, LEARNING_ROOT, VERIF_ROOT
     SEED = int(args.seed)
 
     if args.result_dir:
