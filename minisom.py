@@ -29,6 +29,9 @@ class MiniSom:
           'ssim5'    （論文仕様に近い 5x5 窓・C=0 のSSIM：移動窓平均）
           's1'       （Teweles–Wobus S1）
           's1ssim'   （S1とSSIM(5x5)の融合距離：サンプル毎min-max正規化後の等重み和）
+          's1ssim5_hf'（HF-S1SSIM5: SSIM(5x5)でゲートするソフト階層化 D = u + (1-u)v）
+          's1ssim5_and'（AND合成: 行方向min–max正規化後の D = max(U,V)）
+          'pf_s1ssim'（比例融合: 正規化なしで D = dS1 * dSSIM）
       - 学習は「ミニバッチ版バッチSOM」：BMU→近傍重み→分子/分母累積→一括更新
       - 全ての重い計算はGPU実行
       - σ（近傍幅）は学習全体で一方向に減衰させる（セグメント学習でも継続）
@@ -81,8 +84,8 @@ class MiniSom:
 
         # 距離タイプ
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim', 's1ssim5_hf', 's1ssim5_and', 'pf_s1ssim', 's1gssim', 'gssim'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim","s1ssim5_hf","s1ssim5_and","pf_s1ssim","s1gssim","gssim"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -242,6 +245,145 @@ class MiniSom:
         return out
 
     @torch.no_grad()
+    def _s1gssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Gradient-SSIM(+direction) と S1(行方向min-max正規化) のRMS合成距離。
+        1) 勾配強度 |∇| のSSIM(5x5, C=0) => d_g ∈ [0,1]
+        2) 勾配方向cosθの重み付き平均（重み=max(|∇X|,|∇W|)）=> d_dir ∈ [0,1]
+        3) d_edge = 0.5*(d_g + d_dir)
+        4) d_s1 = 行方向min-max正規化したS1 ∈ [0,1]
+        出力: sqrt((d_edge^2 + d_s1^2)/2)
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+
+        # サンプル側の勾配と強度（共通領域 (H-1, W-1)）
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]   # (B, H, W-1)
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]   # (B, H-1, W)
+        dXdx_c = dXdx[:, :-1, :]              # (B, H-1, W-1)
+        dXdy_c = dXdy[:, :, :-1]              # (B, H-1, W-1)
+        magX = torch.sqrt(dXdx_c * dXdx_c + dXdy_c * dXdy_c + eps)  # (B, H-1, W-1)
+
+        # 勾配強度のローカル統計（5x5平均畳み込み）
+        self._ensure_kernel5()
+        Xg = magX.unsqueeze(1)  # (B,1,H-1,W-1)
+        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        mu_xg = F.conv2d(Xg_pad, self._kernel5, padding=0)                  # (B,1,H-1,W-1)
+        mu_xg2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
+        var_xg = torch.clamp(mu_xg2 - mu_xg * mu_xg, min=0.0)
+
+        # ノード側の勾配（事前計算）
+        dWdx_full = self.weights[:, :, 1:] - self.weights[:, :, :-1]  # (m, H, W-1)
+        dWdy_full = self.weights[:, 1:, :] - self.weights[:, :-1, :]  # (m, H-1, W)
+
+        # S1全体を先に計算して行方向min-max正規化用のmin/maxを得る
+        dS1_all = self._s1_distance_batch(Xb, nodes_chunk=self.nodes_chunk)  # (B, m)
+        min_s1 = dS1_all.min(dim=1, keepdim=True).values
+        max_s1 = dS1_all.max(dim=1, keepdim=True).values
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            dWdx = dWdx_full[start:end]    # (Mc, H, W-1)
+            dWdy = dWdy_full[start:end]    # (Mc, H-1, W)
+            dWdx_c = dWdx[:, :-1, :]       # (Mc, H-1, W-1)
+            dWdy_c = dWdy[:, :, :-1]       # (Mc, H-1, W-1)
+            magW = torch.sqrt(dWdx_c * dWdx_c + dWdy_c * dWdy_c + eps)  # (Mc, H-1, W-1)
+
+            # 1) 勾配強度のSSIM (C=0)
+            Wg = magW.unsqueeze(1)                                         # (Mc,1,H-1,W-1)
+            Wg_pad = F.pad(Wg, (2, 2, 2, 2), mode='reflect')
+            mu_wg = F.conv2d(Wg_pad, self._kernel5, padding=0)             # (Mc,1,H-1,W-1)
+            mu_wg2 = F.conv2d(Wg_pad * Wg_pad, self._kernel5, padding=0)
+            var_wg = torch.clamp(mu_wg2 - mu_wg * mu_wg, min=0.0)
+
+            # 修正: ブロードキャスト次元を合わせるため Xg にもノード次元を追加（(B,1,1,H-1,W-1) × (1,Mc,1,H-1,W-1)）
+            prod = (Xg.unsqueeze(1) * Wg.unsqueeze(0)).reshape(B * (end - start), 1, magX.shape[1], magX.shape[2])
+            prod_pad = F.pad(prod, (2, 2, 2, 2), mode='reflect')
+            mu_xwg = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B, end - start, 1, magX.shape[1], magX.shape[2])
+
+            mu_xg_b = mu_xg.unsqueeze(1)       # (B,1,1,H-1,W-1)
+            mu_wg_mc = mu_wg.unsqueeze(0)      # (1,Mc,1,H-1,W-1)
+            var_xg_b = var_xg.unsqueeze(1)
+            var_wg_mc = var_wg.unsqueeze(0)
+            l_num = 2.0 * (mu_xg_b * mu_wg_mc)
+            l_den = (mu_xg_b * mu_xg_b + mu_wg_mc * mu_wg_mc)
+            c_num = 2.0 * (mu_xwg - mu_xg_b * mu_wg_mc)
+            c_den = (var_xg_b + var_wg_mc)
+            ssim_map = (l_num * c_num) / (l_den * c_den + eps)             # (B,Mc,1,H-1,W-1)
+            ssim_avg = ssim_map.mean(dim=(2, 3, 4))                        # (B,Mc)
+            d_g = 0.5 * (1.0 - ssim_avg)                                   # (B,Mc) in [0,1]
+
+            # 2) 勾配方向の一致（cosθの重み付き平均）
+            magW2 = torch.sqrt(dWdx_c * dWdx_c + dWdy_c * dWdy_c + eps)    # (Mc, H-1, W-1)
+            dot = dXdx_c.unsqueeze(1) * dWdx_c.unsqueeze(0) + dXdy_c.unsqueeze(1) * dWdy_c.unsqueeze(0)  # (B,Mc,H-1,W-1)
+            denom = magX.unsqueeze(1) * magW2.unsqueeze(0) + eps
+            cos = (dot / denom).clamp(-1.0, 1.0)
+            wgt = torch.maximum(magX.unsqueeze(1), magW2.unsqueeze(0))
+            s_dir = (cos * wgt).sum(dim=(2, 3)) / (wgt.sum(dim=(2, 3)) + eps)   # (B,Mc)
+            d_dir = 0.5 * (1.0 - s_dir)                                         # (B,Mc) in [0,1]
+
+            d_edge = 0.5 * (d_g + d_dir)                                        # (B,Mc)
+
+            # 3) S1 を行方向min-max正規化し、RMS合成
+            dS1n = (dS1_all[:, start:end] - min_s1) / (max_s1 - min_s1 + eps)   # (B,Mc)
+            out[:, start:end] = torch.sqrt((d_edge * d_edge + dS1n * dS1n) / 2.0)
+
+        return out
+
+    @torch.no_grad()
+    def _gssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Gradient-Structure Similarity (G-SSIM-S1の勾配構造部分) に基づく距離。
+        S_GS = Σ[w · S_mag · S_dir] / (Σ w + ε),  D = 1 - S_GS
+          - S_mag = 2|∇X||∇W| / (|∇X|^2 + |∇W|^2 + ε)
+          - S_dir = (1 + cosθ)/2,  cosθ = (∇X·∇W)/(||∇X||||∇W|| + ε)
+          - w = max(|∇X|, |∇W|)
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+
+        # サンプル側勾配（共通領域）
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        gx = dXdx[:, :-1, :]
+        gy = dXdy[:, :, :-1]
+        gmagX = torch.sqrt(gx * gx + gy * gy + eps)  # (B, H-1, W-1)
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+
+        dWdx_full = self.weights[:, :, 1:] - self.weights[:, :, :-1]  # (m, H, W-1)
+        dWdy_full = self.weights[:, 1:, :] - self.weights[:, :-1, :]  # (m, H-1, W)
+
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            grx = dWdx_full[start:end, :-1, :]   # (Mc, H-1, W-1)
+            gry = dWdy_full[start:end, :, :-1]   # (Mc, H-1, W-1)
+            gmagW = torch.sqrt(grx * grx + gry * gry + eps)  # (Mc, H-1, W-1)
+
+            gx_b = gx.unsqueeze(1)     # (B,1,H-1,W-1)
+            gy_b = gy.unsqueeze(1)
+            gX_b = gmagX.unsqueeze(1)  # (B,1,H-1,W-1)
+            grx_m = grx.unsqueeze(0)   # (1,Mc,H-1,W-1)
+            gry_m = gry.unsqueeze(0)
+            gW_m = gmagW.unsqueeze(0)  # (1,Mc,H-1,W-1)
+
+            dot = gx_b * grx_m + gy_b * gry_m
+            cos = (dot / (gX_b * gW_m + eps)).clamp(-1.0, 1.0)
+            Sdir = 0.5 * (1.0 + cos)
+            Smag = (2.0 * gX_b * gW_m) / (gX_b * gX_b + gW_m * gW_m + eps)
+            S = Smag * Sdir
+            w = torch.maximum(gX_b, gW_m)
+            sim = (S * w).sum(dim=(2, 3)) / (w.sum(dim=(2, 3)) + eps)  # (B,Mc)
+            out[:, start:end] = 1.0 - sim
+
+        return out
+
+    @torch.no_grad()
     def _s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         """
         Xb: (B,H,W) 戻り (B,m) S1距離
@@ -291,6 +433,39 @@ class MiniSom:
             dn1 = (d1 - min1) / (max1 - min1 + 1e-12)
             dn2 = (d2 - min2) / (max2 - min2 + 1e-12)
             return 0.5 * (dn1 + dn2)
+        elif self.activation_distance == 's1ssim5_hf':
+            # HF-S1SSIM5: SSIM(5x5)でゲートするソフト階層化 D = u + (1-u)*v
+            dS1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)      # (B,m)
+            dSSIM = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk) # (B,m) = 1-SSIM
+            eps = 1e-12
+            min_s1 = dS1.min(dim=1, keepdim=True).values
+            max_s1 = dS1.max(dim=1, keepdim=True).values
+            min_ss = dSSIM.min(dim=1, keepdim=True).values
+            max_ss = dSSIM.max(dim=1, keepdim=True).values
+            v = (dS1 - min_s1) / (max_s1 - min_s1 + eps)   # normalized S1
+            u = (dSSIM - min_ss) / (max_ss - min_ss + eps) # normalized dSSIM
+            return u + (1.0 - u) * v
+        elif self.activation_distance == 's1ssim5_and':
+            # AND合成: 行方向min–max正規化 U,V を用いて D = max(U,V)
+            dS1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+            dSSIM = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
+            eps = 1e-12
+            min_s1 = dS1.min(dim=1, keepdim=True).values
+            max_s1 = dS1.max(dim=1, keepdim=True).values
+            min_ss = dSSIM.min(dim=1, keepdim=True).values
+            max_ss = dSSIM.max(dim=1, keepdim=True).values
+            V = (dS1 - min_s1) / (max_s1 - min_s1 + eps)
+            U = (dSSIM - min_ss) / (max_ss - min_ss + eps)
+            return torch.maximum(U, V)
+        elif self.activation_distance == 'pf_s1ssim':
+            # 比例融合: 正規化なしで積 D = dS1 * dSSIM
+            dS1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+            dSSIM = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
+            return dS1 * dSSIM
+        elif self.activation_distance == 's1gssim':
+            return self._s1gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'gssim':
+            return self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -355,6 +530,91 @@ class MiniSom:
         return s1
 
     @torch.no_grad()
+    def _s1gssim_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        s1gssim の対参照距離：
+          d_edge = 0.5*(d_g + d_dir),  d_s1 = 行方向min-max正規化したS1
+          D = sqrt((d_edge^2 + d_s1^2)/2)
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+
+        # 勾配（共通領域）
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        dRdx = ref[:, 1:] - ref[:, :-1]
+        dRdy = ref[1:, :] - ref[:-1, :]
+
+        dXdx_c, dXdy_c = dXdx[:, :-1, :], dXdy[:, :, :-1]
+        dRdx_c, dRdy_c = dRdx[:-1, :], dRdy[:, :-1]
+        magX = torch.sqrt(dXdx_c * dXdx_c + dXdy_c * dXdy_c + eps)  # (B, H-1, W-1)
+        magR = torch.sqrt(dRdx_c * dRdx_c + dRdy_c * dRdy_c + eps)  # (H-1, W-1)
+
+        # 勾配強度のSSIM(5x5, C=0)
+        self._ensure_kernel5()
+        Xg = magX.unsqueeze(1)                          # (B,1,.,.)
+        Rg = magR.unsqueeze(0).unsqueeze(1)             # (1,1,.,.)
+        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        Rg_pad = F.pad(Rg, (2, 2, 2, 2), mode='reflect')
+        mu_x = F.conv2d(Xg_pad, self._kernel5, padding=0)
+        mu_r = F.conv2d(Rg_pad, self._kernel5, padding=0)
+        mu_x2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
+        mu_r2 = F.conv2d(Rg_pad * Rg_pad, self._kernel5, padding=0)
+        var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)
+        var_r = torch.clamp(mu_r2 - mu_r * mu_r, min=0.0)
+        mu_xr = F.conv2d(F.pad(Xg * Rg, (2, 2, 2, 2), mode='reflect'), self._kernel5, padding=0)
+        cov = mu_xr - mu_x * mu_r
+        ssim_map = (2 * mu_x * mu_r * 2 * cov) / ((mu_x * mu_x + mu_r * mu_r) * (var_x + var_r) + eps)
+        ssim_avg = ssim_map.mean(dim=(1, 2, 3))
+        d_g = 0.5 * (1.0 - ssim_avg)                    # (B,)
+
+        # 勾配方向（加重平均）
+        dot = dXdx_c * dRdx_c.unsqueeze(0) + dXdy_c * dRdy_c.unsqueeze(0)     # (B,.,.)
+        denom = magX * magR.unsqueeze(0) + eps
+        cos = (dot / denom).clamp(-1.0, 1.0)
+        wgt = torch.maximum(magX, magR.unsqueeze(0))
+        s_dir = (cos * wgt).flatten(1).sum(dim=1) / (wgt.flatten(1).sum(dim=1) + eps)     # (B,)
+        d_dir = 0.5 * (1.0 - s_dir)
+
+        d_edge = 0.5 * (d_g + d_dir)                    # (B,)
+
+        # S1 の行方向min-max正規化（バッチ内）
+        dS1 = self._s1_to_ref(Xb, ref)                  # (B,)
+        min_s1, _ = dS1.min(dim=0, keepdim=True)
+        max_s1, _ = dS1.max(dim=0, keepdim=True)
+        dS1n = (dS1 - min_s1) / (max_s1 - min_s1 + eps)
+
+        return torch.sqrt((d_edge * d_edge + dS1n * dS1n) / 2.0)
+
+    @torch.no_grad()
+    def _gssim_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        gssim の対参照距離： D = 1 - S_GS （勾配強度・方向の重み付き類似度）
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        gx = dXdx[:, :-1, :]
+        gy = dXdy[:, :, :-1]
+        gmagX = torch.sqrt(gx * gx + gy * gy + eps)     # (B, H-1, W-1)
+
+        dRdx = ref[:, 1:] - ref[:, :-1]
+        dRdy = ref[1:, :] - ref[:-1, :]
+        grx = dRdx[:-1, :]
+        gry = dRdy[:, :-1]
+        gmagR = torch.sqrt(grx * grx + gry * gry + eps) # (H-1, W-1)
+
+        dot = gx * grx.unsqueeze(0) + gy * gry.unsqueeze(0)                     # (B,.,.)
+        cos = (dot / (gmagX * gmagR.unsqueeze(0) + eps)).clamp(-1.0, 1.0)
+        Sdir = 0.5 * (1.0 + cos)
+        Smag = (2.0 * gmagX * gmagR.unsqueeze(0)) / (gmagX * gmagX + gmagR.unsqueeze(0) * gmagR.unsqueeze(0) + eps)
+        S = Smag * Sdir
+        w = torch.maximum(gmagX, gmagR.unsqueeze(0))
+        sim = (S * w).flatten(1).sum(dim=1) / (w.flatten(1).sum(dim=1) + eps)   # (B,)
+        return 1.0 - sim
+
+    @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         現在のactivation_distanceに対応した「Xb vs 単一参照ref」の距離ベクトル(B,)
@@ -375,6 +635,39 @@ class MiniSom:
             dn1 = (d1 - min1) / (max1 - min1 + 1e-12)
             dn2 = (d2 - min2) / (max2 - min2 + 1e-12)
             return 0.5 * (dn1 + dn2)
+        elif self.activation_distance == 's1ssim5_hf':
+            # HF-S1SSIM5 (to ref): 行方向（バッチ内）でmin-max正規化後、D = u + (1-u)*v
+            dS1 = self._s1_to_ref(Xb, ref)       # (B,)
+            dSSIM = self._ssim5_to_ref(Xb, ref)  # (B,)
+            eps = 1e-12
+            min_s1, _ = dS1.min(dim=0, keepdim=True)
+            max_s1, _ = dS1.max(dim=0, keepdim=True)
+            min_ss, _ = dSSIM.min(dim=0, keepdim=True)
+            max_ss, _ = dSSIM.max(dim=0, keepdim=True)
+            v = (dS1 - min_s1) / (max_s1 - min_s1 + eps)    # normalized S1
+            u = (dSSIM - min_ss) / (max_ss - min_ss + eps)  # normalized dSSIM
+            return u + (1.0 - u) * v
+        elif self.activation_distance == 's1ssim5_and':
+            # AND合成 (to ref): 行方向min–max正規化後、D = max(U,V)
+            dS1 = self._s1_to_ref(Xb, ref)
+            dSSIM = self._ssim5_to_ref(Xb, ref)
+            eps = 1e-12
+            min_s1, _ = dS1.min(dim=0, keepdim=True)
+            max_s1, _ = dS1.max(dim=0, keepdim=True)
+            min_ss, _ = dSSIM.min(dim=0, keepdim=True)
+            max_ss, _ = dSSIM.max(dim=0, keepdim=True)
+            V = (dS1 - min_s1) / (max_s1 - min_s1 + eps)
+            U = (dSSIM - min_ss) / (max_ss - min_ss + eps)
+            return torch.maximum(U, V)
+        elif self.activation_distance == 'pf_s1ssim':
+            # 比例融合 (to ref): 正規化なしで積
+            dS1 = self._s1_to_ref(Xb, ref)
+            dSSIM = self._ssim5_to_ref(Xb, ref)
+            return dS1 * dSSIM
+        elif self.activation_distance == 's1gssim':
+            return self._s1gssim_to_ref(Xb, ref)
+        elif self.activation_distance == 'gssim':
+            return self._gssim_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
