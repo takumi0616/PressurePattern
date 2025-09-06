@@ -3,6 +3,7 @@
 
 # Result directories
 result_*/
+results_*/
 
 # Python cache
 __pycache__/
@@ -51,6 +52,8 @@ nc/era5_msl/
 *.pkl
 
 *.pt
+
+*.out
 
 !SOM-MPPCA/document/*.txt
 !SOM-MPPCA/document/*.pdf
