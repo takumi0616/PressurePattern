@@ -83,8 +83,8 @@ nohup python main_v5.py --gpu 1 --seed 2 > seed2_gpu1.out 2>&1 &
 - notify-run を使う（通知が欲しい場合）
 
 ```bash
-notify-run -- nohup python main_v5.py --gpu 0 --seed 1 > seed1_gpu0.out 2>&1 &
-notify-run -- nohup python main_v5.py --gpu 1 --seed 2 > seed2_gpu1.out 2>&1 &
+notify-run gpu02 -- nohup python main_v5.py --gpu 0 --seed 19 > seed19.out 2>&1 &
+notify-run gpu02 -- nohup python main_v5.py --gpu 1 --seed 20 > seed20.out 2>&1 &
 ```
 
 出力先を明示したい場合（同名衝突を避けたいとき等）:
@@ -208,7 +208,8 @@ rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/P
 - gpu02 → mac
 
 ```bash
-rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_* \
+rsync -avz --progress \
+  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{19,20,21,22,23,24,25,26}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
 ```
 
@@ -229,3 +230,140 @@ rsync -avz --progress gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/P
   - シードや出力先を変えて複数ジョブを並走/整理しやすく
 - True Medoid 計算等、内部で用いる torch デバイスをユーザ指定デバイスに統一
   - GPU 0/1 の使い分けが混在しないよう安全に反映
+
+## 自動化: 2GPU で seed を順次実行（notify-run 通知付き）
+
+手動で `seed` を 2 つずつ増やしながら実行する作業を自動化するスクリプトを追加しました。
+
+- スクリプト: `src/PressurePattern/run_seeds.sh`
+- 既定動作:
+  - `seed=19,20` のペアから開始し、`seed=49,50` まで実行（デフォルトは 19..50）
+  - GPU0 に奇数（19, 21, 23, ...）、GPU1 に偶数（20, 22, 24, ...）を割当
+  - 各ペア（2 本）の終了を待ってから次ペアへ進む
+  - ログは `seed{SEED}.out` に保存（例: `seed19.out`, `seed20.out`）
+  - `notify-run <channel> -- <command>` で実行開始/完了の通知（チャンネル既定: `gpu02`）
+- 実行場所はどこでも OK（スクリプトが自動で `src/PressurePattern` に `cd` します）
+
+使い方（基本）:
+
+```bash
+chmod +x run_seeds.sh
+```
+
+```bash
+# 範囲やGPU、チャネル、対象スクリプトを明示
+nohup bash run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+```
+
+そのコマンドは正常に動きます。前提として src/PressurePattern に移動してから実行する場合、以下が成立します。
+
+- nohup bash run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+
+  - オーケストレータ(run_seeds.sh)がバックグラウンドで継続
+  - orchestrator.log はカレントの src/PressurePattern に出力
+  - 各ジョブの標準出力・標準エラーは seed{SEED}.out（例: seed21.out, seed22.out）として src/PressurePattern に作成
+  - スクリプト内で自身のあるディレクトリに cd するため、ジョブの実行とログの場所は安定（相対パスの main_v5.py も解決可能）
+
+補足:
+
+- 同じ内容をリポジトリルートから実行したい場合は以下でも可:
+  - nohup bash src/PressurePattern/run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > src/PressurePattern/orchestrator.log 2>&1 &
+
+- 内側のコマンドに nohup は不要です（スクリプト自体を nohup で起動しているため、子プロセスも SIGHUP を受けません）。
+
+- 動作確認:
+
+  - tail -f src/PressurePattern/orchestrator.log
+  - ps aux | grep main_v5.py | grep -v grep
+
+- 事前条件:
+
+  - notify-run が PATH 上にあり、チャンネル gpu02 が有効
+  - main_v5.py が src/PressurePattern に存在し --gpu/--seed を受け付ける
+
+このコマンドを打った時の中断の仕方は？ (swinunet_env) root@bace913e623d:/app/src/PressurePattern# nohup bash run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+
+**Checkpoint
+
+Compare
+
+Restore
+
+API Request$0.0855
+
+Cline wants to edit this file:
+
+src/PressurePattern/run_seeds.sh‎
+
+3
+
+**Checkpoint
+
+Compare
+
+Restore
+
+API Request$0.0662
+
+Cline wants to edit this file:
+
+src/PressurePattern/run_seeds.sh‎
+
+3
+
+**Checkpoint
+
+Compare
+
+Restore
+
+API Request$0.0589
+
+Task Completed
+
+中断方法は以下です（nohup でバックグラウンド起動した run_seeds.sh を安全に止める手順）。
+
+前提:
+
+- スクリプトは PID を src/PressurePattern/run_seeds.pid に保存します
+- TERM/INT シグナルを受けると、実行中の GPU ジョブもまとめて安全に停止するよう実装済みです
+
+最も簡単な停止（推奨）:
+
+- 実行中のコンテナ/ホストで src/PressurePattern にいる場合:
+  - kill "$(cat run_seeds.pid)"
+- どこからでもフルパスで:
+  - kill "$(cat /app/src/PressurePattern/run_seeds.pid)"
+
+確認:
+
+- tail -n 50 -f orchestrator.log
+  - "[INFO] Received signal, terminating active jobs..." が出て、ペア終了の待機を切り上げて停止します
+- ps -p "$(cat run_seeds.pid)"
+  - プロセスがいなければ停止済みです
+
+補足（PIDファイルが見つからない/壊れている場合）:
+
+- オーケストレータを直接探して止める:
+
+  - pgrep -af 'run_seeds.sh'
+  - kill <見つかったPID>
+
+- まだ子プロセス（学習ジョブ）が残ってしまった場合は個別停止:
+
+  - pkill -f 'main_v5.py.*--gpu 0'
+  - pkill -f 'main_v5.py.*--gpu 1'
+
+強制停止（最後の手段）:
+
+- 正常停止できない場合のみ使用してください
+
+  - pkill -9 -f 'main_v5.py'
+  - kill -9 "$(cat run_seeds.pid)"; rm -f run_seeds.pid
+
+再開方法:
+
+- 途中まで実行済みなら、次の seed から再開
+
+  - 例: seed 33 まで完了していれば、--start 35 を指定
+  - nohup bash run_seeds.sh --start 35 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
