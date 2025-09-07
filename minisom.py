@@ -51,7 +51,8 @@ class MiniSom:
                  s1_field_shape: Optional[Tuple[int, int]] = None,
                  device: Optional[str] = None,
                  dtype: torch.dtype = torch.float32,
-                 nodes_chunk: int = 16):
+                 nodes_chunk: int = 16,
+                 area_weight: Optional[np.ndarray] = None):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = torch.device(device)
@@ -84,8 +85,8 @@ class MiniSom:
 
         # 距離タイプ
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim', 's1ssim5_hf', 's1ssim5_and', 'pf_s1ssim', 's1gssim', 'gssim'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim","s1ssim5_hf","s1ssim5_and","pf_s1ssim","s1gssim","gssim"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim', 's1ssim5_hf', 's1ssim5_and', 'pf_s1ssim', 's1gssim', 'gssim', 's1gl', 'gsmd', 's3d', 'cfsd', 'hff', 's1gk', 's1gcurv'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim","s1ssim5_hf","s1ssim5_and","pf_s1ssim","s1gssim","gssim","s1gl","gsmd","s3d","cfsd","hff","s1gk","s1gcurv"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -95,6 +96,13 @@ class MiniSom:
             raise ValueError(f's1_field_shape={s1_field_shape} does not match input_len={input_len}.')
         self.field_shape = s1_field_shape
         H, W = s1_field_shape
+        # Optional area weight (e.g., cos(lat)); used for curvature S1 weighting on Laplacian domain
+        self.area_w: Optional[Tensor] = None
+        if area_weight is not None:
+            aw = torch.as_tensor(area_weight, device=self.device, dtype=self.dtype)
+            if aw.shape != (H, W):
+                raise ValueError(f'area_weight shape {aw.shape} does not match field_shape {(H, W)}')
+            self.area_w = aw
 
         # グリッド座標
         gx, gy = torch.meshgrid(torch.arange(x), torch.arange(y), indexing='ij')
@@ -111,6 +119,11 @@ class MiniSom:
         self._kernel5: Optional[Tensor] = None
         self._win5_size: int = 5
         self._win5_pad: int = 2
+        # 3x3ラプラシアン（曲率）用カーネル
+        self._lap_kernel: Optional[Tensor] = None
+        # 正規化座標グリッド（0..1）
+        self._xnorm = torch.linspace(0.0, 1.0, W, device=self.device, dtype=self.dtype).view(1, 1, W).expand(1, H, W)
+        self._ynorm = torch.linspace(0.0, 1.0, H, device=self.device, dtype=self.dtype).view(1, H, 1).expand(1, H, W)
 
     # ---------- 外部制御 ----------
     def set_total_iterations(self, total_iters: int):
@@ -190,6 +203,14 @@ class MiniSom:
         if self._kernel5 is None:
             k = torch.ones((1, 1, self._win5_size, self._win5_size), device=self.device, dtype=self.dtype) / float(self._win5_size * self._win5_size)
             self._kernel5 = k
+
+    @torch.no_grad()
+    def _ensure_lap_kernel(self):
+        if self._lap_kernel is None:
+            k = torch.tensor([[0.0, 1.0, 0.0],
+                              [1.0,-4.0, 1.0],
+                              [0.0, 1.0, 0.0]], device=self.device, dtype=self.dtype)
+            self._lap_kernel = k.view(1, 1, 3, 3)
 
     @torch.no_grad()
     def _ssim5_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
@@ -334,6 +355,354 @@ class MiniSom:
         return out
 
     @torch.no_grad()
+    def _s1gl_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        DSGC: S1 + Gradient(+direction) + Curvature(Laplacian) Structural distance
+        Dedge = 1 - (SSIM(|∇|) + Sdir)/2,  Dcurv = 1 - weighted SSIM(ΔX,ΔW),  dS1n = row-wise min-max normalized S1
+        Output: sqrt((Dedge^2 + Dcurv^2 + dS1n^2)/3)
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+
+        # Gradients (common inner H-1 x W-1 region)
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]      # (B,H,W-1)
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]      # (B,H-1,W)
+        gx = dXdx[:, :-1, :]                     # (B,H-1,W-1)
+        gy = dXdy[:, :, :-1]                     # (B,H-1,W-1)
+        gmagX = torch.sqrt(gx * gx + gy * gy + eps)  # (B,H-1,W-1)
+
+        # 5x5 stats for gradient magnitude (X side)
+        self._ensure_kernel5()
+        Xg = gmagX.unsqueeze(1)                      # (B,1,H-1,W-1)
+        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        mu_xg = F.conv2d(Xg_pad, self._kernel5, padding=0)
+        mu_xg2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
+        var_xg = torch.clamp(mu_xg2 - mu_xg * mu_xg, min=0.0)
+
+        # S1 distances for all nodes for min-max normalization (per row)
+        dS1_all = self._s1_distance_batch(Xb, nodes_chunk=self.nodes_chunk)  # (B,m)
+        min_s1 = dS1_all.min(dim=1, keepdim=True).values
+        max_s1 = dS1_all.max(dim=1, keepdim=True).values
+
+        # Precompute node gradients
+        dWdx_full = self.weights[:, :, 1:] - self.weights[:, :, :-1]  # (m,H,W-1)
+        dWdy_full = self.weights[:, 1:, :] - self.weights[:, :-1, :]  # (m,H-1,W)
+        grx_full = dWdx_full[:, :-1, :]                                # (m,H-1,W-1)
+        gry_full = dWdy_full[:, :, :-1]                                # (m,H-1,W-1)
+        gmagW_full = torch.sqrt(grx_full * grx_full + gry_full * gry_full + eps)  # (m,H-1,W-1)
+
+        # Laplacians (curvature) for X and W
+        self._ensure_lap_kernel()
+        Lx = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (B,H-2,W-2)
+        Lw_full = F.conv2d(self.weights.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (m,H-2,W-2)
+
+        # 5x5 stats for Lx (X side)
+        Lx1 = Lx.unsqueeze(1)                         # (B,1,H-2,W-2)
+        Lx_pad = F.pad(Lx1, (2, 2, 2, 2), mode='reflect')
+        mu_lx = F.conv2d(Lx_pad, self._kernel5, padding=0)
+        mu_lx2 = F.conv2d(Lx_pad * Lx_pad, self._kernel5, padding=0)
+        var_lx = torch.clamp(mu_lx2 - mu_lx * mu_lx, min=0.0)
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+
+            # Gradient direction cosine weighted by max(|∇X|,|∇W|)
+            grx = grx_full[start:end]                  # (Mc,H-1,W-1)
+            gry = gry_full[start:end]                  # (Mc,H-1,W-1)
+            gmagW = gmagW_full[start:end]              # (Mc,H-1,W-1)
+            cos = (gx.unsqueeze(1) * grx.unsqueeze(0) + gy.unsqueeze(1) * gry.unsqueeze(0)) / (gmagX.unsqueeze(1) * gmagW.unsqueeze(0) + eps)
+            cos = torch.clamp(cos, -1.0, 1.0)
+            w1 = torch.maximum(gmagX.unsqueeze(1), gmagW.unsqueeze(0))
+            Sdir = ((0.5 * (1.0 + cos)) * w1).sum(dim=(2, 3)) / (w1.sum(dim=(2, 3)) + eps)  # (B,Mc)
+
+            # Gradient magnitude SSIM (5x5, C=0)
+            Wg = gmagW.unsqueeze(1)                    # (Mc,1,H-1,W-1)
+            Wg_pad = F.pad(Wg, (2, 2, 2, 2), mode='reflect')
+            mu_wg = F.conv2d(Wg_pad, self._kernel5, padding=0)
+            mu_wg2 = F.conv2d(Wg_pad * Wg_pad, self._kernel5, padding=0)
+            var_wg = torch.clamp(mu_wg2 - mu_wg * mu_wg, min=0.0)
+
+            prod = (Xg.unsqueeze(1) * Wg.unsqueeze(0)).reshape(B * (end - start), 1, gmagX.shape[1], gmagX.shape[2])
+            prod_pad = F.pad(prod, (2, 2, 2, 2), mode='reflect')
+            mu_xwg = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B, end - start, 1, gmagX.shape[1], gmagX.shape[2])
+
+            mu_xg_b = mu_xg.unsqueeze(1)
+            mu_wg_mc = mu_wg.unsqueeze(0)
+            var_xg_b = var_xg.unsqueeze(1)
+            var_wg_mc = var_wg.unsqueeze(0)
+
+            ssim_g_map = (2 * mu_xg_b * mu_wg_mc * 2 * (mu_xwg - mu_xg_b * mu_wg_mc)) / ((mu_xg_b * mu_xg_b + mu_wg_mc * mu_wg_mc) * (var_xg_b + var_wg_mc) + eps)
+            SSIMg = ssim_g_map.mean(dim=(2, 3, 4))     # (B,Mc)
+
+            Dedge = 1.0 - 0.5 * (SSIMg + Sdir)         # (B,Mc)
+
+            # Curvature SSIM with weight w2 = max(|ΔX|,|ΔW|)
+            Lw = Lw_full[start:end]                     # (Mc,H-2,W-2)
+            Lw1 = Lw.unsqueeze(1)                       # (Mc,1,H-2,W-2)
+            Lw_pad = F.pad(Lw1, (2, 2, 2, 2), mode='reflect')
+            mu_lw = F.conv2d(Lw_pad, self._kernel5, padding=0)
+            mu_lw2 = F.conv2d(Lw_pad * Lw_pad, self._kernel5, padding=0)
+            var_lw = torch.clamp(mu_lw2 - mu_lw * mu_lw, min=0.0)
+
+            prodL = (Lx1.unsqueeze(1) * Lw1.unsqueeze(0)).reshape(B * (end - start), 1, Lx.shape[1], Lx.shape[2])
+            prodL_pad = F.pad(prodL, (2, 2, 2, 2), mode='reflect')
+            mu_xlw = F.conv2d(prodL_pad, self._kernel5, padding=0).reshape(B, end - start, 1, Lx.shape[1], Lx.shape[2])
+
+            mu_lx_b = mu_lx.unsqueeze(1)
+            mu_lw_mc = mu_lw.unsqueeze(0)
+            var_lx_b = var_lx.unsqueeze(1)
+            var_lw_mc = var_lw.unsqueeze(0)
+
+            ssim_l_map = (2 * mu_lx_b * mu_lw_mc * 2 * (mu_xlw - mu_lx_b * mu_lw_mc)) / ((mu_lx_b * mu_lx_b + mu_lw_mc * mu_lw_mc) * (var_lx_b + var_lw_mc) + eps)
+            w2 = torch.maximum(torch.abs(Lx).unsqueeze(1), torch.abs(Lw).unsqueeze(0))  # (B,Mc,H-2,W-2)
+            Scurv = (ssim_l_map.squeeze(2) * w2).sum(dim=(2, 3)) / (w2.sum(dim=(2, 3)) + eps)  # (B,Mc)
+            Dcurv = 1.0 - Scurv
+
+            # Normalized S1
+            dS1n = (dS1_all[:, start:end] - min_s1) / (max_s1 - min_s1 + eps)
+
+            out[:, start:end] = torch.sqrt((Dedge * Dedge + Dcurv * Dcurv + dS1n * dS1n) / 3.0)
+
+        return out
+
+    @torch.no_grad()
+    def _s1norm_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Dimensionless S1-like distance in [0,1]:
+          r = (sum|∂X-∂W|) / (sum max(|∂X|,|∂W|) + eps) in both x and y, D = 0.5 * r.
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]  # (B,H,W-1)
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]  # (B,H-1,W)
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        dWdx_full = self.weights[:, :, 1:] - self.weights[:, :, :-1]  # (m,H,W-1)
+        dWdy_full = self.weights[:, 1:, :] - self.weights[:, :-1, :]  # (m,H-1,W)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            dWdx = dWdx_full[start:end]   # (Mc,H,W-1)
+            dWdy = dWdy_full[start:end]   # (Mc,H-1,W)
+            num = (torch.abs(dWdx.unsqueeze(0) - dXdx.unsqueeze(1)).sum(dim=(2, 3)) +
+                   torch.abs(dWdy.unsqueeze(0) - dXdy.unsqueeze(1)).sum(dim=(2, 3)))
+            den = (torch.maximum(torch.abs(dWdx).unsqueeze(0), torch.abs(dXdx).unsqueeze(1)).sum(dim=(2, 3)) +
+                   torch.maximum(torch.abs(dWdy).unsqueeze(0), torch.abs(dXdy).unsqueeze(1)).sum(dim=(2, 3)))
+            r = num / (den + eps)  # 0..2
+            out[:, start:end] = 0.5 * r
+        return out
+
+    @torch.no_grad()
+    def _moment_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Moment-based distance in [0,1]: D_mom = 0.5 * (d_pos + d_neg), centroids on normalized coords,
+        with fallback to (0.5,0.5) when mass is zero.
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        Xp = torch.clamp(Xb, min=0.0)    # (B,H,W)
+        Xn = torch.clamp(-Xb, min=0.0)   # (B,H,W)
+
+        mp_b = Xp.sum(dim=(1, 2), keepdim=True)  # (B,1)
+        mn_b = Xn.sum(dim=(1, 2), keepdim=True)  # (B,1)
+
+        cxp_b = (Xp * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mp_b + eps)
+        cyp_b = (Xp * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mp_b + eps)
+        cxn_b = (Xn * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mn_b + eps)
+        cyn_b = (Xn * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mn_b + eps)
+
+        # fallback to center for zero mass
+        mask_mpz = (mp_b <= eps)
+        mask_mnz = (mn_b <= eps)
+        cxp_b[mask_mpz] = 0.5; cyp_b[mask_mpz] = 0.5
+        cxn_b[mask_mnz] = 0.5; cyn_b[mask_mnz] = 0.5
+
+        cxp_b = cxp_b.squeeze(-1).squeeze(-1); cyp_b = cyp_b.squeeze(-1).squeeze(-1)  # (B,)
+        cxn_b = cxn_b.squeeze(-1).squeeze(-1); cyn_b = cyn_b.squeeze(-1).squeeze(-1)
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        d2norm = math.sqrt(2.0)
+
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            Wc = self.weights[start:end]          # (Mc,H,W)
+            Wp = torch.clamp(Wc, min=0.0)
+            Wn = torch.clamp(-Wc, min=0.0)
+
+            mp = Wp.sum(dim=(1, 2), keepdim=True)  # (Mc,1)
+            mn = Wn.sum(dim=(1, 2), keepdim=True)  # (Mc,1)
+
+            cxp = (Wp * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mp + eps)
+            cyp = (Wp * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mp + eps)
+            cxn = (Wn * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mn + eps)
+            cyn = (Wn * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mn + eps)
+
+            mask_mp0 = (mp <= eps)
+            mask_mn0 = (mn <= eps)
+            cxp[mask_mp0] = 0.5; cyp[mask_mp0] = 0.5
+            cxn[mask_mn0] = 0.5; cyn[mask_mn0] = 0.5
+
+            cxp = cxp.squeeze(-1).squeeze(-1); cyp = cyp.squeeze(-1).squeeze(-1)  # (Mc,)
+            cxn = cxn.squeeze(-1).squeeze(-1); cyn = cyn.squeeze(-1).squeeze(-1)
+
+            dpos = torch.sqrt((cxp_b.unsqueeze(1) - cxp.unsqueeze(0))**2 + (cyp_b.unsqueeze(1) - cyp.unsqueeze(0))**2) / d2norm  # (B,Mc)
+            dneg = torch.sqrt((cxn_b.unsqueeze(1) - cxn.unsqueeze(0))**2 + (cyn_b.unsqueeze(1) - cyn.unsqueeze(0))**2) / d2norm  # (B,Mc)
+
+            out[:, start:end] = 0.5 * (dpos + dneg)
+
+        return out
+
+    @torch.no_grad()
+    def _gsmd_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        GSMD: Gradient-Structural-Moment Distance
+        D_grad = gssim distance in [0,1]; D_s1n in [0,1]; D_mom in [0,1]
+        Output: sqrt((D_grad^2 + D_s1n^2 + D_mom^2)/3)
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        Dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        Ds = self._s1norm_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        Dm = self._moment_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        return torch.sqrt((Dg * Dg + Ds * Ds + Dm * Dm) / 3.0)
+
+    @torch.no_grad()
+    def _curv_struct_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Curvature structural distance (0..1) using Laplacian magnitude ratio and sign agreement with weight w=max(|ΔX|,|ΔW|).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        # Laplacians
+        self._ensure_lap_kernel()
+        Lx = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)    # (B,H-2,W-2)
+        LA = Lx
+        KA = torch.abs(LA)                                                         # (B,h2,w2)
+        sA = torch.sign(LA)
+        Lw_full = F.conv2d(self.weights.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (m,H-2,W-2)
+        KW_full = torch.abs(Lw_full)                                               # (m,h2,w2)
+        sW_full = torch.sign(Lw_full)
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            KW = KW_full[start:end]                                               # (Mc,h2,w2)
+            sW = sW_full[start:end]                                               # (Mc,h2,w2)
+
+            KA_b = KA.unsqueeze(1)                                                # (B,1,h2,w2)
+            KW_m = KW.unsqueeze(0)                                                # (1,Mc,h2,w2)
+            Smag = (2.0 * KA_b * KW_m) / (KA_b * KA_b + KW_m * KW_m + eps)       # (B,Mc,h2,w2)
+
+            sA_b = sA.unsqueeze(1)
+            sW_m = sW.unsqueeze(0)
+            Ssign = 0.5 * (1.0 + sA_b * sW_m)                                     # (B,Mc,h2,w2)
+
+            w = torch.maximum(KA_b, KW_m)                                         # (B,Mc,h2,w2)
+            S = Smag * Ssign
+            num = (S * w).sum(dim=(2, 3))                                         # (B,Mc)
+            den = w.sum(dim=(2, 3)) + eps
+            S_C = num / den
+            out[:, start:end] = 1.0 - S_C
+
+        return out
+
+    @torch.no_grad()
+    def _s3d_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        S3D: RMS of three [0,1] distances: d_L (SSIM5), d_G (gssim), d_C (curvature structural).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        dL = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        dG = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        dC = self._curv_struct_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        return torch.sqrt((dL * dL + dG * dG + dC * dC) / 3.0)
+
+    @torch.no_grad()
+    def _hff_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        HFF (Hierarchical Feature Fusion) distance:
+          D = (1 - SSIM5)^2 + SSIM5 * (1 - GSSIM) = dL^2 + (1 - dL) * dG
+        where dL = 1 - SSIM5(P,W), dG = 1 - GSSIM(∇P,∇W). Returns (B,m).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        dL = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m) in [0,1]
+        dG = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m) in [0,1]
+        return dL * dL + (1.0 - dL) * dG
+
+    @torch.no_grad()
+    def _kappa_field(self, X: Tensor) -> Tensor:
+        """
+        Curvature field κ = div(∇X/|∇X|) computed with centered differences on the inner common grid.
+        Input: X (B,H,W), Output: (B,H-3,W-3)
+        """
+        eps = 1e-12
+        B, H, W = X.shape
+        dXdx = X[:, :, 1:] - X[:, :, :-1]        # (B,H,W-1)
+        dXdy = X[:, 1:, :] - X[:, :-1, :]        # (B,H-1,W)
+        gx = dXdx[:, :-1, :]                     # (B,H-1,W-1)
+        gy = dXdy[:, :, :-1]                     # (B,H-1,W-1)
+        mag = torch.sqrt(gx * gx + gy * gy + eps)
+        nx = gx / (mag + eps)
+        ny = gy / (mag + eps)
+        dnx_dx = 0.5 * (nx[:, :, 2:] - nx[:, :, :-2])   # (B,H-1,W-3)
+        dny_dy = 0.5 * (ny[:, 2:, :] - ny[:, :-2, :])   # (B,H-3,W-1)
+        dnx_dx_c = dnx_dx[:, 1:-1, :]                   # (B,H-3,W-3)
+        dny_dy_c = dny_dy[:, :, 1:-1]                   # (B,H-3,W-3)
+        kappa = dnx_dx_c + dny_dy_c
+        return kappa
+
+    @torch.no_grad()
+    def _kappa_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Kappa curvature distance in [0,1]: D_k = 0.5 * Σ|κ(X)-κ(W)| / Σ max(|κ(X)|,|κ(W)|)
+        Uses inner grid (H-3, W-3).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        kx = self._kappa_field(Xb)                               # (B,hk,wk)
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            kw = self._kappa_field(self.weights[start:end])      # (Mc,hk,wk)
+            diff = torch.abs(kx.unsqueeze(1) - kw.unsqueeze(0))  # (B,Mc,hk,wk)
+            num = diff.flatten(2).sum(dim=2)                     # (B,Mc)
+            den = torch.maximum(kx.abs().unsqueeze(1), kw.abs().unsqueeze(0)).flatten(2).sum(dim=2)
+            out[:, start:end] = 0.5 * (num / (den + eps))
+        return out
+
+    @torch.no_grad()
+    def _s1gk_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        S1GK distance: RMS of row-normalized S1, G-SSIM distance, and row-normalized Kappa curvature distance.
+        Returns (B,m).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        d1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)     # (B,m)
+        dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m) in [0,1]
+        dk = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m)
+        d1_min = d1.min(dim=1, keepdim=True).values
+        d1_max = d1.max(dim=1, keepdim=True).values
+        dk_min = dk.min(dim=1, keepdim=True).values
+        dk_max = dk.max(dim=1, keepdim=True).values
+        d1n = (d1 - d1_min) / (d1_max - d1_min + eps)
+        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
+        return torch.sqrt((d1n * d1n + dg * dg + dkn * dkn) / 3.0)
+
+    @torch.no_grad()
     def _gssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         """
         Gradient-Structure Similarity (G-SSIM-S1の勾配構造部分) に基づく距離。
@@ -415,6 +784,78 @@ class MiniSom:
         return out
 
     @torch.no_grad()
+    def _curv_s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        Curvature S1-like ratio on Laplacian fields (not normalized), optionally area-weighted.
+        Returns (B,m) with values roughly in [0,2]; downstream callers may row-wise normalize to [0,1].
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        self._ensure_lap_kernel()
+        Lx = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)   # (B,H-2,W-2)
+        Lw_full = F.conv2d(self.weights.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (m,H-2,W-2)
+        if self.area_w is not None:
+            w_inner = self.area_w[1:-1, 1:-1]                                     # (H-2,W-2)
+        else:
+            w_inner = None
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            Lw = Lw_full[start:end]                                              # (Mc,H-2,W-2)
+            diff = torch.abs(Lx.unsqueeze(1) - Lw.unsqueeze(0))                  # (B,Mc,H-2,W-2)
+            denom = torch.maximum(torch.abs(Lx).unsqueeze(1), torch.abs(Lw).unsqueeze(0))  # (B,Mc,H-2,W-2)
+            if w_inner is not None:
+                win = w_inner.view(1, 1, H-2, W-2)
+                num_s = (diff * win).sum(dim=(2, 3))
+                den_s = (denom * win).sum(dim=(2, 3)) + eps
+            else:
+                num_s = diff.sum(dim=(2, 3))
+                den_s = denom.sum(dim=(2, 3)) + eps
+            out[:, start:end] = num_s / den_s
+        return out
+
+    @torch.no_grad()
+    def _cfsd_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        CFSD: RMS of three components:
+          - D_G: G-SSIM distance in [0,1]
+          - D_S1^n: row-wise min–max normalized S1
+          - D_CURV^n: row-wise min–max normalized curvature S1 on Laplacians
+        """
+        eps = 1e-12
+        # Compute all components (each function internally chunks)
+        Dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)               # (B,m) in [0,1]
+        Ds1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)                 # (B,m) arbitrary scale
+        Dc_raw = self._curv_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)         # (B,m) ratio
+        min_s1 = Ds1.min(dim=1, keepdim=True).values
+        max_s1 = Ds1.max(dim=1, keepdim=True).values
+        Ds1n = (Ds1 - min_s1) / (max_s1 - min_s1 + eps)
+        min_c = Dc_raw.min(dim=1, keepdim=True).values
+        max_c = Dc_raw.max(dim=1, keepdim=True).values
+        Dcn = (Dc_raw - min_c) / (max_c - min_c + eps)
+        return torch.sqrt((Dg * Dg + Ds1n * Ds1n + Dcn * Dcn) / 3.0)
+
+    @torch.no_grad()
+    def _s1gcurv_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        S1GCURV: RMS of three [0,1] distances:
+          - D_s1 = S1/200 clamped to [0,1]
+          - D_edge = G-SSIM distance in [0,1]
+          - D_curv = 0.5 * curvature S1-like ratio on Laplacians in [0,1]
+        Returns (B,m).
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        D1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)                 # (B,m) ~0..200
+        D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)                           # (B,m) in [0,1]
+        Dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)              # (B,m) in [0,1]
+        Dc = self._curv_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)            # (B,m) ~0..2
+        Dcurv = 0.5 * Dc                                                          # (B,m) in [0,1]
+        return torch.sqrt((D1n * D1n + Dg * Dg + Dcurv * Dcurv) / 3.0)
+
+    @torch.no_grad()
     def _distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         if self.activation_distance == 's1':
             return self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
@@ -462,6 +903,20 @@ class MiniSom:
             dS1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
             dSSIM = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
             return dS1 * dSSIM
+        elif self.activation_distance == 's3d':
+            return self._s3d_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'cfsd':
+            return self._cfsd_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'hff':
+            return self._hff_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 's1gk':
+            return self._s1gk_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 's1gcurv':
+            return self._s1gcurv_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'gsmd':
+            return self._gsmd_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 's1gl':
+            return self._s1gl_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 's1gssim':
             return self._s1gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'gssim':
@@ -587,6 +1042,211 @@ class MiniSom:
         return torch.sqrt((d_edge * d_edge + dS1n * dS1n) / 2.0)
 
     @torch.no_grad()
+    def _s1gl_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        DSGC (to ref): Dedge (grad structure) + Dcurv (curvature SSIM) + normalized S1, combined by RMS.
+        Returns (B,)
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+
+        # Gradients
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        dRdx = ref[:, 1:] - ref[:, :-1]
+        dRdy = ref[1:, :] - ref[:-1, :]
+
+        dXdx_c, dXdy_c = dXdx[:, :-1, :], dXdy[:, :, :-1]            # (B,H-1,W-1)
+        dRdx_c, dRdy_c = dRdx[:-1, :], dRdy[:, :-1]                  # (H-1,W-1)
+        magX = torch.sqrt(dXdx_c * dXdx_c + dXdy_c * dXdy_c + eps)   # (B,H-1,W-1)
+        magR = torch.sqrt(dRdx_c * dRdx_c + dRdy_c * dRdy_c + eps)   # (H-1,W-1)
+
+        # Gradient magnitude SSIM (5x5, C=0)
+        self._ensure_kernel5()
+        Xg = magX.unsqueeze(1)                          # (B,1,.,.)
+        Rg = magR.unsqueeze(0).unsqueeze(1)             # (1,1,.,.)
+        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        Rg_pad = F.pad(Rg, (2, 2, 2, 2), mode='reflect')
+        mu_x = F.conv2d(Xg_pad, self._kernel5, padding=0)
+        mu_r = F.conv2d(Rg_pad, self._kernel5, padding=0)
+        mu_x2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
+        mu_r2 = F.conv2d(Rg_pad * Rg_pad, self._kernel5, padding=0)
+        var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)
+        var_r = torch.clamp(mu_r2 - mu_r * mu_r, min=0.0)
+        mu_xr = F.conv2d(F.pad(Xg * Rg, (2, 2, 2, 2), mode='reflect'), self._kernel5, padding=0)
+        cov = mu_xr - mu_x * mu_r
+        ssim_map = (2 * mu_x * mu_r * 2 * cov) / ((mu_x * mu_x + mu_r * mu_r) * (var_x + var_r) + eps)
+        ssim_avg = ssim_map.mean(dim=(1, 2, 3))
+        d_g = 0.5 * (1.0 - ssim_avg)                    # (B,)
+
+        # Gradient direction (weighted cosine)
+        dot = dXdx_c * dRdx_c.unsqueeze(0) + dXdy_c * dRdy_c.unsqueeze(0)
+        denom = magX * magR.unsqueeze(0) + eps
+        cos = (dot / denom).clamp(-1.0, 1.0)
+        wgt = torch.maximum(magX, magR.unsqueeze(0))
+        s_dir = (cos * wgt).flatten(1).sum(dim=1) / (wgt.flatten(1).sum(dim=1) + eps)
+        d_dir = 0.5 * (1.0 - s_dir)
+        d_edge = 0.5 * (d_g + d_dir)                    # (B,)
+
+        # Curvature (Laplacian) SSIM with weight w2
+        self._ensure_lap_kernel()
+        Lx = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (B,H-2,W-2)
+        Lr = F.conv2d(ref.view(1, 1, H, W), self._lap_kernel, padding=0).squeeze(0).squeeze(0)  # (H-2,W-2)
+
+        Lx1 = Lx.unsqueeze(1)                       # (B,1,H-2,W-2)
+        Lr1 = Lr.unsqueeze(0).unsqueeze(1)          # (1,1,H-2,W-2)
+        Lx_pad = F.pad(Lx1, (2, 2, 2, 2), mode='reflect')
+        Lr_pad = F.pad(Lr1, (2, 2, 2, 2), mode='reflect')
+        mu_lx = F.conv2d(Lx_pad, self._kernel5, padding=0)
+        mu_lr = F.conv2d(Lr_pad, self._kernel5, padding=0)
+        mu_lx2 = F.conv2d(Lx_pad * Lx_pad, self._kernel5, padding=0)
+        mu_lr2 = F.conv2d(Lr_pad * Lr_pad, self._kernel5, padding=0)
+        var_lx = torch.clamp(mu_lx2 - mu_lx * mu_lx, min=0.0)
+        var_lr = torch.clamp(mu_lr2 - mu_lr * mu_lr, min=0.0)
+        mu_xl = F.conv2d(F.pad(Lx1 * Lr1, (2, 2, 2, 2), mode='reflect'), self._kernel5, padding=0)
+        cov_l = mu_xl - mu_lx * mu_lr
+
+        ssim_l = (2 * mu_lx * mu_lr * 2 * cov_l) / ((mu_lx * mu_lx + mu_lr * mu_lr) * (var_lx + var_lr) + eps)  # (B,1,H-2,W-2)
+        w2 = torch.maximum(torch.abs(Lx), torch.abs(Lr).unsqueeze(0))  # (B,H-2,W-2)
+        Scurv = (ssim_l.squeeze(1) * w2).flatten(1).sum(dim=1) / (w2.flatten(1).sum(dim=1) + eps)
+        Dcurv = 1.0 - Scurv                                            # (B,)
+
+        # S1 row-wise min-max normalization within batch
+        dS1 = self._s1_to_ref(Xb, ref)                  # (B,)
+        min_s1, _ = dS1.min(dim=0, keepdim=True)
+        max_s1, _ = dS1.max(dim=0, keepdim=True)
+        dS1n = (dS1 - min_s1) / (max_s1 - min_s1 + eps)
+
+        return torch.sqrt((d_edge * d_edge + Dcurv * Dcurv + dS1n * dS1n) / 3.0)
+
+    @torch.no_grad()
+    def _s1norm_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        Dimensionless S1-like distance to ref in [0,1]: D = 0.5 * r
+        """
+        eps = 1e-12
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        dRdx = ref[:, 1:] - ref[:, :-1]
+        dRdy = ref[1:, :] - ref[:-1, :]
+        num = (torch.abs(dXdx - dRdx.view(1, *dRdx.shape)).sum(dim=(1, 2)) +
+               torch.abs(dXdy - dRdy.view(1, *dRdy.shape)).sum(dim=(1, 2)))
+        den = (torch.maximum(torch.abs(dXdx), torch.abs(dRdx).view(1, *dRdx.shape)).sum(dim=(1, 2)) +
+               torch.maximum(torch.abs(dXdy), torch.abs(dRdy).view(1, *dRdy.shape)).sum(dim=(1, 2)))
+        r = num / (den + eps)
+        return 0.5 * r
+
+    @torch.no_grad()
+    def _moment_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        Moment-based distance to ref in [0,1].
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+        d2norm = math.sqrt(2.0)
+
+        # batch side centroids
+        Xp = torch.clamp(Xb, min=0.0); Xn = torch.clamp(-Xb, min=0.0)
+        mp_b = Xp.sum(dim=(1, 2), keepdim=True)
+        mn_b = Xn.sum(dim=(1, 2), keepdim=True)
+        cxp_b = (Xp * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mp_b + eps)
+        cyp_b = (Xp * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mp_b + eps)
+        cxn_b = (Xn * self._xnorm).sum(dim=(1, 2), keepdim=True) / (mn_b + eps)
+        cyn_b = (Xn * self._ynorm).sum(dim=(1, 2), keepdim=True) / (mn_b + eps)
+        cxp_b[mp_b <= eps] = 0.5; cyp_b[mp_b <= eps] = 0.5
+        cxn_b[mn_b <= eps] = 0.5; cyn_b[mn_b <= eps] = 0.5
+        cxp_b = cxp_b.squeeze(-1).squeeze(-1); cyp_b = cyp_b.squeeze(-1).squeeze(-1)
+        cxn_b = cxn_b.squeeze(-1).squeeze(-1); cyn_b = cyn_b.squeeze(-1).squeeze(-1)
+
+        # ref side centroids
+        Rp = torch.clamp(ref, min=0.0); Rn = torch.clamp(-ref, min=0.0)
+        mrp = Rp.sum(); mrn = Rn.sum()
+        cxp_r = (Rp * self._xnorm.squeeze(0)).sum() / (mrp + eps)
+        cyp_r = (Rp * self._ynorm.squeeze(0)).sum() / (mrp + eps)
+        cxn_r = (Rn * self._xnorm.squeeze(0)).sum() / (mrn + eps)
+        cyn_r = (Rn * self._ynorm.squeeze(0)).sum() / (mrn + eps)
+        if mrp <= eps:
+            cxp_r = torch.tensor(0.5, device=Xb.device, dtype=Xb.dtype)
+            cyp_r = torch.tensor(0.5, device=Xb.device, dtype=Xb.dtype)
+        if mrn <= eps:
+            cxn_r = torch.tensor(0.5, device=Xb.device, dtype=Xb.dtype)
+            cyn_r = torch.tensor(0.5, device=Xb.device, dtype=Xb.dtype)
+
+        dpos = torch.sqrt((cxp_b - cxp_r)**2 + (cyp_b - cyp_r)**2) / d2norm
+        dneg = torch.sqrt((cxn_b - cxn_r)**2 + (cyn_b - cyn_r)**2) / d2norm
+        return 0.5 * (dpos + dneg)
+
+    @torch.no_grad()
+    def _gsmd_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        Dg = self._gssim_to_ref(Xb, ref)
+        Ds = self._s1norm_to_ref(Xb, ref)
+        Dm = self._moment_to_ref(Xb, ref)
+        return torch.sqrt((Dg * Dg + Ds * Ds + Dm * Dm) / 3.0)
+
+    @torch.no_grad()
+    def _kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        Kappa curvature distance to ref in [0,1]: D_k = 0.5 * Σ|κ(X)-κ(ref)| / Σ max(|κ(X)|,|κ(ref)|)
+        """
+        eps = 1e-12
+        kx = self._kappa_field(Xb)                       # (B,hk,wk)
+        kr = self._kappa_field(ref.unsqueeze(0)).squeeze(0)  # (hk,wk)
+        num = torch.abs(kx - kr.unsqueeze(0)).flatten(1).sum(dim=1)
+        den = torch.maximum(kx.abs(), kr.abs().unsqueeze(0)).flatten(1).sum(dim=1)
+        return 0.5 * (num / (den + eps))
+
+    @torch.no_grad()
+    def _s1gk_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        S1GK (to ref): RMS of row-normalized S1, G-SSIM distance, and row-normalized Kappa curvature distance.
+        """
+        eps = 1e-12
+        d1 = self._s1_to_ref(Xb, ref)        # (B,)
+        dg = self._gssim_to_ref(Xb, ref)     # (B,)
+        dk = self._kappa_to_ref(Xb, ref)     # (B,)
+        d1_min, _ = d1.min(dim=0, keepdim=True)
+        d1_max, _ = d1.max(dim=0, keepdim=True)
+        dk_min, _ = dk.min(dim=0, keepdim=True)
+        dk_max, _ = dk.max(dim=0, keepdim=True)
+        d1n = (d1 - d1_min) / (d1_max - d1_min + eps)
+        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
+        return torch.sqrt((d1n * d1n + dg * dg + dkn * dkn) / 3.0)
+
+    @torch.no_grad()
+    def _hff_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        HFF (to ref): D = (1 - SSIM5)^2 + SSIM5 * (1 - GSSIM) = dL^2 + (1 - dL) * dG
+        Returns (B,)
+        """
+        dL = self._ssim5_to_ref(Xb, ref)  # (B,)
+        dG = self._gssim_to_ref(Xb, ref)  # (B,)
+        return dL * dL + (1.0 - dL) * dG
+
+    @torch.no_grad()
+    def _s3d_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        S3D to ref: sqrt((dL^2 + dG^2 + dC^2)/3), where
+          dL = 1 - SSIM5(A,B), dG = gssim distance, dC = curvature structural distance.
+        """
+        dL = self._ssim5_to_ref(Xb, ref)
+        dG = self._gssim_to_ref(Xb, ref)
+        # curvature structural to ref
+        eps = 1e-12
+        B, H, W = Xb.shape
+        self._ensure_lap_kernel()
+        LA = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (B,h2,w2)
+        LR = F.conv2d(ref.view(1, 1, H, W), self._lap_kernel, padding=0).squeeze(0).squeeze(0)  # (h2,w2)
+        KA = torch.abs(LA); sA = torch.sign(LA)
+        KR = torch.abs(LR); sR = torch.sign(LR)
+        KR_b = KR.unsqueeze(0)
+        Smag = (2.0 * KA * KR_b) / (KA * KA + KR_b * KR_b + eps)
+        Ssign = 0.5 * (1.0 + sA * sR.unsqueeze(0))
+        w = torch.maximum(KA, KR_b)
+        S = (Smag * Ssign * w).flatten(1).sum(dim=1) / (w.flatten(1).sum(dim=1) + eps)
+        dC = 1.0 - S
+        return torch.sqrt((dL * dL + dG * dG + dC * dC) / 3.0)
+
+    @torch.no_grad()
     def _gssim_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         gssim の対参照距離： D = 1 - S_GS （勾配強度・方向の重み付き類似度）
@@ -613,6 +1273,57 @@ class MiniSom:
         w = torch.maximum(gmagX, gmagR.unsqueeze(0))
         sim = (S * w).flatten(1).sum(dim=1) / (w.flatten(1).sum(dim=1) + eps)   # (B,)
         return 1.0 - sim
+
+    @torch.no_grad()
+    def _curv_s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        Curvature S1-like ratio to reference on Laplacian fields, optionally area-weighted.
+        Returns (B,)
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+        self._ensure_lap_kernel()
+        Lx = F.conv2d(Xb.unsqueeze(1), self._lap_kernel, padding=0).squeeze(1)  # (B,H-2,W-2)
+        Lr = F.conv2d(ref.view(1,1,H,W), self._lap_kernel, padding=0).squeeze(0).squeeze(0)  # (H-2,W-2)
+        diff = torch.abs(Lx - Lr.unsqueeze(0))                                   # (B,H-2,W-2)
+        denom = torch.maximum(torch.abs(Lx), torch.abs(Lr).unsqueeze(0))         # (B,H-2,W-2)
+        if self.area_w is not None:
+            w_inner = self.area_w[1:-1,1:-1].view(1, H-2, W-2)
+            num_s = (diff * w_inner).flatten(1).sum(dim=1)
+            den_s = (denom * w_inner).flatten(1).sum(dim=1) + eps
+        else:
+            num_s = diff.flatten(1).sum(dim=1)
+            den_s = denom.flatten(1).sum(dim=1) + eps
+        return num_s / den_s
+
+    @torch.no_grad()
+    def _cfsd_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        CFSD to reference: RMS of Dg (G-SSIM), normalized S1, normalized curvature S1 across batch rows.
+        """
+        eps = 1e-12
+        Dg = self._gssim_to_ref(Xb, ref)            # (B,)
+        Ds1 = self._s1_to_ref(Xb, ref)              # (B,)
+        Dc = self._curv_s1_to_ref(Xb, ref)          # (B,)
+        min_s1, _ = Ds1.min(dim=0, keepdim=True)
+        max_s1, _ = Ds1.max(dim=0, keepdim=True)
+        min_c, _ = Dc.min(dim=0, keepdim=True)
+        max_c, _ = Dc.max(dim=0, keepdim=True)
+        Ds1n = (Ds1 - min_s1) / (max_s1 - min_s1 + eps)
+        Dcn = (Dc - min_c) / (max_c - min_c + eps)
+        return torch.sqrt((Dg * Dg + Ds1n * Ds1n + Dcn * Dcn) / 3.0)
+
+    @torch.no_grad()
+    def _s1gcurv_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        S1GCURV (to ref): RMS of D_s1 (=S1/200), D_edge (=G-SSIM distance), and D_curv (=0.5 * curvature S1-like ratio).
+        Returns (B,)
+        """
+        d1 = self._s1_to_ref(Xb, ref)       # (B,) percent
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        dEdge = self._gssim_to_ref(Xb, ref) # (B,)
+        dCurv = 0.5 * self._curv_s1_to_ref(Xb, ref)  # (B,)
+        return torch.sqrt((d1n * d1n + dEdge * dEdge + dCurv * dCurv) / 3.0)
 
     @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -664,6 +1375,20 @@ class MiniSom:
             dS1 = self._s1_to_ref(Xb, ref)
             dSSIM = self._ssim5_to_ref(Xb, ref)
             return dS1 * dSSIM
+        elif self.activation_distance == 's3d':
+            return self._s3d_to_ref(Xb, ref)
+        elif self.activation_distance == 'cfsd':
+            return self._cfsd_to_ref(Xb, ref)
+        elif self.activation_distance == 'hff':
+            return self._hff_to_ref(Xb, ref)
+        elif self.activation_distance == 's1gk':
+            return self._s1gk_to_ref(Xb, ref)
+        elif self.activation_distance == 's1gcurv':
+            return self._s1gcurv_to_ref(Xb, ref)
+        elif self.activation_distance == 'gsmd':
+            return self._gsmd_to_ref(Xb, ref)
+        elif self.activation_distance == 's1gl':
+            return self._s1gl_to_ref(Xb, ref)
         elif self.activation_distance == 's1gssim':
             return self._s1gssim_to_ref(Xb, ref)
         elif self.activation_distance == 'gssim':

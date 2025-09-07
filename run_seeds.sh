@@ -50,8 +50,8 @@ EOF
 }
 
 # Defaults
-START=19
-END=50
+START=1
+END=6
 GPU0=0
 GPU1=1
 CHANNEL="gpu02"
