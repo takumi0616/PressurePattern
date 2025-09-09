@@ -1,4 +1,4 @@
-# main_v4.py
+# main_v5.py
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -14,6 +14,7 @@ import pandas as pd
 import xarray as xr
 import torch
 import torch.nn.functional as F
+import math
 
 import matplotlib
 matplotlib.use('Agg')  # サーバ上でも保存できるように
@@ -92,10 +93,10 @@ def set_reproducibility(seed: int = 42):
         pass
 
 
-def setup_logging_v4():
+def setup_logging_v5():
     for d in [RESULT_DIR, LEARNING_ROOT, VERIF_ROOT]:
         os.makedirs(d, exist_ok=True)
-    log_path = os.path.join(RESULT_DIR, 'run_v4.log')
+    log_path = os.path.join(RESULT_DIR, 'run_v5.log')
     if os.path.exists(log_path):
         os.remove(log_path)
     logging.basicConfig(
@@ -103,7 +104,7 @@ def setup_logging_v4():
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[logging.FileHandler(log_path), logging.StreamHandler()]
     )
-    logging.info("ログ初期化完了（run_v4.log）。")
+    logging.info("ログ初期化完了（run_v5.log）。")
 
 
 # =====================================================
@@ -1108,6 +1109,134 @@ def _s3d_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     dC = _curv_struct_dist_to_ref(Xb, ref)
     return torch.sqrt((dL*dL + dG*dG + dC*dC) / 3.0)
 
+def _spot_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    SPOT: Sliced Wasserstein-1 distance (fixed 16 projections, 64 bins), positive/negative mass average.
+    Grid-normalized coordinates [0,1]^2, area weight未使用（近似）。
+    Returns (B,) in [0,1].
+    """
+    device = Xb.device; dtype = Xb.dtype
+    B, H, W = Xb.shape
+    # mass split and normalization
+    Ap = torch.clamp(Xb, min=0.0).flatten(1)
+    An = torch.clamp(-Xb, min=0.0).flatten(1)
+    Wp = torch.clamp(ref, min=0.0).flatten()
+    Wn = torch.clamp(-ref, min=0.0).flatten()
+    Ap = Ap / (Ap.sum(dim=1, keepdim=True).clamp(min=1e-12))
+    An = An / (An.sum(dim=1, keepdim=True).clamp(min=1e-12))
+    Wp = Wp / (Wp.sum().clamp(min=1e-12))
+    Wn = Wn / (Wn.sum().clamp(min=1e-12))
+    # coords
+    x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, W).expand(1, H, W)
+    y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, H, 1).expand(1, H, W)
+    x = x.view(-1); y = y.view(-1)  # (H*W,)
+    # projections
+    K = 16; N_BINS = 64; L = (2.0 ** 0.5)
+    thetas = torch.linspace(0.0, math.pi, K, device=device, dtype=dtype)
+    bin_edges = torch.linspace(0.0, L, N_BINS + 1, device=device, dtype=dtype)
+    bin_width = (L / N_BINS)
+    def _emd_side(Mb_flat: torch.Tensor, Mm_flat: torch.Tensor):
+        # Mb_flat: (B,HW), Mm_flat: (HW,)
+        emds = torch.zeros((B, K), device=device, dtype=dtype)
+        for ki, t in enumerate(thetas):
+            s = (x * torch.cos(t) + y * torch.sin(t))  # (HW,)
+            idx = torch.bucketize(s, bin_edges) - 1
+            idx = idx.clamp(min=0, max=N_BINS - 1)
+            # batch hist
+            HB = torch.zeros((B, N_BINS), device=device, dtype=dtype)
+            HB.scatter_add_(1, idx.unsqueeze(0).expand(B, -1), Mb_flat)
+            HM = torch.zeros((N_BINS,), device=device, dtype=dtype)
+            HM.scatter_add_(0, idx, Mm_flat)
+            # normalize to 1
+            HB = HB / (HB.sum(dim=1, keepdim=True).clamp(min=1e-12))
+            HM = HM / (HM.sum().clamp(min=1e-12))
+            # CDFs
+            CDFB = torch.cumsum(HB, dim=1)
+            CDFM = torch.cumsum(HM, dim=0)
+            diff = (CDFB - CDFM.view(1, -1)).abs().sum(dim=1) * bin_width
+            # normalize by L
+            emds[:, ki] = diff / L
+        return emds.mean(dim=1)  # (B,)
+    Dp = _emd_side(Ap, Wp)
+    Dn = _emd_side(An, Wn)
+    return 0.5 * (Dp + Dn)
+
+def _gvd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    GVD to ref: second-derivative invariants distance averaged over inner grid.
+    Returns (B,) in [0,1].
+    """
+    device = Xb.device; dtype = Xb.dtype
+    B, H, W = Xb.shape
+    def _second(Z):
+        Z_xx = Z[..., 2:, 1:-1] - 2.0 * Z[..., 1:-1, 1:-1] + Z[..., :-2, 1:-1]
+        Z_yy = Z[..., 1:-1, 2:] - 2.0 * Z[..., 1:-1, 1:-1] + Z[..., 1:-1, :-2]
+        Z_xy = (Z[..., 2:, 2:] - Z[..., 2:, :-2] - Z[..., :-2, 2:] + Z[..., :-2, :-2]) * 0.25
+        return Z_xx, Z_yy, Z_xy
+    X_xx, X_yy, X_xy = _second(Xb)
+    R_xx, R_yy, R_xy = _second(ref.view(1, H, W))
+    def _inv(Z_xx, Z_yy, Z_xy):
+        L = Z_xx + Z_yy
+        S = torch.sqrt((Z_xx - Z_yy) * (Z_xx - Z_yy) + (2.0 * Z_xy) * (2.0 * Z_xy) + 1e-12)
+        theta = 0.5 * torch.atan2(2.0 * Z_xy, (Z_xx - Z_yy + 1e-12))
+        return L, S, theta
+    Lx, Sx, thx = _inv(X_xx, X_yy, X_xy)
+    Lr, Sr, thr = _inv(R_xx, R_yy, R_xy)
+    # normalize L,S per sample/ref
+    w_inner = torch.ones((H - 2, W - 2), device=device, dtype=dtype)
+    def _norm_LS(L, S):
+        Lsum = (L.abs() * w_inner).flatten(1).sum(dim=1, keepdim=True).clamp(min=1e-12)
+        Ssum = (S * w_inner).flatten(1).sum(dim=1, keepdim=True).clamp(min=1e-12)
+        return L / Lsum.view(-1, 1, 1), S / Ssum.view(-1, 1, 1)
+    Lx, Sx = _norm_LS(Lx, Sx)
+    Lr0, Sr0 = _norm_LS(Lr, Sr)
+    Lr = Lr0[0]; Sr = Sr0[0]; thr = thr[0]
+    Wsum = w_inner.sum()
+    d_vort = ((Lx - Lr.unsqueeze(0)).abs() * w_inner).flatten(1).sum(dim=1) / Wsum
+    d_def  = ((Sx - Sr.unsqueeze(0)).abs() * w_inner).flatten(1).sum(dim=1) / Wsum
+    d_axis = (1.0 - torch.cos(2.0 * (thx - thr.unsqueeze(0)))) * w_inner
+    d_axis = d_axis.flatten(1).sum(dim=1) / Wsum
+    return torch.sqrt((d_vort * d_vort + d_def * d_def + d_axis * d_axis) / 3.0)
+
+def _itcs_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    ITCS to ref: quantile-based area fraction & centroid signature distance, pos/neg average.
+    Returns (B,) in [0,1].
+    """
+    device = Xb.device; dtype = Xb.dtype
+    B, H, W = Xb.shape
+    qs = torch.linspace(0.1, 0.9, 9, device=device, dtype=dtype)
+    x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, W).expand(1, H, W).view(-1)
+    y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, H, 1).expand(1, H, W).view(-1)
+    w = torch.ones((H * W,), device=device, dtype=dtype)
+    def _sig(Z: torch.Tensor):
+        N = Z.shape[0]
+        Zf = Z.view(N, -1)
+        t = torch.quantile(Zf, qs, dim=1, interpolation='linear')  # (N,9)
+        phi = []; cx = []; cy = []
+        for qi in range(qs.numel()):
+            thr = t[:, qi].view(N, 1)
+            M = (Zf >= thr).to(dtype)
+            wM = M * w.view(1, -1)
+            a = wM.sum(dim=1).clamp(min=1e-12)
+            phi.append((a / w.sum()).view(N, 1))
+            cx.append(((wM * x.view(1, -1)).sum(dim=1) / a).view(N, 1))
+            cy.append(((wM * y.view(1, -1)).sum(dim=1) / a).view(N, 1))
+        return torch.cat(phi, dim=1), torch.cat(cx, dim=1), torch.cat(cy, dim=1)
+    # positive side
+    phiB_p, cxB_p, cyB_p = _sig(Xb)
+    phiR_p, cxR_p, cyR_p = _sig(ref.view(1, H, W))
+    dphi_p = (phiB_p - phiR_p.view(1, -1)).abs().mean(dim=1)
+    dc_p = torch.sqrt((cxB_p - cxR_p.view(1, -1))**2 + (cyB_p - cyR_p.view(1, -1))**2).mean(dim=1) / (2.0 ** 0.5)
+    Dp = 0.5 * dphi_p + 0.5 * dc_p
+    # negative side (apply on -Z with same routine)
+    phiB_n, cxB_n, cyB_n = _sig(-Xb)
+    phiR_n, cxR_n, cyR_n = _sig((-ref).view(1, H, W))
+    dphi_n = (phiB_n - phiR_n.view(1, -1)).abs().mean(dim=1)
+    dc_n = torch.sqrt((cxB_n - cxR_n.view(1, -1))**2 + (cyB_n - cyR_n.view(1, -1))**2).mean(dim=1) / (2.0 ** 0.5)
+    Dn = 0.5 * dphi_n + 0.5 * dc_n
+    return 0.5 * (Dp + Dn)
+
 
 def compute_node_true_medoids(
     method_name: str,
@@ -1273,6 +1402,15 @@ def compute_node_true_medoids(
             elif method_name == 'gssim':
                 # 勾配構造類似ベースの距離（[0,1]）
                 D = pairwise_by_ref(lambda Xb, ref: _gssim_dist_to_ref(Xb, ref), Xcand)
+            elif method_name == 'spot':
+                # SPOT: sliced Wasserstein-1 (正負平均)
+                D = pairwise_by_ref(lambda Xb, ref: _spot_to_ref(Xb, ref), Xcand)
+            elif method_name == 'gvd':
+                # GVD: 二階微分不変量
+                D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
+            elif method_name == 'itcs':
+                # ITCS: トポロジー＆重心シグネチャ
+                D = pairwise_by_ref(lambda Xb, ref: _itcs_to_ref(Xb, ref), Xcand)
             else:
                 raise ValueError(f'Unknown method_name: {method_name}')
 
@@ -2174,7 +2312,7 @@ def main():
     VERIF_ROOT = os.path.join(RESULT_DIR, 'verification_results')
 
     set_reproducibility(SEED)
-    setup_logging_v4()
+    setup_logging_v5()
     device = dev
     logging.info(f"使用デバイス: {device} ({gpu_name})")
     logging.info(f"SOM(3type): size={SOM_X}x{SOM_Y}, iters={NUM_ITER}, batch={BATCH_SIZE}, nodes_chunk={NODES_CHUNK}")
@@ -2212,6 +2350,8 @@ def main():
         ('euclidean',   'euclidean'),
         ('ssim5',       'ssim5'),        # 論文仕様（5x5窓・C=0）版SSIM
         ('s1',          's1'),
+        ('ms_s1',       'ms_s1'),        # Multi-Scale S1
+        ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
         ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
         ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
         ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
@@ -2223,7 +2363,11 @@ def main():
         ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
         ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
         ('s1gk',        's1gk'),         # 新提案: S1GK (S1 + G-SSIM + Kappa curvature)
-        ('gssim',       'gssim')         # 新提案: 勾配構造類似距離
+        ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
+        ('spot',        'spot'),         # 新提案: SPOT (Optimal Transport)
+        ('gvd',         'gvd'),          # 新提案: GVD (Vorticity–Deformation)
+        ('itcs',        'itcs'),         # 新提案: ITCS (Topology & Centroid Signature)
+        ('s1gcurv',    's1gcurv')       # 新提案: S1GCurv (S1 + Gradient Curvature)
     ]
     for mname, adist in methods:
         # 学習

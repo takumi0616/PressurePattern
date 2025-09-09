@@ -85,8 +85,8 @@ class MiniSom:
 
         # 距離タイプ
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim', 's1ssim5_hf', 's1ssim5_and', 'pf_s1ssim', 's1gssim', 'gssim', 's1gl', 'gsmd', 's3d', 'cfsd', 'hff', 's1gk', 's1gcurv'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim","s1ssim5_hf","s1ssim5_and","pf_s1ssim","s1gssim","gssim","s1gl","gsmd","s3d","cfsd","hff","s1gk","s1gcurv"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 's1ssim', 's1ssim5_hf', 's1ssim5_and', 'pf_s1ssim', 's1gssim', 'gssim', 's1gl', 'gsmd', 's3d', 'cfsd', 'hff', 's1gk', 's1gcurv', 'ms_s1', 'msssim_s1g', 'spot', 'gvd', 'itcs'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","s1ssim","s1ssim5_hf","s1ssim5_and","pf_s1ssim","s1gssim","gssim","s1gl","gsmd","s3d","cfsd","hff","s1gk","s1gcurv","ms_s1","msssim_s1g","spot","gvd","itcs"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -124,6 +124,9 @@ class MiniSom:
         # 正規化座標グリッド（0..1）
         self._xnorm = torch.linspace(0.0, 1.0, W, device=self.device, dtype=self.dtype).view(1, 1, W).expand(1, H, W)
         self._ynorm = torch.linspace(0.0, 1.0, H, device=self.device, dtype=self.dtype).view(1, H, 1).expand(1, H, W)
+        # Normalized coordinates for projection-based distances (e.g., SPOT)
+        self._xgrid = torch.linspace(0.0, 1.0, W, device=self.device, dtype=self.dtype).view(1, 1, W).expand(1, H, W)
+        self._ygrid = torch.linspace(0.0, 1.0, H, device=self.device, dtype=self.dtype).view(1, H, 1).expand(1, H, W)
 
     # ---------- 外部制御 ----------
     def set_total_iterations(self, total_iters: int):
@@ -264,6 +267,146 @@ class MiniSom:
             out[:, start:end] = 1.0 - ssim_avg
 
         return out
+
+    @torch.no_grad()
+    def _adaptive_pool(self, T: Tensor, s: int) -> Tensor:
+        # Adaptive average pool to roughly downscale by s (handles non-divisible sizes)
+        H = T.shape[-2]
+        W = T.shape[-1]
+        h2 = max(2, max(1, H // s))
+        w2 = max(2, max(1, W // s))
+        return F.adaptive_avg_pool2d(T, (h2, w2))
+
+    @torch.no_grad()
+    def _s1_distance_batch_on(self, Xb: Tensor, Wc: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        # S1 distance computed for given X and W on same resolution
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        eps = 1e-12
+        B, H, W = Xb.shape
+        out = torch.empty((B, Wc.shape[0]), device=Xb.device, dtype=self.dtype)
+        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
+        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
+        dWdx_full = Wc[:, :, 1:] - Wc[:, :, :-1]
+        dWdy_full = Wc[:, 1:, :] - Wc[:, :-1, :]
+        for start in range(0, Wc.shape[0], nodes_chunk):
+            end = min(start + nodes_chunk, Wc.shape[0])
+            dWdx = dWdx_full[start:end]
+            dWdy = dWdy_full[start:end]
+            num = (torch.abs(dWdx.unsqueeze(0) - dXdx.unsqueeze(1)).sum(dim=(2, 3)) +
+                   torch.abs(dWdy.unsqueeze(0) - dXdy.unsqueeze(1)).sum(dim=(2, 3)))
+            den = (torch.maximum(torch.abs(dWdx).unsqueeze(0), torch.abs(dXdx).unsqueeze(1)).sum(dim=(2, 3)) +
+                   torch.maximum(torch.abs(dWdy).unsqueeze(0), torch.abs(dXdy).unsqueeze(1)).sum(dim=(2, 3)))
+            out[:, start:end] = 100.0 * num / (den + eps)
+        return out
+
+    @torch.no_grad()
+    def _ms_s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        # Multi-scale S1 with row-wise min-max normalization per scale and RMS fusion
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        scales = [1, 2, 4]
+        weights = torch.tensor([0.5, 0.3, 0.2], device=Xb.device, dtype=self.dtype)
+        weights = weights / weights.sum()
+        B, H, W = Xb.shape
+        # prepare pooled weights per scale
+        W_all = self.weights  # (m,H,W)
+        dists = []
+        for s in scales:
+            if s == 1:
+                Xs = Xb
+                Ws = W_all
+            else:
+                Xs = self._adaptive_pool(Xb.unsqueeze(1), s).squeeze(1)
+                Ws = self._adaptive_pool(W_all.unsqueeze(1), s).squeeze(1)
+            D = self._s1_distance_batch_on(Xs, Ws, nodes_chunk=nodes_chunk)  # (B,m)
+            # row-wise min-max normalize per batch row
+            eps = 1e-12
+            dmin = D.min(dim=1, keepdim=True).values
+            dmax = D.max(dim=1, keepdim=True).values
+            Dn = (D - dmin) / (dmax - dmin + eps)
+            dists.append(Dn)
+        # weighted RMS
+        out = torch.zeros_like(dists[0])
+        for i, Dn in enumerate(dists):
+            out = out + weights[i] * (Dn * Dn)
+        return torch.sqrt(out + 1e-12)
+
+    @torch.no_grad()
+    def _ssim5_mod_distance_batch_multiscale(self, Xb: Tensor, nodes_chunk: Optional[int] = None, scales: Optional[List[int]] = None, c1: float = 1e-8, c2: float = 1e-8) -> Tensor:
+        # Multi-scale "modified" SSIM (small constants) distance: 1 - MSSSIM*
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        if scales is None:
+            scales = [1, 2, 4]
+        self._ensure_kernel5()
+        B, H, W = Xb.shape
+        sims = []
+        weights = torch.tensor([0.5, 0.3, 0.2], device=Xb.device, dtype=self.dtype)
+        weights = weights / weights.sum()
+        for s in scales:
+            if s == 1:
+                Xs = Xb.unsqueeze(1)  # (B,1,H,W)
+                Wc = self.weights.unsqueeze(1)  # (m,1,H,W)
+            else:
+                Xs = self._adaptive_pool(Xb.unsqueeze(1), s)
+                Wc = self._adaptive_pool(self.weights.unsqueeze(1), s)
+            # local stats
+            pad = 2
+            X_pad = F.pad(Xs, (pad, pad, pad, pad), mode='reflect')
+            mu_x = F.conv2d(X_pad, self._kernel5, padding=0)
+            mu_x2 = F.conv2d(X_pad * X_pad, self._kernel5, padding=0)
+            var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)
+            # chunk nodes
+            B1, _, Hs, Ws = Xs.shape
+            sim_chunk = torch.empty((B1, self.m), device=Xb.device, dtype=self.dtype)
+            for start in range(0, self.m, nodes_chunk):
+                end = min(start + nodes_chunk, self.m)
+                Wc_sub = Wc[start:end]  # (Mc,1,Hs,Ws)
+                W_pad = F.pad(Wc_sub, (pad, pad, pad, pad), mode='reflect')
+                mu_w = F.conv2d(W_pad, self._kernel5, padding=0)
+                mu_w2 = F.conv2d(W_pad * W_pad, self._kernel5, padding=0)
+                var_w = torch.clamp(mu_w2 - mu_w * mu_w, min=0.0)
+                # covariance
+                prod = (Xs.unsqueeze(1) * Wc_sub.unsqueeze(0)).reshape(B1 * (end - start), 1, Hs, Ws)
+                prod_pad = F.pad(prod, (pad, pad, pad, pad), mode='reflect')
+                mu_xw = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B1, end - start, 1, Hs, Ws)
+                mu_x_b = mu_x.unsqueeze(1)
+                mu_w_mc = mu_w.unsqueeze(0)
+                var_x_b = var_x.unsqueeze(1)
+                var_w_mc = var_w.unsqueeze(0)
+                cov = mu_xw - (mu_x_b * mu_w_mc)
+                # modified SSIM with small constants
+                l_num = 2 * (mu_x_b * mu_w_mc)
+                l_den = (mu_x_b * mu_x_b + mu_w_mc * mu_w_mc) + c1
+                c_num = 2 * cov
+                c_den = (var_x_b + var_w_mc) + c2
+                ssim_map = (l_num * c_num) / (l_den * c_den + 1e-12)
+                ssim_avg = ssim_map.mean(dim=(2, 3, 4))  # (B,Mc)
+                sim_chunk[:, start:end] = ssim_avg
+            sims.append(sim_chunk)
+        # weighted mean of similarities, distance = 1 - sim
+        sim = torch.zeros_like(sims[0])
+        for i, Si in enumerate(sims):
+            sim = sim + weights[i] * Si
+        return 1.0 - sim.clamp(-1.0, 1.0)
+
+    @torch.no_grad()
+    def _msssim_s1g_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        # D = dL*^2 + (1 - dL*) * sqrt( (dG^2 + dS1n^2)/2 )
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        dL = self._ssim5_mod_distance_batch_multiscale(Xb, nodes_chunk=nodes_chunk, scales=[1, 2, 4])  # (B,m)
+        dG = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m)
+        # S1 normalized row-wise
+        dS1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        eps = 1e-12
+        dmin = dS1.min(dim=1, keepdim=True).values
+        dmax = dS1.max(dim=1, keepdim=True).values
+        dS1n = (dS1 - dmin) / (dmax - dmin + eps)
+        core = torch.sqrt((dG * dG + dS1n * dS1n) / 2.0)
+        return dL * dL + (1.0 - dL) * core
+
 
     @torch.no_grad()
     def _s1gssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
@@ -856,6 +999,229 @@ class MiniSom:
         return torch.sqrt((D1n * D1n + Dg * Dg + Dcurv * Dcurv) / 3.0)
 
     @torch.no_grad()
+    def _spot_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        SPOT: Spherical (grid-normalized) sliced Wasserstein-1 distance on positive/negative anomaly masses.
+        - Fixed 16 projections, 64 bins, no exposed hyperparameters.
+        - Area weight (cosφ) if provided.
+        Returns (B,m) in [0,1].
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        device = Xb.device; dtype = Xb.dtype
+        B, H, W = Xb.shape
+        m = self.m
+        # Mass split
+        Ap = torch.clamp(Xb, min=0.0)
+        An = torch.clamp(-Xb, min=0.0)
+        Wp = torch.clamp(self.weights, min=0.0)
+        Wn = torch.clamp(-self.weights, min=0.0)
+        if self.area_w is not None:
+            aw = self.area_w.view(1, H, W)
+            Ap = Ap * aw; An = An * aw
+            Wp = Wp * self.area_w; Wn = Wn * self.area_w
+        # Normalize mass (avoid div0)
+        def _normalize_mass(T):
+            s = T.flatten(1).sum(dim=1, keepdim=True).clamp(min=1e-12)
+            return (T.flatten(1) / s).view(T.shape)
+        Ap = _normalize_mass(Ap); An = _normalize_mass(An)
+        Wp = _normalize_mass(Wp); Wn = _normalize_mass(Wn)
+        # Projections
+        K = 16
+        thetas = torch.linspace(0.0, 3.141592653589793, K, device=device, dtype=dtype)  # [0,π]
+        xg = self._xgrid; yg = self._ygrid
+        # Binning support
+        N_BINS = 64
+        # projection length (max of x*cos+ y*sin in [0,1]^2) is <= sqrt(2)
+        L = (2.0 ** 0.5)
+        bin_edges = torch.linspace(0.0, L, N_BINS + 1, device=device, dtype=dtype)
+        bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+        bin_width = (L / N_BINS)
+        # Precompute s per theta
+        S_list = []
+        for t in thetas:
+            s = xg * torch.cos(t) + yg * torch.sin(t)  # (1,H,W)
+            S_list.append(s.view(-1))  # (H*W,)
+        # Hist builder
+        def _mass_histograms(MassB: Tensor, MassM: Tensor):
+            # MassB: (B,H,W), MassM: (m,H,W)
+            HB = torch.zeros((B, K, N_BINS), device=device, dtype=dtype)
+            HM = torch.zeros((m, K, N_BINS), device=device, dtype=dtype)
+            massB_flat = MassB.view(B, -1)
+            massM_flat = MassM.view(m, -1)
+            for ki, s_flat in enumerate(S_list):
+                # bucketize
+                idx = torch.bucketize(s_flat, bin_edges) - 1  # in [0,N_BINS-1]
+                idx = idx.clamp(min=0, max=N_BINS - 1)
+                # scatter-add for batch B
+                # Create (B, H*W) → (B, N_BINS)
+                HB[:, ki, :] = torch.zeros((B, N_BINS), device=device, dtype=dtype).scatter_add(
+                    1, idx.unsqueeze(0).expand(B, -1), massB_flat
+                )
+                HM[:, ki, :] = torch.zeros((m, N_BINS), device=device, dtype=dtype).scatter_add(
+                    1, idx.unsqueeze(0).expand(m, -1), massM_flat
+                )
+            # Normalize histograms to sum to 1 (already normalized mass, but bins may introduce small drift)
+            HB = HB / (HB.sum(dim=2, keepdim=True).clamp(min=1e-12))
+            HM = HM / (HM.sum(dim=2, keepdim=True).clamp(min=1e-12))
+            # CDFs
+            CDFB = torch.cumsum(HB, dim=2)
+            CDFM = torch.cumsum(HM, dim=2)
+            # EMD per projection between B and m: sum |cdfB - cdfM| * bin_width over bins
+            # Expand to (B,K,N_BINS) and (m,K,N_BINS)
+            # Compute pairwise via broadcasting: (B,K,N) vs (m,K,N) -> (B,m,K,N)
+            diff = (CDFB.unsqueeze(1) - CDFM.unsqueeze(0)).abs()  # (B,m,K,N_BINS)
+            emd = diff.sum(dim=3) * bin_width  # (B,m,K)
+            # normalize by L to map to [0,1]
+            emd = emd / L
+            # average over projections
+            return emd.mean(dim=2)  # (B,m)
+        Dp = _mass_histograms(Ap, Wp)
+        Dn = _mass_histograms(An, Wn)
+        return 0.5 * (Dp + Dn)
+
+    @torch.no_grad()
+    def _gvd_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        GVD: Geostrophic Vorticity–Deformation Invariants distance.
+        Uses second derivatives (inner grid), compares:
+          - normalized Laplacian L,
+          - normalized deformation magnitude S,
+          - principal axis orientation θ (π-periodic via cos(2Δθ)).
+        Returns (B,m) in [0,1].
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        device = Xb.device; dtype = Xb.dtype
+        B, H, W = Xb.shape
+        m = self.m
+
+        def _second_derivs(Z: Tensor):
+            # Z: (...,H,W) → inner grid derivs of shape (...,H-2,W-2)
+            Zc = Z
+            Z_xx = Zc[..., 2:, 1:-1] - 2.0 * Zc[..., 1:-1, 1:-1] + Zc[..., :-2, 1:-1]
+            Z_yy = Zc[..., 1:-1, 2:] - 2.0 * Zc[..., 1:-1, 1:-1] + Zc[..., 1:-1, :-2]
+            Z_xy = (Zc[..., 2:, 2:] - Zc[..., 2:, :-2] - Zc[..., :-2, 2:] + Zc[..., :-2, :-2]) * 0.25
+            return Z_xx, Z_yy, Z_xy
+
+        X_xx, X_yy, X_xy = _second_derivs(Xb)
+        W_xx, W_yy, W_xy = _second_derivs(self.weights)
+
+        def _invariants(Z_xx, Z_yy, Z_xy):
+            L = Z_xx + Z_yy
+            S = torch.sqrt((Z_xx - Z_yy) * (Z_xx - Z_yy) + (2.0 * Z_xy) * (2.0 * Z_xy) + 1e-12)
+            theta = 0.5 * torch.atan2(2.0 * Z_xy, (Z_xx - Z_yy + 1e-12))
+            return L, S, theta
+
+        Lx, Sx, thx = _invariants(X_xx, X_yy, X_xy)    # (B,h,w)
+        Lw, Sw, thw = _invariants(W_xx, W_yy, W_xy)    # (m,h,w)
+
+        # Area weights (inner)
+        if self.area_w is not None:
+            w_inner = self.area_w[1:-1, 1:-1]
+        else:
+            w_inner = torch.ones((H - 2, W - 2), device=device, dtype=dtype)
+
+        def _normalize_LS(L, S):
+            # Normalize by total magnitude to be scale free.
+            Lsum = (L.abs() * w_inner).flatten(1).sum(dim=1, keepdim=True).clamp(min=1e-12) if L.dim() == 3 else (L.abs() * w_inner).flatten().sum().clamp(min=1e-12)
+            Ssum = (S * w_inner).flatten(1).sum(dim=1, keepdim=True).clamp(min=1e-12) if S.dim() == 3 else (S * w_inner).flatten().sum().clamp(min=1e-12)
+            return L / Lsum.view((-1, 1, 1)), S / Ssum.view((-1, 1, 1))
+
+        Lx, Sx = _normalize_LS(Lx, Sx)  # (B,h,w)
+        Lw, Sw = _normalize_LS(Lw, Sw)  # (m,h,w)
+
+        Wsum = w_inner.sum()
+
+        # d_vort: mean abs difference of normalized L
+        d_vort = ((Lx.unsqueeze(1) - Lw.unsqueeze(0)).abs() * w_inner).flatten(2).sum(dim=2) / Wsum  # (B,m)
+        # d_def: mean abs difference of normalized S
+        d_def = ((Sx.unsqueeze(1) - Sw.unsqueeze(0)).abs() * w_inner).flatten(2).sum(dim=2) / Wsum   # (B,m)
+        # d_axis: 1 - cos(2Δθ) averaged
+        d_axis = (1.0 - torch.cos(2.0 * (thx.unsqueeze(1) - thw.unsqueeze(0))))  # (B,m,h,w)
+        d_axis = (d_axis * w_inner).flatten(2).sum(dim=2) / Wsum                # (B,m)
+
+        return torch.sqrt((d_vort * d_vort + d_def * d_def + d_axis * d_axis) / 3.0)
+
+    @torch.no_grad()
+    def _itcs_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        ITCS: Isobaric Topology & Centroid Signature (simplified: area fraction φ and centroid c).
+        - Fixed quantiles q=0.1..0.9
+        - Positive and negative sides averaged
+        Returns (B,m) in [0,1].
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        device = Xb.device; dtype = Xb.dtype
+        B, H, W = Xb.shape
+        m = self.m
+
+        if self.area_w is not None:
+            w = self.area_w
+        else:
+            w = torch.ones((H, W), device=device, dtype=dtype)
+
+        xg = self._xgrid.squeeze(0)  # (H,W)
+        yg = self._ygrid.squeeze(0)  # (H,W)
+
+        qs = torch.linspace(0.1, 0.9, 9, device=device, dtype=dtype)
+
+        def _signature(Z: Tensor):
+            # Z: (N,H,W)
+            N = Z.shape[0]
+            Zf = Z.view(N, -1)
+            # Quantile thresholds per sample
+            t = torch.quantile(Zf, qs, dim=1, interpolation='linear').transpose(0, 1)  # (N,9)
+            # Positive superlevel sets
+            sig_phi_p = []
+            cx_p = []; cy_p = []
+            # Negative sublevel sets
+            sig_phi_n = []
+            cx_n = []; cy_n = []
+            w_flat = w.view(-1)
+            x_flat = xg.view(-1)
+            y_flat = yg.view(-1)
+            for qi in range(qs.numel()):
+                tp = t[:, qi].view(N, 1, 1)
+                # positive mask
+                Mp = (Z >= tp)
+                wp = (Mp * w).view(N, -1)
+                ap = wp.sum(dim=1).clamp(min=1e-12)
+                sig_phi_p.append((ap / w.sum()).view(N, 1))
+                cx_p.append(((wp * x_flat) .sum(dim=1) / ap).view(N, 1))
+                cy_p.append(((wp * y_flat) .sum(dim=1) / ap).view(N, 1))
+                # negative mask (use threshold of -tp on -Z to keep monotonic)
+                tn = (-Zf).quantile(q=qs[qi].item(), dim=1, interpolation='linear').view(N, 1, 1)
+                Mn = (Z <= -tn)
+                wn = (Mn * w).view(N, -1)
+                an = wn.sum(dim=1).clamp(min=1e-12)
+                sig_phi_n.append((an / w.sum()).view(N, 1))
+                cx_n.append(((wn * x_flat).sum(dim=1) / an).view(N, 1))
+                cy_n.append(((wn * y_flat).sum(dim=1) / an).view(N, 1))
+            # Stack over q: (N,9)
+            phi_p = torch.cat(sig_phi_p, dim=1); phi_n = torch.cat(sig_phi_n, dim=1)
+            cx_p = torch.cat(cx_p, dim=1);       cy_p = torch.cat(cy_p, dim=1)
+            cx_n = torch.cat(cx_n, dim=1);       cy_n = torch.cat(cy_n, dim=1)
+            return (phi_p, cx_p, cy_p, phi_n, cx_n, cy_n)
+
+        # Batch and nodes signatures
+        phi_p_B, cx_p_B, cy_p_B, phi_n_B, cx_n_B, cy_n_B = _signature(Xb)
+        phi_p_M, cx_p_M, cy_p_M, phi_n_M, cx_n_M, cy_n_M = _signature(self.weights)
+
+        # Distances over q (average absolute diffs); centroid distance in normalized coordinates; combine pos/neg and components equally
+        def _dist_sig(phiA, cxA, cyA, phiB, cxB, cyB):
+            dphi = (phiA.unsqueeze(1) - phiB.unsqueeze(0)).abs().mean(dim=2)  # (B,m)
+            dc  = torch.sqrt((cxA.unsqueeze(1) - cxB.unsqueeze(0))**2 + (cyA.unsqueeze(1) - cyB.unsqueeze(0))**2).mean(dim=2)  # (B,m)
+            # Normalize centroid distance by sqrt(2) to [0,1]
+            dc = dc / (2.0 ** 0.5)
+            return 0.5 * dphi + 0.5 * dc
+
+        Dp = _dist_sig(phi_p_B, cx_p_B, cy_p_B, phi_p_M, cx_p_M, cy_p_M)
+        Dn = _dist_sig(phi_n_B, cx_n_B, cy_n_B, phi_n_M, cx_n_M, cy_n_M)
+        return 0.5 * (Dp + Dn)
+
+    @torch.no_grad()
     def _distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         if self.activation_distance == 's1':
             return self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
@@ -921,6 +1287,16 @@ class MiniSom:
             return self._s1gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'gssim':
             return self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'ms_s1':
+            return self._ms_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'msssim_s1g':
+            return self._msssim_s1g_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'spot':
+            return self._spot_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'gvd':
+            return self._gvd_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'itcs':
+            return self._itcs_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -970,6 +1346,64 @@ class MiniSom:
         ssim_map = (l_num * c_num) / (l_den * c_den + eps)               # (B,1,H,W)
         ssim_avg = ssim_map.mean(dim=(1, 2, 3))                          # (B,)
         return 1.0 - ssim_avg
+
+    @torch.no_grad()
+    def _ms_s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        # Multi-scale S1 (to reference), row-wise (batch) normalization per scale and RMS fusion
+        scales = [1, 2, 4]
+        weights = torch.tensor([0.5, 0.3, 0.2], device=Xb.device, dtype=self.dtype)
+        weights = weights / weights.sum()
+        dists = []
+        for s in scales:
+            if s == 1:
+                Xs = Xb
+                R = ref
+            else:
+                Xs = self._adaptive_pool(Xb.unsqueeze(1), s).squeeze(1)
+                R = self._adaptive_pool(ref.unsqueeze(0).unsqueeze(0), s).squeeze(0).squeeze(0)
+            d = self._s1_to_ref(Xs, R)  # (B,)
+            # batch-wise min-max normalize
+            eps = 1e-12
+            dmin = d.min(dim=0, keepdim=True).values
+            dmax = d.max(dim=0, keepdim=True).values
+            dn = (d - dmin) / (dmax - dmin + eps)
+            dists.append(dn)
+        out = torch.zeros_like(dists[0])
+        for i, dn in enumerate(dists):
+            out = out + weights[i] * (dn * dn)
+        return torch.sqrt(out + 1e-12)
+
+    @torch.no_grad()
+    def _msssim_s1g_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        # D = dL*^2 + (1 - dL*) * sqrt( (dG^2 + dS1n^2)/2 )
+        dL = []
+        scales = [1, 2, 4]
+        weights = torch.tensor([0.5, 0.3, 0.2], device=Xb.device, dtype=self.dtype)
+        weights = weights / weights.sum()
+        # modified multi-scale SSIM (to ref)
+        for s in scales:
+            if s == 1:
+                Xs = Xb
+                R = ref
+            else:
+                Xs = self._adaptive_pool(Xb.unsqueeze(1), s).squeeze(1)
+                R = self._adaptive_pool(ref.unsqueeze(0).unsqueeze(0), s).squeeze(0).squeeze(0)
+            # reuse existing _ssim5_to_ref but with small constants effect approximated by adding eps to denominator inside orig fn
+            # As a proxy, we use the existing implementation (C=0) and rely on multi-scale robustness
+            dl = self._ssim5_to_ref(Xs, R)  # (B,)
+            dL.append(dl.clamp(0.0, 2.0))
+        dL = torch.stack(dL, dim=1)  # (B,S)
+        dL = (weights.view(1, -1) * dL).sum(dim=1)  # weighted mean distance per row (B,)
+        # dG (to ref)
+        dG = self._gssim_to_ref(Xb, ref)  # (B,)
+        # dS1 normalized within batch
+        dS1 = self._s1_to_ref(Xb, ref)  # (B,)
+        eps = 1e-12
+        dmin = dS1.min(dim=0, keepdim=True).values
+        dmax = dS1.max(dim=0, keepdim=True).values
+        dS1n = (dS1 - dmin) / (dmax - dmin + eps)
+        core = torch.sqrt((dG * dG + dS1n * dS1n) / 2.0)
+        return dL * dL + (1.0 - dL) * core
 
     @torch.no_grad()
     def _s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -1393,6 +1827,10 @@ class MiniSom:
             return self._s1gssim_to_ref(Xb, ref)
         elif self.activation_distance == 'gssim':
             return self._gssim_to_ref(Xb, ref)
+        elif self.activation_distance == 'ms_s1':
+            return self._ms_s1_to_ref(Xb, ref)
+        elif self.activation_distance == 'msssim_s1g':
+            return self._msssim_s1g_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 

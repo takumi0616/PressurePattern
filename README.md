@@ -187,21 +187,24 @@ python main_v5.py --gpu 0 --seed 7 --result-dir ./results_gpu0_seed7
 - wsl-ubuntu → mac
 
 ```bash
-rsync -avz --progress wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/results_v5_* \
+rsync -avz --progress \
+  'wsl-ubuntu:/home/takumi/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{1,2}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_wsl-ubuntu
 ```
 
 - via-tml2 → mac
 
 ```bash
-rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/results_v5_* \
+rsync -avz --progress \
+  'via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{1,2}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_via-tml2
 ```
 
 - gpu01 → mac
 
 ```bash
-rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_* \
+rsync -avz --progress \
+  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{19,20}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu01
 ```
 
@@ -209,7 +212,7 @@ rsync -avz --progress gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/P
 
 ```bash
 rsync -avz --progress \
-  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{19,20,21,22,23,24,25,26}_*' \
+  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{11,12}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
 ```
 
@@ -267,6 +270,7 @@ nohup bash run_seeds.sh --start 1 --end 10 --gpu0 0 --gpu1 1 --channel gpu02 --s
 補足:
 
 - 同じ内容をリポジトリルートから実行したい場合は以下でも可:
+
   - nohup bash src/PressurePattern/run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > src/PressurePattern/orchestrator.log 2>&1 &
 
 - 内側のコマンドに nohup は不要です（スクリプト自体を nohup で起動しているため、子プロセスも SIGHUP を受けません）。
@@ -283,7 +287,7 @@ nohup bash run_seeds.sh --start 1 --end 10 --gpu0 0 --gpu1 1 --channel gpu02 --s
 
 このコマンドを打った時の中断の仕方は？ (swinunet_env) root@bace913e623d:/app/src/PressurePattern# nohup bash run_seeds.sh --start 21 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
 
-**Checkpoint
+\*\*Checkpoint
 
 Compare
 
@@ -297,7 +301,7 @@ src/PressurePattern/run_seeds.sh‎
 
 3
 
-**Checkpoint
+\*\*Checkpoint
 
 Compare
 
@@ -311,7 +315,7 @@ src/PressurePattern/run_seeds.sh‎
 
 3
 
-**Checkpoint
+\*\*Checkpoint
 
 Compare
 
@@ -342,17 +346,17 @@ Task Completed
 - ps -p "$(cat run_seeds.pid)"
   - プロセスがいなければ停止済みです
 
-補足（PIDファイルが見つからない/壊れている場合）:
+補足（PID ファイルが見つからない/壊れている場合）:
 
 - オーケストレータを直接探して止める:
 
   - pgrep -af 'run_seeds.sh'
-  - kill <見つかったPID>
+  - kill <見つかった PID>
 
 - まだ子プロセス（学習ジョブ）が残ってしまった場合は個別停止:
 
-  - pkill -f 'main_v5.py.*--gpu 0'
-  - pkill -f 'main_v5.py.*--gpu 1'
+  - pkill -f 'main_v5.py.\*--gpu 0'
+  - pkill -f 'main_v5.py.\*--gpu 1'
 
 強制停止（最後の手段）:
 
@@ -367,3 +371,46 @@ Task Completed
 
   - 例: seed 33 まで完了していれば、--start 35 を指定
   - nohup bash run_seeds.sh --start 35 --end 50 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+
+# results_v5 集計スクリプトの使い方（search_results_v5.py）
+
+目的:
+
+- `results_v5` 配下の各 seed 実験ディレクトリにある `evaluation_v5.log` を再帰的に探索し、手法ごとに次を集計します。
+  - [Summary] Macro Recall（基本ラベル）の平均
+  - [Summary] Macro Recall（基本+応用）の平均
+  - ラベル 6A/6B/6C の統計（Correct の合計、Recall の平均）※「各ラベルの再現率（代表ノード群ベース）」の値を使用
+
+スクリプト:
+
+- `PressurePattern/search_results_v5.py`
+
+基本的な使い方（プロジェクトルートから）:
+
+```bash
+nohup python search_results_v5.py  --root ./results_v5 > search_results_v5.log 2>&1 &
+```
+
+主なオプション:
+
+- `--root PATH`:
+  - 探索対象の `results_v5` ルートを指定（省略時は `search_results_v5.py` と同じディレクトリ直下の `results_v5`）。
+- `--sort {rank,name,basic_combo}`:
+  - 並び順を指定（デフォルト: `rank`）。
+  - `rank`: 各表で平均値の降順（ランキング）で表示。
+  - `name`: 手法名の昇順。
+  - `basic_combo`: 「基本」表は基本の平均降順、「基本+応用」表は基本+応用の平均降順（`rank` と同じ挙動）。
+- `--precision INT`:
+  - 小数点以下の表示桁数（デフォルト: 4）。
+
+出力（例）:
+
+- 2 つの表を分けて表示します。
+  1. 手法別 Macro Recall 平均（基本ラベル）
+  2. 手法別 Macro Recall 平均（基本+応用）
+- さらに、ラベル 6A / 6B / 6C について、手法別に「Correct 合計 / Recall 平均」を表示します。
+
+注意:
+
+- ログ内の該当値が欠損している場合、そのログは平均算出から自動的に除外されます。
+- 6A/6B/6C は「代表ノード群ベース」の表からのみ集計します（複合ラベル表は使用しません）。
