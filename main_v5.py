@@ -37,7 +37,7 @@ SEED = 1
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 1000
 BATCH_SIZE = 256
-NODES_CHUNK = 4 # VRAM16GB:2, VRAM24GB:4
+NODES_CHUNK = 32 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
 SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
@@ -1129,7 +1129,7 @@ def _spot_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     # coords
     x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, W).expand(1, H, W)
     y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, H, 1).expand(1, H, W)
-    x = x.view(-1); y = y.view(-1)  # (H*W,)
+    x = x.reshape(-1); y = y.reshape(-1)  # (H*W,)
     # projections
     K = 16; N_BINS = 64; L = (2.0 ** 0.5)
     thetas = torch.linspace(0.0, math.pi, K, device=device, dtype=dtype)
@@ -1237,6 +1237,92 @@ def _itcs_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     Dn = 0.5 * dphi_n + 0.5 * dc_n
     return 0.5 * (Dp + Dn)
 
+
+# 追加: マルチスケール系/複合距離の「対参照」関数群（medoid算出で使用）
+def _adaptive_pool_ms(T: torch.Tensor, s: int) -> torch.Tensor:
+    """
+    Adaptive average pool for 3D tensors (B,H,W) to roughly downscale by factor s.
+    Ensures output size is at least 2x2.
+    """
+    B, H, W = T.shape
+    h2 = max(2, max(1, H // s))
+    w2 = max(2, max(1, W // s))
+    return F.adaptive_avg_pool2d(T.unsqueeze(1), (h2, w2)).squeeze(1)
+
+def _ms_s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    Multi-scale S1 distance to reference with batch-wise min-max normalization per scale and weighted RMS fusion.
+    Returns (B,)
+    """
+    device = Xb.device; dtype = Xb.dtype
+    scales = [1, 2, 4]
+    weights = torch.tensor([0.5, 0.3, 0.2], device=device, dtype=dtype)
+    weights = weights / weights.sum()
+    dists = []
+    eps = 1e-12
+    for s in scales:
+        if s == 1:
+            Xs = Xb
+            R = ref
+        else:
+            Xs = _ms_s1_down_X = _adaptive_pool_ms(Xb, s)
+            R = _ms_s1_down_R = _adaptive_pool_ms(ref.unsqueeze(0), s).squeeze(0)
+        d = _s1_dist_to_ref(Xs, R)  # (B,)
+        dmin = torch.min(d)
+        dmax = torch.max(d)
+        dn = (d - dmin) / (dmax - dmin + eps)
+        dists.append(dn)
+    out = torch.zeros_like(dists[0])
+    for i, dn in enumerate(dists):
+        out = out + weights[i] * (dn * dn)
+    return torch.sqrt(out + 1e-12)
+
+def _msssim_s1g_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    MSSSIM*-S1 Gate distance to reference:
+      D = dL*^2 + (1 - dL*) * sqrt( (dG^2 + dS1n^2)/2 )
+    where dL* is multi-scale 1-SSIM (5x5, C=0 proxy), dG is G-SSIM distance, dS1n is batch-wise min-max normalized S1.
+    Returns (B,)
+    """
+    device = Xb.device; dtype = Xb.dtype
+    scales = [1, 2, 4]
+    w = torch.tensor([0.5, 0.3, 0.2], device=device, dtype=dtype)
+    w = w / w.sum()
+    dL_list = []
+    for s in scales:
+        if s == 1:
+            Xs = Xb
+            R = ref
+        else:
+            Xs = _adaptive_pool_ms(Xb, s)
+            R = _adaptive_pool_ms(ref.unsqueeze(0), s).squeeze(0)
+        dl = _ssim5_dist_to_ref(Xs, R)  # (B,)
+        dL_list.append(dl.clamp(0.0, 2.0))
+    # weighted mean for dL*
+    dL = torch.zeros_like(dL_list[0])
+    for i, dl in enumerate(dL_list):
+        dL = dL + w[i] * dl
+    dG = _gssim_dist_to_ref(Xb, ref)  # (B,)
+    dS1 = _s1_dist_to_ref(Xb, ref)    # (B,)
+    eps = 1e-12
+    dS1n = (dS1 - torch.min(dS1)) / (torch.max(dS1) - torch.min(dS1) + eps)
+    core = torch.sqrt((dG * dG + dS1n * dS1n) / 2.0)
+    return dL * dL + (1.0 - dL) * core
+
+def _s1gcurv_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    S1GCurv: RMS of three [0,1] distances:
+      - D_s1 = clamp(S1/200, 0,1)
+      - D_edge = G-SSIM distance in [0,1]
+      - D_curv = 0.5 * curvature S1-like ratio on Laplacians in [0,1]
+    Returns (B,)
+    """
+    D1 = _s1_dist_to_ref(Xb, ref)             # (B,) ~0..200
+    D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
+    Dg = _gssim_dist_to_ref(Xb, ref)          # (B,) in [0,1]
+    Dc = _curv_s1_dist_to_ref(Xb, ref)        # (B,) ~0..2
+    Dcurv = 0.5 * Dc
+    return torch.sqrt((D1n * D1n + Dg * Dg + Dcurv * Dcurv) / 3.0)
 
 def compute_node_true_medoids(
     method_name: str,
@@ -1411,6 +1497,15 @@ def compute_node_true_medoids(
             elif method_name == 'itcs':
                 # ITCS: トポロジー＆重心シグネチャ
                 D = pairwise_by_ref(lambda Xb, ref: _itcs_to_ref(Xb, ref), Xcand)
+            elif method_name == 'ms_s1':
+                # Multi-Scale S1
+                D = pairwise_by_ref(lambda Xb, ref: _ms_s1_dist_to_ref(Xb, ref), Xcand)
+            elif method_name == 'msssim_s1g':
+                # MSSSIM*-S1 Gate
+                D = pairwise_by_ref(lambda Xb, ref: _msssim_s1g_to_ref(Xb, ref), Xcand)
+            elif method_name == 's1gcurv':
+                # S1 + G-SSIM + curvature S1 (scaled)
+                D = pairwise_by_ref(lambda Xb, ref: _s1gcurv_to_ref(Xb, ref), Xcand)
             else:
                 raise ValueError(f'Unknown method_name: {method_name}')
 

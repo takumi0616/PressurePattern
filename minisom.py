@@ -1041,7 +1041,7 @@ class MiniSom:
         S_list = []
         for t in thetas:
             s = xg * torch.cos(t) + yg * torch.sin(t)  # (1,H,W)
-            S_list.append(s.view(-1))  # (H*W,)
+            S_list.append(s.reshape(-1))  # (H*W,)
         # Hist builder
         def _mass_histograms(MassB: Tensor, MassM: Tensor):
             # MassB: (B,H,W), MassM: (m,H,W)
@@ -1179,9 +1179,9 @@ class MiniSom:
             # Negative sublevel sets
             sig_phi_n = []
             cx_n = []; cy_n = []
-            w_flat = w.view(-1)
-            x_flat = xg.view(-1)
-            y_flat = yg.view(-1)
+            w_flat = w.reshape(-1)
+            x_flat = xg.reshape(-1)
+            y_flat = yg.reshape(-1)
             for qi in range(qs.numel()):
                 tp = t[:, qi].view(N, 1, 1)
                 # positive mask
