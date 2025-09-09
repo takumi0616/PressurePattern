@@ -2352,18 +2352,18 @@ def main():
         ('s1',          's1'),
         ('ms_s1',       'ms_s1'),        # Multi-Scale S1
         ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
-        ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
-        ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
-        ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
+        # ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
+        # ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
+        # ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
         ('pf_s1ssim',   'pf_s1ssim'),    # 新提案: 比例融合（積）
-        ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
+        # ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
         ('s1gl',        's1gl'),         # 新提案: DSGC (S1 + Gradient + Curvature)
-        ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
+        # ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
         ('s3d',         's3d'),          # 新提案: S3D (SSIM + Gradient structure + Curvature structure)
         ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
         ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
         ('s1gk',        's1gk'),         # 新提案: S1GK (S1 + G-SSIM + Kappa curvature)
-        ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
+        # ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
         ('spot',        'spot'),         # 新提案: SPOT (Optimal Transport)
         ('gvd',         'gvd'),          # 新提案: GVD (Vorticity–Deformation)
         ('itcs',        'itcs'),         # 新提案: ITCS (Topology & Centroid Signature)
