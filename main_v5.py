@@ -41,6 +41,8 @@ NODES_CHUNK = 32 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
 SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+# SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
+SSIM_WINDOW = 5
 
 # データ
 DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
@@ -808,6 +810,50 @@ def _ssim5_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     ssim_avg = ssim_map.mean(dim=(1, 2, 3))               # (B,)
     return 1.0 - ssim_avg
 
+
+def _ssimN_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor, win: int) -> torch.Tensor:
+    """
+    1 - mean(SSIM_map) with NxN moving window (N>=1), C1=C2=0.
+    Even N uses asymmetric SAME padding to preserve size.
+    """
+    B, H, W = Xb.shape
+    device, dtype = Xb.device, Xb.dtype
+    k = max(1, int(win))
+    kernel = torch.ones((1, 1, k, k), device=device, dtype=dtype) / float(k * k)
+    # asymmetric SAME padding
+    pl = k // 2
+    pr = k - 1 - pl
+    pt = k // 2
+    pb = k - 1 - pt
+
+    X = Xb.unsqueeze(1)              # (B,1,H,W)
+    R = ref.view(1, 1, H, W)         # (1,1,H,W)
+
+    X_pad = F.pad(X, (pl, pr, pt, pb), mode='reflect')
+    R_pad = F.pad(R, (pl, pr, pt, pb), mode='reflect')
+
+    mu_x = F.conv2d(X_pad, kernel, padding=0)            # (B,1,H,W)
+    mu_r = F.conv2d(R_pad, kernel, padding=0)            # (1,1,H,W)
+
+    mu_x2 = F.conv2d(X_pad * X_pad, kernel, padding=0)
+    mu_r2 = F.conv2d(R_pad * R_pad, kernel, padding=0)
+    var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)
+    var_r = torch.clamp(mu_r2 - mu_r * mu_r, min=0.0)
+
+    prod = X * R
+    prod_pad = F.pad(prod, (pl, pr, pt, pb), mode='reflect')
+    mu_xr = F.conv2d(prod_pad, kernel, padding=0)
+    cov = mu_xr - mu_x * mu_r
+
+    eps = 1e-12
+    l_num = 2 * (mu_x * mu_r)
+    l_den = (mu_x * mu_x + mu_r * mu_r)
+    c_num = 2 * cov
+    c_den = (var_x + var_r)
+    ssim_map = (l_num * c_num) / (l_den * c_den + eps)    # (B,1,H,W)
+    ssim_avg = ssim_map.mean(dim=(1, 2, 3))               # (B,)
+    return 1.0 - ssim_avg
+
 def _s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     # Teweles–Wobus S1: 100 * sum|∇X-∇ref| / sum max(|∇X|,|∇ref|)
     dXdx = Xb[:,:,1:] - Xb[:,:,:-1]
@@ -1390,6 +1436,9 @@ def compute_node_true_medoids(
                 D = pairwise_euclidean(Xcand)
             elif method_name == 'ssim5':
                 D = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+            elif method_name.startswith('ssim') and method_name[4:].isdigit():
+                w = int(method_name[4:])
+                D = pairwise_by_ref(lambda Xb, ref: _ssimN_dist_to_ref(Xb, ref, w), Xcand)
             elif method_name == 's1':
                 D = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
             elif method_name == 's1ssim':
@@ -1970,7 +2019,7 @@ def evaluate_verification_with_training_majority(
 # 3種類のbatchSOM（学習：一方式分）
 # =====================================================
 def run_one_method_learning(method_name, activation_distance, data_all, labels_all, times_all,
-                            field_shape, lat, lon, out_dir, device: str):
+                            field_shape, lat, lon, out_dir, device: str, ssim_window: Optional[int] = None):
     """
     学習（learning）：method_name: 'euclidean' | 'ssim5' | 's1' | 's1ssim'
     activation_distance: 同上
@@ -2019,6 +2068,7 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         device=device,
         dtype=torch.float32,
         nodes_chunk=NODES_CHUNK,
+        ssim_window=ssim_window if ssim_window is not None else SSIM_WINDOW,
         area_weight=area_w_map
     )
     som.random_weights_init(data_all)
@@ -2530,6 +2580,8 @@ def main():
     methods = [
         ('euclidean',   'euclidean'),
         ('ssim5',       'ssim5'),        # 論文仕様（5x5窓・C=0）版SSIM
+        ('ssim7',       'ssim5'),        # 7x7窓SSIM（activationはssim5、窓は名前から設定）
+        ('ssim12',      'ssim5'),        # 12x12窓SSIM（偶数窓は非対称SAMEパディング）
         ('s1',          's1'),
         ('ms_s1',       'ms_s1'),        # Multi-Scale S1
         ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
@@ -2552,10 +2604,18 @@ def main():
     for mname, adist in methods:
         # 学習
         out_dir_learn = os.path.join(LEARNING_ROOT, f'{mname}_som')
+        # ssimN（例: ssim7, ssim12）は名前から窓サイズを自動解釈（minisomのactivationはssim5を使い、窓で差異を出す）
+        ssim_win_eff = None
+        if mname.startswith('ssim') and mname[4:].isdigit():
+            try:
+                ssim_win_eff = int(mname[4:])
+            except Exception:
+                ssim_win_eff = None
         som, majority_raw_train, majority_base_train, base_counts_train = run_one_method_learning(
             method_name=mname, activation_distance=adist,
             data_all=data_learn, labels_all=labels_L, times_all=ts_L,
-            field_shape=field_shape, lat=lat, lon=lon, out_dir=out_dir_learn, device=device
+            field_shape=field_shape, lat=lat, lon=lon, out_dir=out_dir_learn, device=device,
+            ssim_window=ssim_win_eff
         )
         # 検証
         out_dir_verif = os.path.join(VERIF_ROOT, f'{mname}_som')

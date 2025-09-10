@@ -52,6 +52,7 @@ class MiniSom:
                  device: Optional[str] = None,
                  dtype: torch.dtype = torch.float32,
                  nodes_chunk: int = 16,
+                 ssim_window: int = 5,
                  area_weight: Optional[np.ndarray] = None):
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -115,10 +116,12 @@ class MiniSom:
             self.neighborhood_function = 'gaussian'
 
 
-        # 5x5移動窓SSIM用カーネル（平均フィルタ）
+        # SSIM用移動窓カーネル（平均フィルタ）
         self._kernel5: Optional[Tensor] = None
-        self._win5_size: int = 5
-        self._win5_pad: int = 2
+        self._win5_size: int = int(ssim_window)
+        if self._win5_size < 1:
+            raise ValueError(f'ssim_window must be positive integer, got {self._win5_size}')
+        self._win5_pad: int = self._win5_size // 2
         # 3x3ラプラシアン（曲率）用カーネル
         self._lap_kernel: Optional[Tensor] = None
         # 正規化座標グリッド（0..1）
@@ -207,6 +210,15 @@ class MiniSom:
             k = torch.ones((1, 1, self._win5_size, self._win5_size), device=self.device, dtype=self.dtype) / float(self._win5_size * self._win5_size)
             self._kernel5 = k
 
+    def _ssim_pad_tuple(self) -> Tuple[int, int, int, int]:
+        # Asymmetric SAME padding for arbitrary window size (odd/even)
+        k = int(self._win5_size)
+        pl = k // 2
+        pr = k - 1 - pl
+        pt = k // 2
+        pb = k - 1 - pt
+        return (pl, pr, pt, pb)
+
     @torch.no_grad()
     def _ensure_lap_kernel(self):
         if self._lap_kernel is None:
@@ -231,7 +243,7 @@ class MiniSom:
 
         # X 側のローカル統計
         X = Xb.unsqueeze(1)  # (B,1,H,W)
-        X_pad = F.pad(X, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
+        X_pad = F.pad(X, self._ssim_pad_tuple(), mode='reflect')
         mu_x = F.conv2d(X_pad, self._kernel5, padding=0)                      # (B,1,H,W)
         mu_x2 = F.conv2d(X_pad * X_pad, self._kernel5, padding=0)             # (B,1,H,W)
         var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)                     # (B,1,H,W)
@@ -239,14 +251,14 @@ class MiniSom:
         for start in range(0, self.m, nodes_chunk):
             end = min(start + nodes_chunk, self.m)
             Wc = self.weights[start:end].unsqueeze(1)                          # (Mc,1,H,W)
-            W_pad = F.pad(Wc, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
+            W_pad = F.pad(Wc, self._ssim_pad_tuple(), mode='reflect')
             mu_w = F.conv2d(W_pad, self._kernel5, padding=0)                  # (Mc,1,H,W)
             mu_w2 = F.conv2d(W_pad * W_pad, self._kernel5, padding=0)         # (Mc,1,H,W)
             var_w = torch.clamp(mu_w2 - mu_w * mu_w, min=0.0)                 # (Mc,1,H,W)
 
             # 共分散: mean(x*w) - mu_x*mu_w
             prod = (X.unsqueeze(1) * Wc.unsqueeze(0)).reshape(B * (end - start), 1, H, W)  # (B*Mc,1,H,W)
-            prod_pad = F.pad(prod, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
+            prod_pad = F.pad(prod, self._ssim_pad_tuple(), mode='reflect')
             mu_xw = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B, end - start, 1, H, W)  # (B,Mc,1,H,W)
 
             mu_x_b = mu_x.unsqueeze(1)                         # (B,1,1,H,W)
@@ -352,7 +364,7 @@ class MiniSom:
                 Xs = self._adaptive_pool(Xb.unsqueeze(1), s)
                 Wc = self._adaptive_pool(self.weights.unsqueeze(1), s)
             # local stats
-            pad = 2
+            pad = self._win5_pad
             X_pad = F.pad(Xs, (pad, pad, pad, pad), mode='reflect')
             mu_x = F.conv2d(X_pad, self._kernel5, padding=0)
             mu_x2 = F.conv2d(X_pad * X_pad, self._kernel5, padding=0)
@@ -421,6 +433,7 @@ class MiniSom:
         if nodes_chunk is None:
             nodes_chunk = self.nodes_chunk
         eps = 1e-12
+        pad = self._win5_pad
         B, H, W = Xb.shape
 
         # サンプル側の勾配と強度（共通領域 (H-1, W-1)）
@@ -433,7 +446,7 @@ class MiniSom:
         # 勾配強度のローカル統計（5x5平均畳み込み）
         self._ensure_kernel5()
         Xg = magX.unsqueeze(1)  # (B,1,H-1,W-1)
-        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        Xg_pad = F.pad(Xg, (pad, pad, pad, pad), mode='reflect')
         mu_xg = F.conv2d(Xg_pad, self._kernel5, padding=0)                  # (B,1,H-1,W-1)
         mu_xg2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
         var_xg = torch.clamp(mu_xg2 - mu_xg * mu_xg, min=0.0)
@@ -458,14 +471,14 @@ class MiniSom:
 
             # 1) 勾配強度のSSIM (C=0)
             Wg = magW.unsqueeze(1)                                         # (Mc,1,H-1,W-1)
-            Wg_pad = F.pad(Wg, (2, 2, 2, 2), mode='reflect')
+            Wg_pad = F.pad(Wg, (pad, pad, pad, pad), mode='reflect')
             mu_wg = F.conv2d(Wg_pad, self._kernel5, padding=0)             # (Mc,1,H-1,W-1)
             mu_wg2 = F.conv2d(Wg_pad * Wg_pad, self._kernel5, padding=0)
             var_wg = torch.clamp(mu_wg2 - mu_wg * mu_wg, min=0.0)
 
             # 修正: ブロードキャスト次元を合わせるため Xg にもノード次元を追加（(B,1,1,H-1,W-1) × (1,Mc,1,H-1,W-1)）
             prod = (Xg.unsqueeze(1) * Wg.unsqueeze(0)).reshape(B * (end - start), 1, magX.shape[1], magX.shape[2])
-            prod_pad = F.pad(prod, (2, 2, 2, 2), mode='reflect')
+            prod_pad = F.pad(prod, (pad, pad, pad, pad), mode='reflect')
             mu_xwg = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B, end - start, 1, magX.shape[1], magX.shape[2])
 
             mu_xg_b = mu_xg.unsqueeze(1)       # (B,1,1,H-1,W-1)
@@ -507,6 +520,7 @@ class MiniSom:
         if nodes_chunk is None:
             nodes_chunk = self.nodes_chunk
         eps = 1e-12
+        pad = self._win5_pad
         B, H, W = Xb.shape
 
         # Gradients (common inner H-1 x W-1 region)
@@ -519,7 +533,7 @@ class MiniSom:
         # 5x5 stats for gradient magnitude (X side)
         self._ensure_kernel5()
         Xg = gmagX.unsqueeze(1)                      # (B,1,H-1,W-1)
-        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
+        Xg_pad = F.pad(Xg, (pad, pad, pad, pad), mode='reflect')
         mu_xg = F.conv2d(Xg_pad, self._kernel5, padding=0)
         mu_xg2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
         var_xg = torch.clamp(mu_xg2 - mu_xg * mu_xg, min=0.0)
@@ -564,13 +578,13 @@ class MiniSom:
 
             # Gradient magnitude SSIM (5x5, C=0)
             Wg = gmagW.unsqueeze(1)                    # (Mc,1,H-1,W-1)
-            Wg_pad = F.pad(Wg, (2, 2, 2, 2), mode='reflect')
+            Wg_pad = F.pad(Wg, (pad, pad, pad, pad), mode='reflect')
             mu_wg = F.conv2d(Wg_pad, self._kernel5, padding=0)
             mu_wg2 = F.conv2d(Wg_pad * Wg_pad, self._kernel5, padding=0)
             var_wg = torch.clamp(mu_wg2 - mu_wg * mu_wg, min=0.0)
 
             prod = (Xg.unsqueeze(1) * Wg.unsqueeze(0)).reshape(B * (end - start), 1, gmagX.shape[1], gmagX.shape[2])
-            prod_pad = F.pad(prod, (2, 2, 2, 2), mode='reflect')
+            prod_pad = F.pad(prod, (pad, pad, pad, pad), mode='reflect')
             mu_xwg = F.conv2d(prod_pad, self._kernel5, padding=0).reshape(B, end - start, 1, gmagX.shape[1], gmagX.shape[2])
 
             mu_xg_b = mu_xg.unsqueeze(1)
@@ -586,13 +600,13 @@ class MiniSom:
             # Curvature SSIM with weight w2 = max(|ΔX|,|ΔW|)
             Lw = Lw_full[start:end]                     # (Mc,H-2,W-2)
             Lw1 = Lw.unsqueeze(1)                       # (Mc,1,H-2,W-2)
-            Lw_pad = F.pad(Lw1, (2, 2, 2, 2), mode='reflect')
+            Lw_pad = F.pad(Lw1, (pad, pad, pad, pad), mode='reflect')
             mu_lw = F.conv2d(Lw_pad, self._kernel5, padding=0)
             mu_lw2 = F.conv2d(Lw_pad * Lw_pad, self._kernel5, padding=0)
             var_lw = torch.clamp(mu_lw2 - mu_lw * mu_lw, min=0.0)
 
             prodL = (Lx1.unsqueeze(1) * Lw1.unsqueeze(0)).reshape(B * (end - start), 1, Lx.shape[1], Lx.shape[2])
-            prodL_pad = F.pad(prodL, (2, 2, 2, 2), mode='reflect')
+            prodL_pad = F.pad(prodL, (pad, pad, pad, pad), mode='reflect')
             mu_xlw = F.conv2d(prodL_pad, self._kernel5, padding=0).reshape(B, end - start, 1, Lx.shape[1], Lx.shape[2])
 
             mu_lx_b = mu_lx.unsqueeze(1)
@@ -1443,15 +1457,15 @@ class MiniSom:
         self._ensure_kernel5()
         Xg = magX.unsqueeze(1)                          # (B,1,.,.)
         Rg = magR.unsqueeze(0).unsqueeze(1)             # (1,1,.,.)
-        Xg_pad = F.pad(Xg, (2, 2, 2, 2), mode='reflect')
-        Rg_pad = F.pad(Rg, (2, 2, 2, 2), mode='reflect')
+        Xg_pad = F.pad(Xg, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
+        Rg_pad = F.pad(Rg, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
         mu_x = F.conv2d(Xg_pad, self._kernel5, padding=0)
         mu_r = F.conv2d(Rg_pad, self._kernel5, padding=0)
         mu_x2 = F.conv2d(Xg_pad * Xg_pad, self._kernel5, padding=0)
         mu_r2 = F.conv2d(Rg_pad * Rg_pad, self._kernel5, padding=0)
         var_x = torch.clamp(mu_x2 - mu_x * mu_x, min=0.0)
         var_r = torch.clamp(mu_r2 - mu_r * mu_r, min=0.0)
-        mu_xr = F.conv2d(F.pad(Xg * Rg, (2, 2, 2, 2), mode='reflect'), self._kernel5, padding=0)
+        mu_xr = F.conv2d(F.pad(Xg * Rg, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect'), self._kernel5, padding=0)
         cov = mu_xr - mu_x * mu_r
         ssim_map = (2 * mu_x * mu_r * 2 * cov) / ((mu_x * mu_x + mu_r * mu_r) * (var_x + var_r) + eps)
         ssim_avg = ssim_map.mean(dim=(1, 2, 3))
@@ -1529,15 +1543,15 @@ class MiniSom:
 
         Lx1 = Lx.unsqueeze(1)                       # (B,1,H-2,W-2)
         Lr1 = Lr.unsqueeze(0).unsqueeze(1)          # (1,1,H-2,W-2)
-        Lx_pad = F.pad(Lx1, (2, 2, 2, 2), mode='reflect')
-        Lr_pad = F.pad(Lr1, (2, 2, 2, 2), mode='reflect')
+        Lx_pad = F.pad(Lx1, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
+        Lr_pad = F.pad(Lr1, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect')
         mu_lx = F.conv2d(Lx_pad, self._kernel5, padding=0)
         mu_lr = F.conv2d(Lr_pad, self._kernel5, padding=0)
         mu_lx2 = F.conv2d(Lx_pad * Lx_pad, self._kernel5, padding=0)
         mu_lr2 = F.conv2d(Lr_pad * Lr_pad, self._kernel5, padding=0)
         var_lx = torch.clamp(mu_lx2 - mu_lx * mu_lx, min=0.0)
         var_lr = torch.clamp(mu_lr2 - mu_lr * mu_lr, min=0.0)
-        mu_xl = F.conv2d(F.pad(Lx1 * Lr1, (2, 2, 2, 2), mode='reflect'), self._kernel5, padding=0)
+        mu_xl = F.conv2d(F.pad(Lx1 * Lr1, (self._win5_pad, self._win5_pad, self._win5_pad, self._win5_pad), mode='reflect'), self._kernel5, padding=0)
         cov_l = mu_xl - mu_lx * mu_lr
 
         ssim_l = (2 * mu_lx * mu_lr * 2 * cov_l) / ((mu_lx * mu_lx + mu_lr * mu_lr) * (var_lx + var_lr) + eps)  # (B,1,H-2,W-2)
