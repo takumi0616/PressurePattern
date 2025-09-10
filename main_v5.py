@@ -1206,12 +1206,12 @@ def _itcs_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     device = Xb.device; dtype = Xb.dtype
     B, H, W = Xb.shape
     qs = torch.linspace(0.1, 0.9, 9, device=device, dtype=dtype)
-    x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, W).expand(1, H, W).view(-1)
-    y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, H, 1).expand(1, H, W).view(-1)
+    x = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype).view(1, 1, W).expand(1, H, W).reshape(-1)
+    y = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype).view(1, H, 1).expand(1, H, W).reshape(-1)
     w = torch.ones((H * W,), device=device, dtype=dtype)
     def _sig(Z: torch.Tensor):
         N = Z.shape[0]
-        Zf = Z.view(N, -1)
+        Zf = Z.reshape(N, -1)
         t = torch.quantile(Zf, qs, dim=1, interpolation='linear')  # (N,9)
         phi = []; cx = []; cy = []
         for qi in range(qs.numel()):
@@ -1369,6 +1369,14 @@ def compute_node_true_medoids(
             idxs = np.where(mask)[0]
             if len(idxs) == 0:
                 continue
+            # ITCS は計算量が非常に大きいため、各ノードの候補数を上限でサンプリングして近似メドイドを計算
+            if method_name == 'itcs' and len(idxs) > 120:
+                try:
+                    rng = np.random.RandomState(SEED)
+                except Exception:
+                    rng = np.random.RandomState(1)
+                sel = np.sort(rng.choice(len(idxs), size=120, replace=False))
+                idxs = idxs[sel]
             Xcand = X_t[idxs]  # (C,H,W)
             Ccand = Xcand.shape[0]
 
@@ -1763,6 +1771,28 @@ def compute_training_node_majorities(
 
     return node_to_majority_raw, node_to_majority_base
 
+def compute_training_node_base_counts(
+    winners_xy: np.ndarray,
+    labels_all: List[Optional[str]],
+    base_labels: List[str],
+    som_shape: Tuple[int, int]
+) -> Dict[Tuple[int, int], Dict[str, int]]:
+    """
+    学習データ上で、各ノードに出現した基本ラベルの出現数を辞書で返す。
+    戻り値: {(ix,iy): {label: count, ...}, ...}
+    """
+    clusters = winners_to_clusters(winners_xy, som_shape)
+    node_to_counts: Dict[Tuple[int, int], Dict[str, int]] = {}
+    for k, idxs in enumerate(clusters):
+        ix, iy = k // som_shape[1], k % som_shape[1]
+        cnt = Counter()
+        for j in idxs:
+            bl = basic_label_or_none(labels_all[j], base_labels)
+            if bl is not None:
+                cnt[bl] += 1
+        node_to_counts[(ix, iy)] = dict(cnt)
+    return node_to_counts
+
 
 # =====================================================
 # 検証（学習時代表ラベルに基づく推論）ユーティリティ
@@ -1776,10 +1806,13 @@ def evaluate_verification_with_training_majority(
     node_to_majority_base_train: Dict[Tuple[int,int], Optional[str]],
     out_dir: str,
     method_name: str,
-    logger: Logger
+    logger: Logger,
+    node_to_base_counts_train: Optional[Dict[Tuple[int,int], Dict[str,int]]] = None,
+    sigma_pred: float = 1.2
 ):
     """
-    学習時の「ノード代表（基本ラベル）」を予測ラベルとして使用し、検証データの正解率を評価。
+    学習時の「ノード代表（基本ラベル）」または「近傍重み付きラベル分布推定（学習時カウント×SOMグリッド距離ガウス重み）」を
+    予測ラベルとして使用し、検証データの正解率を評価。
     - 混同行列（基本ラベル vs クラスタ列）CSV
     - per-label 再現率（基本/複合）CSV
     - 割当CSV（予測/正誤フラグ含む）
@@ -1809,8 +1842,31 @@ def evaluate_verification_with_training_majority(
         bl = basic_label_or_none(raw, base_labels)
         comps = extract_base_components(raw, base_labels)
 
-        # 予測（学習時の代表基本ラベル）
-        pred = node_to_majority_base_train.get((int(ix), int(iy)), None)
+        # 予測
+        pred: Optional[str] = None
+        if node_to_base_counts_train is not None and len(node_to_base_counts_train) > 0:
+            # 近傍重み付き推定（学習時のノード別基本ラベル出現数 × ガウス重み）
+            ix_i, iy_i = int(ix), int(iy)
+            scores = Counter()
+            Hn, Wn = som_shape
+            for nx in range(Hn):
+                for ny in range(Wn):
+                    cnts = node_to_base_counts_train.get((nx, ny), None)
+                    if not cnts:
+                        continue
+                    d2 = (ix_i - nx) * (ix_i - nx) + (iy_i - ny) * (iy_i - ny)
+                    w = math.exp(-d2 / (2.0 * (sigma_pred ** 2)))
+                    if w <= 0.0:
+                        continue
+                    for lbl_k, c in cnts.items():
+                        if lbl_k in base_labels and c > 0:
+                            scores[lbl_k] += w * float(c)
+            if len(scores) > 0:
+                pred = max(scores.items(), key=lambda x: x[1])[0]
+
+        # フォールバック：BMUノードの多数決（従来仕様）
+        if pred is None:
+            pred = node_to_majority_base_train.get((int(ix), int(iy)), None)
 
         # 基本ラベル再現率用
         if bl is not None:
@@ -2012,19 +2068,28 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         )
 
         # 追加: 現時点の True Medoid を再計算して、match rate を算出
-        node_to_true_medoid_idx_now, _ = compute_node_true_medoids(
-            method_name=method_name,
-            data_flat=data_all, winners_xy=winners_now,
-            som_shape=(SOM_X, SOM_Y), field_shape=field_shape,
-            device=device,
-            fusion_alpha=0.5
-        )
-        match_rate_now, matched_nodes_now, counted_nodes_now = compute_nodewise_match_rate(
-            winners_xy=winners_now,
-            labels_all=labels_all,
-            node_to_medoid_idx=node_to_true_medoid_idx_now,
-            som_shape=(SOM_X, SOM_Y)
-        )
+        if method_name == 'itcs':
+            # ITCS は距離計算が高コストなため、学習中の各セグメントではメドイド再計算をスキップ
+            # （最終モデルでのみ算出）
+            node_to_true_medoid_idx_now = {}
+            matched_nodes_now = 0
+            counted_nodes_now = 0
+            match_rate_now = np.nan
+            log.write('  [skip] ITCS: per-iteration True Medoid computation is skipped to avoid heavy O(C^2) cost.\n')
+        else:
+            node_to_true_medoid_idx_now, _ = compute_node_true_medoids(
+                method_name=method_name,
+                data_flat=data_all, winners_xy=winners_now,
+                som_shape=(SOM_X, SOM_Y), field_shape=field_shape,
+                device=device,
+                fusion_alpha=0.5
+            )
+            match_rate_now, matched_nodes_now, counted_nodes_now = compute_nodewise_match_rate(
+                winners_xy=winners_now,
+                labels_all=labels_all,
+                node_to_medoid_idx=node_to_true_medoid_idx_now,
+                som_shape=(SOM_X, SOM_Y)
+            )
 
         # ログ（results.log）に集約指標を追記
         log.write(f'\n[Iteration {current_iter}] QuantizationError={qe_now:.6f}\n')
@@ -2088,6 +2153,10 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
 
     # ===== ノードの多数決（元ラベル/基本ラベル） =====
     node_to_majority_raw, node_to_majority_base = compute_training_node_majorities(
+        winners_all, labels_all, BASE_LABELS, (SOM_X, SOM_Y)
+    )
+    # 学習時のノード別 基本ラベル出現数
+    node_to_base_counts = compute_training_node_base_counts(
         winners_all, labels_all, BASE_LABELS, (SOM_X, SOM_Y)
     )
 
@@ -2232,11 +2301,25 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         json.dump(majority_rows, f, ensure_ascii=False, indent=2)
     log.write(f'Node majorities (raw/base) saved -> {maj_json}\n')
 
+    # ノード別 基本ラベル出現数も保存
+    counts_rows = []
+    for ix in range(SOM_X):
+        for iy in range(SOM_Y):
+            counts_rows.append({
+                'node_x': ix,
+                'node_y': iy,
+                'base_counts': node_to_base_counts.get((ix, iy), {})
+            })
+    counts_json = os.path.join(out_dir, 'node_base_counts.json')
+    with open(counts_json, 'w', encoding='utf-8') as f:
+        json.dump(counts_rows, f, ensure_ascii=False, indent=2)
+    log.write(f'Node base-label counts (training) saved -> {counts_json}\n')
+
     log.write('\n=== Done (learning) ===\n')
     log.close()
 
     # 検証で使用するためにSOMインスタンスと学習代表（raw/基本）辞書を返却
-    return som, node_to_majority_raw, node_to_majority_base
+    return som, node_to_majority_raw, node_to_majority_base, node_to_base_counts
 
 
 # =====================================================
@@ -2251,7 +2334,8 @@ def run_one_method_verification(method_name: str,
                                 times_valid: np.ndarray,
                                 field_shape: Tuple[int,int],
                                 lat: np.ndarray, lon: np.ndarray,
-                                out_dir: str):
+                                out_dir: str,
+                                train_base_counts: Optional[Dict[Tuple[int,int], Dict[str,int]]] = None):
     """
     学習済み SOM を用いて検証データをBMU割当し、学習時のノード代表（基本）ラベルで検証を評価
     """
@@ -2279,7 +2363,9 @@ def run_one_method_verification(method_name: str,
             node_to_majority_base_train=train_majority_base,
             out_dir=out_dir,
             method_name=method_name,
-            logger=vlog
+            logger=vlog,
+            node_to_base_counts_train=train_base_counts,
+            sigma_pred=1.2
         )
         # ラベル分布ヒートマップ（基本/個別）
         dist_dir_val = os.path.join(out_dir, f'{method_name}_verification_label_dist')
@@ -2447,27 +2533,26 @@ def main():
         ('s1',          's1'),
         ('ms_s1',       'ms_s1'),        # Multi-Scale S1
         ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
-        # ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
-        # ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
-        # ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
+        ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
+        ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
+        ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
         ('pf_s1ssim',   'pf_s1ssim'),    # 新提案: 比例融合（積）
-        # ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
+        ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
         ('s1gl',        's1gl'),         # 新提案: DSGC (S1 + Gradient + Curvature)
-        # ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
+        ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
         ('s3d',         's3d'),          # 新提案: S3D (SSIM + Gradient structure + Curvature structure)
         ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
         ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
         ('s1gk',        's1gk'),         # 新提案: S1GK (S1 + G-SSIM + Kappa curvature)
-        # ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
+        ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
         ('spot',        'spot'),         # 新提案: SPOT (Optimal Transport)
         ('gvd',         'gvd'),          # 新提案: GVD (Vorticity–Deformation)
-        ('itcs',        'itcs'),         # 新提案: ITCS (Topology & Centroid Signature)
         ('s1gcurv',    's1gcurv')       # 新提案: S1GCurv (S1 + Gradient Curvature)
     ]
     for mname, adist in methods:
         # 学習
         out_dir_learn = os.path.join(LEARNING_ROOT, f'{mname}_som')
-        som, majority_raw_train, majority_base_train = run_one_method_learning(
+        som, majority_raw_train, majority_base_train, base_counts_train = run_one_method_learning(
             method_name=mname, activation_distance=adist,
             data_all=data_learn, labels_all=labels_L, times_all=ts_L,
             field_shape=field_shape, lat=lat, lon=lon, out_dir=out_dir_learn, device=device
@@ -2484,7 +2569,8 @@ def main():
             times_valid=ts_V,
             field_shape=field_shape,
             lat=lat, lon=lon,
-            out_dir=out_dir_verif
+            out_dir=out_dir_verif,
+            train_base_counts=base_counts_train
         )
 
     # 各手法の結果ログから集約評価ログを生成

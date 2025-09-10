@@ -38,6 +38,8 @@ import statistics as stats
 HEADER_RE = re.compile(r'^--- \[(.+?)\] ---')
 BASIC_SUMMARY_RE = re.compile(r'^\[Summary\]\s*Macro Recall \(基本ラベル\)\s*=\s*([0-9.]+)')
 COMBO_SUMMARY_RE = re.compile(r'^\[Summary\]\s*Macro Recall \(基本\+応用\)\s*=\s*([0-9.]+)')
+# NodewiseMatchRate (from *_results.log, e.g., "NodewiseMatchRate = 0.358696 (matched 33/92 nodes)")
+NODEWISE_RE = re.compile(r'NodewiseMatchRate\s*=\s*([0-9.]+)\s*\(matched\s*(\d+)\s*/\s*(\d+)\s*nodes\)')
 
 # 「各ラベルの再現率（代表ノード群ベース）」ブロック中の 6A/6B/6C 行を抽出
 # 例: " - 6A : N=   7 Correct=   3 Recall=0.4286 代表=[...]"
@@ -167,6 +169,10 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
             aggregate[method] = {
                 "basic": [],
                 "combo": [],
+                # Node-wise metrics from *_results.log
+                "nodewise": [],
+                "nodewise_matched": [],
+                "nodewise_total": [],
                 "labels": {
                     "6A": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                     "6B": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
@@ -198,6 +204,40 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
                     except Exception:
                         # パース失敗時はスキップ
                         pass
+
+    # 追加収集: learning_result/*_som/*_results.log から NodewiseMatchRate（最終値）を集計
+    results_logs: List[str] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.endswith("_results.log"):
+                results_logs.append(os.path.join(dirpath, fn))
+
+    for rp in sorted(results_logs):
+        # 推定手法名: ディレクトリ名 '<name>_som' の前半を大文字化
+        method_dir = os.path.basename(os.path.dirname(rp))  # e.g., 'cfsd_som'
+        base_name = method_dir.rsplit("_som", 1)[0].upper()
+        ensure_method(base_name)
+        last_tuple = None  # (rate, matched, total)
+        try:
+            with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    m = NODEWISE_RE.search(raw)
+                    if m:
+                        try:
+                            rate = float(m.group(1))
+                            matched = int(m.group(2))
+                            total = int(m.group(3))
+                            last_tuple = (rate, matched, total)
+                        except Exception:
+                            pass
+        except FileNotFoundError:
+            last_tuple = None
+
+        if last_tuple:
+            rate, matched, total = last_tuple
+            aggregate[base_name]["nodewise"].append(rate)  # type: ignore[index]
+            aggregate[base_name]["nodewise_matched"].append(matched)  # type: ignore[index]
+            aggregate[base_name]["nodewise_total"].append(total)  # type: ignore[index]
 
     return log_paths, aggregate
 
@@ -334,6 +374,42 @@ def main():
             f"{method:24s} {n:5d} "
             f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
             f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s}"
+        )
+    print("")
+
+    # NodewiseMatchRate 統計（Mean/Min/Median/Max と matched/total の合計および全体比）
+    header_nodewise = (
+        f'{"[Nodewise] Method":24s} '
+        f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
+        f'{"Σmatch":>10s} {"Σnodes":>10s} {"Overall":>10s}'
+    )
+    print("==== 手法別 NodewiseMatchRate 統計（learning_result/*_results.log の[Final Metrics]より） ====")
+    print(header_nodewise)
+    print("-" * len(header_nodewise))
+    items3 = list(aggregate.items())
+    def key_by_nodewise(item):
+        name, metrics = item
+        return -mean_or_nan(metrics.get("nodewise", []))  # type: ignore[arg-type,index]
+    if args.sort == "name":
+        items3.sort(key=key_by_name)
+    else:
+        items3.sort(key=key_by_nodewise)
+
+    for method, metrics in items3:
+        rates: List[float] = metrics.get("nodewise", [])  # type: ignore[assignment]
+        n = len(rates)
+        mean_v = mean_or_nan(rates)
+        min_v = min_or_nan(rates)
+        med_v = median_or_nan(rates)
+        max_v = max_or_nan(rates)
+        sum_match = sum(metrics.get("nodewise_matched", []))  # type: ignore[arg-type]
+        sum_total = sum(metrics.get("nodewise_total", []))  # type: ignore[arg-type]
+        overall = (sum_match / sum_total) if sum_total > 0 else float("nan")
+        print(
+            f"{method:24s} {n:5d} "
+            f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
+            f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s} "
+            f"{sum_match:10d} {sum_total:10d} {fmt_float(overall, prec):>10s}"
         )
     print("")
 
