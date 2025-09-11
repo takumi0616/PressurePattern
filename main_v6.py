@@ -35,12 +35,12 @@ SEED = 1
 
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 1
+NUM_ITER = 1000
 BATCH_SIZE = 256
 NODES_CHUNK = 16 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
-SOM_EVAL_SEGMENTS = 1  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
 
