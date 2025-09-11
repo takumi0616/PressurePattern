@@ -35,12 +35,12 @@ SEED = 1
 
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 1000
+NUM_ITER = 10000
 BATCH_SIZE = 256
-NODES_CHUNK = 32 # VRAM16GB:2, VRAM24GB:4
+NODES_CHUNK = 16 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
-SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+SOM_EVAL_SEGMENTS = 1000  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
 
@@ -2580,26 +2580,29 @@ def main():
     methods = [
         ('euclidean',   'euclidean'),
         ('ssim5',       'ssim5'),        # 論文仕様（5x5窓・C=0）版SSIM
-        ('ssim7',       'ssim5'),        # 7x7窓SSIM（activationはssim5、窓は名前から設定）
-        ('ssim12',      'ssim5'),        # 12x12窓SSIM（偶数窓は非対称SAMEパディング）
+        # ('ssim7',       'ssim5'),        # 7x7窓SSIM（activationはssim5、窓は名前から設定）
+        # ('ssim13',      'ssim5'),       
+        # ('ssim15',      'ssim5'),        
+        # ('ssim17',      'ssim5'),        
+        # ('ssim21',      'ssim5'),        
         ('s1',          's1'),
-        ('ms_s1',       'ms_s1'),        # Multi-Scale S1
-        ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
-        ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
-        ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
-        ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
-        ('pf_s1ssim',   'pf_s1ssim'),    # 新提案: 比例融合（積）
-        ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
-        ('s1gl',        's1gl'),         # 新提案: DSGC (S1 + Gradient + Curvature)
-        ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
+        # ('ms_s1',       'ms_s1'),        # Multi-Scale S1
+        # ('msssim_s1g',  'msssim_s1g'),   # MSSSIM*-S1 Gate
+        # ('s1ssim',      's1ssim'),       # S1とSSIM(5x5)の等重み融合
+        # ('s1ssim5_hf',  's1ssim5_hf'),   # 提案: HF-S1SSIM5（SSIMゲートのソフト階層化）
+        # ('s1ssim5_and', 's1ssim5_and'),  # 新提案: AND合成（max融合）
+        # ('pf_s1ssim',   'pf_s1ssim'),    # 新提案: 比例融合（積）
+        # ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
+        # ('s1gl',        's1gl'),         # 新提案: DSGC (S1 + Gradient + Curvature)
+        # ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
         ('s3d',         's3d'),          # 新提案: S3D (SSIM + Gradient structure + Curvature structure)
-        ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
-        ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
+        # ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
+        # ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
         ('s1gk',        's1gk'),         # 新提案: S1GK (S1 + G-SSIM + Kappa curvature)
-        ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
-        ('spot',        'spot'),         # 新提案: SPOT (Optimal Transport)
-        ('gvd',         'gvd'),          # 新提案: GVD (Vorticity–Deformation)
-        ('s1gcurv',    's1gcurv')       # 新提案: S1GCurv (S1 + Gradient Curvature)
+        # ('gssim',       'gssim'),        # 新提案: 勾配構造類似距離
+        # ('spot',        'spot'),         # 新提案: SPOT (Optimal Transport)
+        # ('gvd',         'gvd'),          # 新提案: GVD (Vorticity–Deformation)
+        # ('s1gcurv',    's1gcurv')       # 新提案: S1GCurv (S1 + Gradient Curvature)
     ]
     for mname, adist in methods:
         # 学習

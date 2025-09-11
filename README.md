@@ -255,7 +255,7 @@ chmod +x run_seeds.sh
 
 ```bash
 # 範囲やGPU、チャネル、対象スクリプトを明示
-nohup bash run_seeds.sh --start 13 --end 14 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+nohup bash run_seeds.sh --start 1 --end 2 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
 ```
 
 そのコマンドは正常に動きます。前提として src/PressurePattern に移動してから実行する場合、以下が成立します。
