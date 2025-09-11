@@ -35,12 +35,12 @@ SEED = 1
 
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
-NUM_ITER = 10000
+NUM_ITER = 1000
 BATCH_SIZE = 256
 NODES_CHUNK = 16 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 EVAL_SAMPLE_LIMIT = 4000
-SOM_EVAL_SEGMENTS = 1000  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
 
@@ -2595,7 +2595,7 @@ def main():
         # ('s1gssim',     's1gssim'),      # 新提案: 勾配SSIM(+方向)+S1のRMS合成
         # ('s1gl',        's1gl'),         # 新提案: DSGC (S1 + Gradient + Curvature)
         # ('gsmd',        'gsmd'),         # 新提案: GSMD (Gradient–Structural–Moment)
-        ('s3d',         's3d'),          # 新提案: S3D (SSIM + Gradient structure + Curvature structure)
+        # ('s3d',         's3d'),          # 新提案: S3D (SSIM + Gradient structure + Curvature structure)
         # ('cfsd',        'cfsd'),         # 新提案: CFSD (G-SSIM + normalized S1 + normalized curvature S1)
         # ('hff',         'hff'),          # 新提案: HFF (Hierarchical Feature Fusion)
         ('s1gk',        's1gk'),         # 新提案: S1GK (S1 + G-SSIM + Kappa curvature)
