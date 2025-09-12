@@ -2,25 +2,35 @@
 # -*- coding: utf-8 -*-
 
 """
-results_v5 配下の各 seed 実験ディレクトリにある evaluation_v5.log を再帰的に探索し、
-手法（--- [METHOD] --- で示されるブロック）ごとに
-[Summary] Macro Recall (基本ラベル) と (基本+応用) を抽出して平均・最小・最大・中央値を算出・表示します。
+results_(v5/v6) 配下の各 seed 実験ディレクトリにある以下を再帰的に探索・集計します:
 
-さらに、各手法に対してラベル 6A / 6B / 6C の
- - Correct（平均/最小/最大/中央値/合計）
- - Recall（平均）
-の統計も集計して表示します（「各ラベルの再現率（代表ノード群ベース）」の値を使用）。
+1) 学習時評価ログ: evaluation_v*.log
+   - 手法（--- [METHOD] --- で示されるブロック）ごとに
+     [Summary] Macro Recall (基本ラベル) と (基本+応用) を抽出して
+     平均・最小・最大・中央値を算出・表示します
+   - ラベル 6A / 6B / 6C の
+     - Correct（平均/最小/最大/中央値/合計）
+     - Recall（平均）
+     も「各ラベルの再現率（代表ノード群ベース）」セクションから集計
+
+2) 検証時評価ログ: verification_results/*_som/*_verification.log
+   - 手法ごとに [Summary] Macro Recall (基本ラベル) / (基本+応用) を抽出し、
+     平均・最小・最大・中央値を算出・表示します
+
+3) 学習結果: learning_result/*_som/*_results.log
+   - NodewiseMatchRate（最終値）を集計（Mean/Min/Median/Max と matched/total の合計および全体比）
+
+さらに、各表の Min / Max について「どの seed の値か」を表示します。
 
 使い方:
   python src/PressurePattern/search_results_v5.py
-    - デフォルトでは、このスクリプトのあるディレクトリの直下 'results_v5' を探索し、
-      ランキング順（平均値の降順）で表を出力します。
+    - デフォルトでは、このスクリプトのあるディレクトリの直下 'results_v5' を探索します
 
-  python src/PressurePattern/search_results_v5.py --root /path/to/results_v5
-    - 明示的に探索ルートを指定可能です。
+  python src/PressurePattern/search_results_v5.py --root /path/to/results_v6
+    - 明示的に探索ルートを指定可能です
 
   python src/PressurePattern/search_results_v5.py --precision 4 --sort rank
-    - 小数点以下の表示桁数や並び順を調整可能です。
+    - 小数点以下の表示桁数や並び順を調整可能です
     - --sort は rank/name/basic_combo のいずれか
       * rank: 各表をそれぞれの平均値（降順）で並べる（デフォルト）
       * name: 手法名で昇順
@@ -30,7 +40,7 @@ results_v5 配下の各 seed 実験ディレクトリにある evaluation_v5.log
 import os
 import re
 import argparse
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import math
 import statistics as stats
 
@@ -50,9 +60,19 @@ LABEL_LINE_RE = re.compile(
 LABELS_TARGET = ("6A", "6B", "6C")
 
 
+def get_seed_from_path(path: str) -> Optional[int]:
+    m = re.search(r'seed(\d+)', path)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
 def parse_log(log_path: str) -> Dict[str, Dict[str, Any]]:
     """
-    1つの evaluation_v5.log をパースして、
+    1つの evaluation_v*.log をパースして、
     {
       method_name: {
         "basic": float or None,
@@ -140,15 +160,58 @@ def parse_log(log_path: str) -> Dict[str, Dict[str, Any]]:
     return methods
 
 
-def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
+def parse_verification_log_for_summaries(log_path: str) -> Tuple[Optional[float], Optional[float]]:
     """
-    root 以下から evaluation_v5.log を再帰的に収集し、手法別に集約する。
+    verification_results/*_som/*_verification.log から
+    [Summary] Macro Recall (基本ラベル) / (基本+応用) を抽出する
+    """
+    basic_val: Optional[float] = None
+    combo_val: Optional[float] = None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                m_basic = BASIC_SUMMARY_RE.match(line)
+                if m_basic:
+                    try:
+                        basic_val = float(m_basic.group(1))
+                    except Exception:
+                        pass
+                    continue
+                m_combo = COMBO_SUMMARY_RE.match(line)
+                if m_combo:
+                    try:
+                        combo_val = float(m_combo.group(1))
+                    except Exception:
+                        pass
+                    continue
+    except FileNotFoundError:
+        pass
+    return basic_val, combo_val
+
+
+def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, Any]]]:
+    """
+    root 以下からログを再帰的に収集し、手法別に集約する。
     返り値:
-      (log_paths, aggregate)
+      (eval_log_paths, ver_log_paths, aggregate)
       aggregate: {
         method: {
           "basic": [float, ...],
+          "basic_pairs": [(float, seed or None), ...],
           "combo": [float, ...],
+          "combo_pairs": [(float, seed or None), ...],
+
+          "ver_basic": [float, ...],
+          "ver_basic_pairs": [(float, seed or None), ...],
+          "ver_combo": [float, ...],
+          "ver_combo_pairs": [(float, seed or None), ...],
+
+          "nodewise": [float, ...],
+          "nodewise_pairs": [(float, seed or None), ...],
+          "nodewise_matched": [int, ...],
+          "nodewise_total": [int, ...],
+
           "labels": {
             "6A": {"correct_sum": int, "corrects": [int, ...], "recalls": [float, ...], "count": int},
             "6B": {...},
@@ -157,20 +220,32 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
         }
       }
     """
-    log_paths: List[str] = []
+    eval_log_paths: List[str] = []
+    ver_log_paths: List[str] = []
+
+    # 収集: evaluation_v*.log
     for dirpath, _dirnames, filenames in os.walk(root):
-        if "evaluation_v5.log" in filenames:
-            log_paths.append(os.path.join(dirpath, "evaluation_v5.log"))
+        for fn in filenames:
+            if re.match(r"evaluation_v\d+\.log$", fn):
+                eval_log_paths.append(os.path.join(dirpath, fn))
 
     aggregate: Dict[str, Dict[str, Any]] = {}
+
     # 初期化ヘルパ
     def ensure_method(method: str):
         if method not in aggregate:
             aggregate[method] = {
                 "basic": [],
+                "basic_pairs": [],
                 "combo": [],
+                "combo_pairs": [],
+                "ver_basic": [],
+                "ver_basic_pairs": [],
+                "ver_combo": [],
+                "ver_combo_pairs": [],
                 # Node-wise metrics from *_results.log
                 "nodewise": [],
+                "nodewise_pairs": [],
                 "nodewise_matched": [],
                 "nodewise_total": [],
                 "labels": {
@@ -180,15 +255,19 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
                 },
             }
 
-    for p in sorted(log_paths):
+    # 解析: evaluation_v*.log
+    for p in sorted(eval_log_paths):
         parsed = parse_log(p)
+        seed = get_seed_from_path(p)
         for method, vals in parsed.items():
             ensure_method(method)
             # Summary
             if vals.get("basic") is not None:
-                aggregate[method]["basic"].append(vals["basic"])
+                aggregate[method]["basic"].append(vals["basic"])  # type: ignore[index]
+                aggregate[method]["basic_pairs"].append((vals["basic"], seed))  # type: ignore[index]
             if vals.get("combo") is not None:
-                aggregate[method]["combo"].append(vals["combo"])
+                aggregate[method]["combo"].append(vals["combo"])  # type: ignore[index]
+                aggregate[method]["combo_pairs"].append((vals["combo"], seed))  # type: ignore[index]
             # Labels 6A/6B/6C（代表ノード群ベース）
             labels: Dict[str, Dict[str, float]] = vals.get("labels", {})
             for lab in LABELS_TARGET:
@@ -214,7 +293,7 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
 
     for rp in sorted(results_logs):
         # 推定手法名: ディレクトリ名 '<name>_som' の前半を大文字化
-        method_dir = os.path.basename(os.path.dirname(rp))  # e.g., 'cfsd_som'
+        method_dir = os.path.basename(os.path.dirname(rp))  # e.g., 'euclidean_som'
         base_name = method_dir.rsplit("_som", 1)[0].upper()
         ensure_method(base_name)
         last_tuple = None  # (rate, matched, total)
@@ -238,8 +317,27 @@ def collect_logs(root: str) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
             aggregate[base_name]["nodewise"].append(rate)  # type: ignore[index]
             aggregate[base_name]["nodewise_matched"].append(matched)  # type: ignore[index]
             aggregate[base_name]["nodewise_total"].append(total)  # type: ignore[index]
+            aggregate[base_name]["nodewise_pairs"].append((rate, get_seed_from_path(rp)))  # type: ignore[index]
 
-    return log_paths, aggregate
+    # 収集/解析: verification_results/*_som/*_verification.log
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.endswith("_verification.log"):
+                vp = os.path.join(dirpath, fn)
+                ver_log_paths.append(vp)
+                method_dir = os.path.basename(os.path.dirname(vp))  # '<name>_som'
+                base_name = method_dir.rsplit("_som", 1)[0].upper()
+                ensure_method(base_name)
+                vb, vc = parse_verification_log_for_summaries(vp)
+                seed = get_seed_from_path(vp)
+                if vb is not None:
+                    aggregate[base_name]["ver_basic"].append(vb)  # type: ignore[index]
+                    aggregate[base_name]["ver_basic_pairs"].append((vb, seed))  # type: ignore[index]
+                if vc is not None:
+                    aggregate[base_name]["ver_combo"].append(vc)  # type: ignore[index]
+                    aggregate[base_name]["ver_combo_pairs"].append((vc, seed))  # type: ignore[index]
+
+    return eval_log_paths, ver_log_paths, aggregate
 
 
 def mean_or_nan(values: List[float]) -> float:
@@ -270,14 +368,33 @@ def fmt_float(v: float, prec: int) -> str:
     return f"{v:.{prec}f}" if not math.isnan(v) else "NaN"
 
 
+def fmt_seed(seed: Optional[int]) -> str:
+    return f"{seed:d}" if seed is not None else "-"
+
+
+def find_extreme_seeds(pairs: List[Tuple[float, Optional[int]]]) -> Tuple[Optional[int], Optional[int], float, float]:
+    """
+    pairs: [(value, seed), ...]
+    return: (min_seed, max_seed, min_val, max_val)
+    """
+    if not pairs:
+        return None, None, float("nan"), float("nan")
+    values = [v for v, _ in pairs]
+    min_v = min(values)
+    max_v = max(values)
+    min_seed = next((s for v, s in pairs if v == min_v), None)
+    max_seed = next((s for v, s in pairs if v == max_v), None)
+    return min_seed, max_seed, min_v, max_v
+
+
 def main():
-    parser = argparse.ArgumentParser(description="results_v5 の evaluation_v5.log から手法別 Macro Recall 統計と 6A/6B/6C 統計を算出")
+    parser = argparse.ArgumentParser(description="results_(v5/v6) のログから手法別の各種統計（学習/検証）を算出")
     default_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results_v5")
     parser.add_argument(
         "--root",
         type=str,
         default=default_root,
-        help=f"探索対象の results_v5 ディレクトリ (default: {default_root})",
+        help=f"探索対象の results ディレクトリ (default: {default_root})",
     )
     parser.add_argument(
         "--sort",
@@ -299,101 +416,88 @@ def main():
         print(f"[ERROR] 指定のディレクトリが存在しません: {root}")
         return
 
-    log_paths, aggregate = collect_logs(root)
+    eval_paths, ver_paths, aggregate = collect_logs(root)
 
-    print("==== results_v5 集計 ====")
+    print("==== results 集計 ====")
     print(f"探索対象: {root}")
-    print(f"検出ログ数: {len(log_paths)}")
+    print(f"検出ログ数: evaluation={len(eval_paths)} verification={len(ver_paths)}")
     print("")
 
     # 並び順関数
     def key_by_name(item):
         return item[0]
 
-    def key_by_basic(item):
-        name, metrics = item
-        return -mean_or_nan(metrics["basic"])  # type: ignore[index]
+    def key_by_mean_key(key: str):
+        def _k(item):
+            name, metrics = item
+            return -mean_or_nan(metrics.get(key, []))  # type: ignore[arg-type,index]
+        return _k
 
-    def key_by_combo(item):
-        name, metrics = item
-        return -mean_or_nan(metrics["combo"])  # type: ignore[index]
+    def print_table(title: str, value_key: str, pair_key: str, sort_mode: str, prec: int):
+        header = (
+            f'{title:24s} '
+            f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
+            f'{"MinSeed":>8s} {"MaxSeed":>8s}'
+        )
+        print(header)
+        print("-" * len(header))
+        items = list(aggregate.items())
+        if sort_mode == "name":
+            items.sort(key=key_by_name)
+        else:
+            items.sort(key=key_by_mean_key(value_key))
 
-    # 基本ラベル表（Mean/Min/Median/Max）
-    header_basic = (
-        f'{"[基本] Method":24s} '
-        f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s}'
-    )
-    print("==== 手法別 Macro Recall 統計（基本ラベル） ====")
-    print(header_basic)
-    print("-" * len(header_basic))
-    items = list(aggregate.items())
-    if args.sort == "name":
-        items.sort(key=key_by_name)
-    else:
-        # rank/basic_combo はどちらも基本は基本の平均降順
-        items.sort(key=key_by_basic)
+        for method, metrics in items:
+            vals: List[float] = metrics.get(value_key, [])  # type: ignore[assignment]
+            pairs: List[Tuple[float, Optional[int]]] = metrics.get(pair_key, [])  # type: ignore[assignment]
+            n = len(vals)
+            mean_v = mean_or_nan(vals)
+            min_v = min_or_nan(vals)
+            med_v = median_or_nan(vals)
+            max_v = max_or_nan(vals)
+            min_seed, max_seed, _mv, _xv = find_extreme_seeds(pairs)
+            print(
+                f"{method:24s} {n:5d} "
+                f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
+                f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s} "
+                f"{fmt_seed(min_seed):>8s} {fmt_seed(max_seed):>8s}"
+            )
+        print("")
 
     prec = args.precision
-    for method, metrics in items:
-        vals = metrics["basic"]  # type: ignore[index]
-        n = len(vals)  # type: ignore[arg-type]
-        mean_v = mean_or_nan(vals)  # type: ignore[arg-type]
-        min_v = min_or_nan(vals)  # type: ignore[arg-type]
-        med_v = median_or_nan(vals)  # type: ignore[arg-type]
-        max_v = max_or_nan(vals)  # type: ignore[arg-type]
-        print(
-            f"{method:24s} {n:5d} "
-            f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
-            f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s}"
-        )
-    print("")
 
-    # 基本+応用表（Mean/Min/Median/Max）
-    header_combo = (
-        f'{"[基本+応用] Method":24s} '
-        f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s}'
-    )
-    print("==== 手法別 Macro Recall 統計（基本+応用） ====")
-    print(header_combo)
-    print("-" * len(header_combo))
-    items2 = list(aggregate.items())
-    if args.sort == "name":
-        items2.sort(key=key_by_name)
-    else:
-        # rank/basic_combo はどちらも基本+応用はその平均降順
-        items2.sort(key=key_by_combo)
+    # 学習(評価ログ) 基本ラベル
+    print("==== 手法別 Macro Recall 統計（学習: 基本ラベル, evaluation_v*.log） ====")
+    print_table("[基本] Method", "basic", "basic_pairs", args.sort, prec)
 
-    for method, metrics in items2:
-        vals = metrics["combo"]  # type: ignore[index]
-        n = len(vals)  # type: ignore[arg-type]
-        mean_v = mean_or_nan(vals)  # type: ignore[arg-type]
-        min_v = min_or_nan(vals)  # type: ignore[arg-type]
-        med_v = median_or_nan(vals)  # type: ignore[arg-type]
-        max_v = max_or_nan(vals)  # type: ignore[arg-type]
-        print(
-            f"{method:24s} {n:5d} "
-            f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
-            f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s}"
-        )
-    print("")
+    # 学習(評価ログ) 基本+応用
+    print("==== 手法別 Macro Recall 統計（学習: 基本+応用, evaluation_v*.log） ====")
+    print_table("[基本+応用] Method", "combo", "combo_pairs", args.sort, prec)
 
-    # NodewiseMatchRate 統計（Mean/Min/Median/Max と matched/total の合計および全体比）
+    # 検証(verification) 基本ラベル
+    print("==== 手法別 Macro Recall 統計（検証: 基本ラベル, *_verification.log） ====")
+    print_table("[Ver基本] Method", "ver_basic", "ver_basic_pairs", args.sort, prec)
+
+    # 検証(verification) 基本+応用
+    print("==== 手法別 Macro Recall 統計（検証: 基本+応用, *_verification.log） ====")
+    print_table("[Ver基本+応用] Method", "ver_combo", "ver_combo_pairs", args.sort, prec)
+
+    # NodewiseMatchRate 統計（Mean/Min/Median/Max と matched/total の合計および全体比 + Min/Max seed）
     header_nodewise = (
         f'{"[Nodewise] Method":24s} '
         f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
-        f'{"Σmatch":>10s} {"Σnodes":>10s} {"Overall":>10s}'
+        f'{"Σmatch":>10s} {"Σnodes":>10s} {"Overall":>10s} '
+        f'{"MinSeed":>8s} {"MaxSeed":>8s}'
     )
     print("==== 手法別 NodewiseMatchRate 統計（learning_result/*_results.log の[Final Metrics]より） ====")
     print(header_nodewise)
     print("-" * len(header_nodewise))
     items3 = list(aggregate.items())
-    def key_by_nodewise(item):
-        name, metrics = item
-        return -mean_or_nan(metrics.get("nodewise", []))  # type: ignore[arg-type,index]
+
     if args.sort == "name":
         items3.sort(key=key_by_name)
     else:
-        items3.sort(key=key_by_nodewise)
+        items3.sort(key=key_by_mean_key("nodewise"))
 
     for method, metrics in items3:
         rates: List[float] = metrics.get("nodewise", [])  # type: ignore[assignment]
@@ -405,11 +509,13 @@ def main():
         sum_match = sum(metrics.get("nodewise_matched", []))  # type: ignore[arg-type]
         sum_total = sum(metrics.get("nodewise_total", []))  # type: ignore[arg-type]
         overall = (sum_match / sum_total) if sum_total > 0 else float("nan")
+        min_seed, max_seed, _mv, _xv = find_extreme_seeds(metrics.get("nodewise_pairs", []))  # type: ignore[arg-type]
         print(
             f"{method:24s} {n:5d} "
             f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
             f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s} "
-            f"{sum_match:10d} {sum_total:10d} {fmt_float(overall, prec):>10s}"
+            f"{sum_match:10d} {sum_total:10d} {fmt_float(overall, prec):>10s} "
+            f"{fmt_seed(min_seed):>8s} {fmt_seed(max_seed):>8s}"
         )
     print("")
 
@@ -439,11 +545,10 @@ def main():
             mean_r = mean_or_nan(recalls)
             rows.append((method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r))
 
-        # デフォルトはランキング（Mean_R または Mean_C の降順）: ここでは従来通り Mean_R を優先
+        # デフォルトはランキング（Mean_R 降順）: 同率は手法名で
         if args.sort == "name":
             rows.sort(key=lambda x: x[0])
         else:
-            # 平均Recall降順、同率は手法名で
             rows.sort(key=lambda x: (- (x[7] if not math.isnan(x[7]) else -1.0), x[0]))
 
         for method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r in rows:
@@ -459,9 +564,9 @@ def main():
         print_label_stats(lab)
 
     print("注記:")
-    print(" - 基本/基本+応用の統計は [Summary] Macro Recall の値から算出（Mean/Min/Median/Max）。")
-    print(" - 6A/6B/6C の Correct/Recall は「各ラベルの再現率（代表ノード群ベース）」の値を使用。")
-    print("   Correct は平均/最小/最大/中央値/合計、Recall は平均を表示（値が取得できたログのみで計算）。")
+    print(" - 学習(評価ログ)/検証(verification)の Macro Recall は [Summary] の値から算出（Mean/Min/Median/Max）。")
+    print(" - 各表では MinSeed / MaxSeed に、最小/最大値が出た seed を表示（同値が複数ある場合は最初に検出したもの）。")
+    print(" - 6A/6B/6C の Correct/Recall は「各ラベルの再現率（代表ノード群ベース）」の値を使用（学習評価ログ）。")
     print(" - デフォルトの並び順（--sort rank/basic_combo）は平均値の降順です。--sort name で手法名順。")
 
 
