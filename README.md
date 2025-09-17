@@ -110,7 +110,7 @@ ps aux | grep main_v5.py | grep -v grep
 - 全て停止（強制）:
 
 ```bash
-pkill -f "main_v5.py"
+pkill -f "main_v6.py"
 ```
 
 - 指定 GPU だけを止めたい場合はコマンドラインを絞り込む:
@@ -204,7 +204,7 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{19,20}_*' \
+  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v6_iter10000_batch256_seed{9,10}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu01
 ```
 
@@ -212,7 +212,7 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v5_iter1000_batch256_seed{11,12}_*' \
+  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v6_iter10000_batch256_seed{5,6}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
 ```
 
@@ -255,7 +255,9 @@ chmod +x run_seeds.sh
 
 ```bash
 # 範囲やGPU、チャネル、対象スクリプトを明示
-nohup bash run_seeds.sh --start 1 --end 10 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v5.py > orchestrator.log 2>&1 &
+nohup bash run_seeds.sh --start 11 --end 16 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v6.py > orchestrator.log 2>&1 &
+
+nohup bash run_seeds.sh --start 17 --end 20 --gpu0 0 --gpu1 1 --channel gpu01 --script main_v6.py > orchestrator.log 2>&1 &
 ```
 
 そのコマンドは正常に動きます。前提として src/PressurePattern に移動してから実行する場合、以下が成立します。
@@ -388,7 +390,7 @@ Task Completed
 基本的な使い方（プロジェクトルートから）:
 
 ```bash
-nohup python search_results_v5.py  --root ./results_v5 > search_results_v5.log 2>&1 &
+nohup python search_results_v6.py  --root ./results_v6_iter1000 > search_results_v6.log 2>&1 &
 ```
 
 主なオプション:

@@ -43,6 +43,7 @@ import argparse
 from typing import Dict, List, Tuple, Any, Optional
 import math
 import statistics as stats
+from decimal import Decimal, ROUND_HALF_UP
 
 
 HEADER_RE = re.compile(r'^--- \[(.+?)\] ---')
@@ -365,7 +366,35 @@ def median_or_nan(values: List[float]) -> float:
 
 
 def fmt_float(v: float, prec: int) -> str:
-    return f"{v:.{prec}f}" if not math.isnan(v) else "NaN"
+    if math.isnan(v):
+        return "NaN"
+    try:
+        d = Decimal(str(v))
+        exp = Decimal('1').scaleb(-prec)  # e.g., prec=2 -> 0.01
+        rounded = d.quantize(exp, rounding=ROUND_HALF_UP)
+        return str(rounded)  # keeps trailing zeros (e.g., '1.20')
+    except Exception:
+        # Fallback to standard formatting
+        return f"{v:.{prec}f}"
+
+
+def fmt_seed(seed: Optional[int]) -> str:
+    return f"{seed:d}" if seed is not None else "-"
+
+
+def find_extreme_seeds(pairs: List[Tuple[float, Optional[int]]]) -> Tuple[Optional[int], Optional[int], float, float]:
+    """
+    pairs: [(value, seed), ...]
+    return: (min_seed, max_seed, min_val, max_val)
+    """
+    if not pairs:
+        return None, None, float("nan"), float("nan")
+    values = [v for v, _ in pairs]
+    min_v = min(values)
+    max_v = max(values)
+    min_seed = next((s for v, s in pairs if v == min_v), None)
+    max_seed = next((s for v, s in pairs if v == max_v), None)
+    return min_seed, max_seed, min_v, max_v
 
 
 def fmt_seed(seed: Optional[int]) -> str:
@@ -406,8 +435,8 @@ def main():
     parser.add_argument(
         "--precision",
         type=int,
-        default=4,
-        help="小数点以下の表示桁数 (default: 4)",
+        default=3,
+        help="小数点以下の表示桁数 (default: 3)",
     )
     args = parser.parse_args()
 
