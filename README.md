@@ -204,7 +204,7 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v6_iter10000_batch256_seed{9,10}_*' \
+  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v7_iter1000_batch128_seed{1,2}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu01
 ```
 
@@ -212,7 +212,7 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v6_iter10000_batch256_seed{5,6}_*' \
+  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v7_iter1000_batch128_seed{1,2}_*' \
   /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
 ```
 

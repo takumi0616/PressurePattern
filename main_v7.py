@@ -36,8 +36,8 @@ SEED = 1
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 1000
-BATCH_SIZE = 256
-NODES_CHUNK = 16 # VRAM16GB:2, VRAM24GB:4
+BATCH_SIZE = 128
+NODES_CHUNK = 32 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
@@ -53,7 +53,7 @@ VALID_START = '1998-01-01'
 VALID_END   = '2000-12-31'
 
 # 出力先（v7）
-RESULT_DIR   = './results_v7_iter1000_batch256_seed1'
+RESULT_DIR   = './results_v7_iter1000_batch128_seed1'
 LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
 VERIF_ROOT    = os.path.join(RESULT_DIR, 'verification_results')
 
