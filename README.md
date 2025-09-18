@@ -110,7 +110,7 @@ ps aux | grep main_v5.py | grep -v grep
 - 全て停止（強制）:
 
 ```bash
-pkill -f "main_v6.py"
+pkill -f "main_v7.py"
 ```
 
 - 指定 GPU だけを止めたい場合はコマンドラインを絞り込む:
@@ -255,9 +255,9 @@ chmod +x run_seeds.sh
 
 ```bash
 # 範囲やGPU、チャネル、対象スクリプトを明示
-nohup bash run_seeds.sh --start 11 --end 16 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v6.py > orchestrator.log 2>&1 &
+nohup bash run_seeds.sh --start 1 --end 2 --gpu0 0 --gpu1 1 --channel gpu02 --script main_v7.py > orchestrator.log 2>&1 &
 
-nohup bash run_seeds.sh --start 17 --end 20 --gpu0 0 --gpu1 1 --channel gpu01 --script main_v6.py > orchestrator.log 2>&1 &
+nohup bash run_seeds.sh --start 1 --end 2 --gpu0 0 --gpu1 1 --channel gpu01 --script main_v7.py > orchestrator.log 2>&1 &
 ```
 
 そのコマンドは正常に動きます。前提として src/PressurePattern に移動してから実行する場合、以下が成立します。

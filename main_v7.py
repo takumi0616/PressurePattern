@@ -1,4 +1,4 @@
-# main_v6.py
+# main_v7.py
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -36,10 +36,9 @@ SEED = 1
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 1000
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 NODES_CHUNK = 16 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
-EVAL_SAMPLE_LIMIT = 4000
 SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
@@ -53,8 +52,8 @@ LEARN_END   = '1997-12-31'
 VALID_START = '1998-01-01'
 VALID_END   = '2000-12-31'
 
-# 出力先（v6）
-RESULT_DIR   = './results_v6_iter1000_batch128_seed1'
+# 出力先（v7）
+RESULT_DIR   = './results_v7_iter1000_batch256_seed1'
 LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
 VERIF_ROOT    = os.path.join(RESULT_DIR, 'verification_results')
 
@@ -95,10 +94,10 @@ def set_reproducibility(seed: int = 42):
         pass
 
 
-def setup_logging_v6():
+def setup_logging_v7():
     for d in [RESULT_DIR, LEARNING_ROOT, VERIF_ROOT]:
         os.makedirs(d, exist_ok=True)
-    log_path = os.path.join(RESULT_DIR, 'run_v6.log')
+    log_path = os.path.join(RESULT_DIR, 'run_v7.log')
     if os.path.exists(log_path):
         os.remove(log_path)
     logging.basicConfig(
@@ -106,7 +105,7 @@ def setup_logging_v6():
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[logging.FileHandler(log_path), logging.StreamHandler()]
     )
-    logging.info("ログ初期化完了（run_v6.log）。")
+    logging.info("ログ初期化完了（run_v7.log）。")
 
 
 # =====================================================
@@ -1651,6 +1650,7 @@ def plot_nodewise_match_map(
     # ノードごとのサンプルリスト
     clusters = winners_to_clusters(winners_xy, som_shape)
     node_to_majority_raw: Dict[Tuple[int,int], Optional[str]] = {}
+    node_to_majority_count: Dict[Tuple[int,int], int] = {}
     node_to_count: Dict[Tuple[int,int], int] = {}
 
     for k, idxs in enumerate(clusters):
@@ -1662,8 +1662,11 @@ def plot_nodewise_match_map(
         cnt = Counter([labels_all[j] for j in idxs if labels_all[j] is not None])
         if len(cnt) == 0:
             node_to_majority_raw[(ix,iy)] = None
+            node_to_majority_count[(ix,iy)] = 0
         else:
-            node_to_majority_raw[(ix,iy)] = cnt.most_common(1)[0][0]
+            top_label, top_count = cnt.most_common(1)[0]
+            node_to_majority_raw[(ix,iy)] = top_label
+            node_to_majority_count[(ix,iy)] = top_count
 
     # グリッド図
     map_x, map_y = som_shape
@@ -1688,7 +1691,16 @@ def plot_nodewise_match_map(
             mi = node_to_medoid_idx[(ix,iy)]
             med_raw = labels_all[mi] if labels_all is not None else None
             dstr = format_date_yyyymmdd(times_all[mi]) if times_all is not None and len(times_all)>mi else ''
-            match = (med_raw == maj) if (med_raw is not None and maj is not None) else False
+            # 基本ラベル一致判定（複合/移行は一致扱いにしない）
+            import unicodedata
+            def _is_comp_or_trans(s):
+                if s is None:
+                    return False
+                u = unicodedata.normalize('NFKC', str(s))
+                return ('+' in u) or ('-' in u) or ('＋' in u) or ('－' in u) or ('−' in u)
+            rep_base = None if (maj is None or _is_comp_or_trans(maj)) else basic_label_or_none(maj, BASE_LABELS)
+            med_base = None if (med_raw is None or _is_comp_or_trans(med_raw)) else basic_label_or_none(med_raw, BASE_LABELS)
+            match = (rep_base is not None) and (med_base is not None) and (rep_base == med_base)
 
             # 背景色を一致/不一致で塗る（薄い緑/薄い赤）
             if match:
@@ -1700,7 +1712,8 @@ def plot_nodewise_match_map(
             ax.text(0.02, 0.98, f'({ix},{iy}) N={node_to_count.get((ix,iy),0)}',
                     transform=ax.transAxes, ha='left', va='top', fontsize=10, fontweight='bold')
             # 付記（少し大きめ）
-            ax.text(0.02, 0.78, f'Majority: {maj}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
+            maj_cnt = node_to_majority_count.get((ix,iy), 0)
+            ax.text(0.02, 0.78, f'Majority: {maj} (n={maj_cnt})', transform=ax.transAxes, ha='left', va='top', fontsize=10)
             ax.text(0.02, 0.62, f'Medoid  : {med_raw}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
             ax.text(0.02, 0.46, f'Date    : {dstr}', transform=ax.transAxes, ha='left', va='top', fontsize=10)
 
@@ -2034,12 +2047,9 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
     # σを学習全体で一方向に減衰（セグメント跨ぎで継続）
     som.set_total_iterations(NUM_ITER)
 
-    # 固定QE評価サンプルを設定（再現性あり）
-    n_eval = min(EVAL_SAMPLE_LIMIT if EVAL_SAMPLE_LIMIT else data_all.shape[0], data_all.shape[0])
-    if n_eval > 0:
-        rng = np.random.RandomState(SEED)
-        eval_idx = rng.choice(data_all.shape[0], size=n_eval, replace=False)
-        som.set_eval_indices(eval_idx)
+    # 評価は常に全サンプルで実施
+    eval_idx = np.arange(data_all.shape[0])
+    som.set_eval_indices(eval_idx)
 
     # ====== 学習を区切って実施し、各区切りで評価（履歴プロット用） ======
     step = max(1, NUM_ITER // SOM_EVAL_SEGMENTS)
@@ -2063,7 +2073,7 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         current_iter += n_it
 
         # 量子化誤差
-        qe_now = som.quantization_error(data_all, sample_limit=EVAL_SAMPLE_LIMIT, batch_size=max(32, BATCH_SIZE))
+        qe_now = som.quantization_error(data_all, sample_limit=None, batch_size=max(32, BATCH_SIZE))
 
         # 評価
         winners_now = som.predict(data_all, batch_size=max(64, BATCH_SIZE))
@@ -2398,10 +2408,10 @@ def write_evaluation_summary(learning_root: str, result_root: str, methods: List
     """
     learning_result/{method}_som/{method}_results.log の中から
     「【SOM代表ノード群ベースの再現率（基本/複合）】」ブロックを抜き出して集約ログを作成。
-    出力先: {result_root}/evaluation_v6.log
+    出力先: {result_root}/evaluation_v7.log
     戻り値: 出力ファイルパス
     """
-    out_path = os.path.join(result_root, 'evaluation_v6.log')
+    out_path = os.path.join(result_root, 'evaluation_v7.log')
     start_tokens = [
         '【SOM代表ノード群ベースの再現率（基本のみ）】',
         '【SOM代表ノード群ベースの再現率（基本/複合）】',
@@ -2449,7 +2459,7 @@ def write_evaluation_summary(learning_root: str, result_root: str, methods: List
 # =====================================================
 def main():
     global SEED, RESULT_DIR, LEARNING_ROOT, VERIF_ROOT
-    parser = argparse.ArgumentParser(description="PressurePattern SOM v6")
+    parser = argparse.ArgumentParser(description="PressurePattern SOM v7")
     parser.add_argument('--seed', type=int, default=SEED, help='random seed')
     parser.add_argument('--gpu', type=int, default=None, help='GPU index to use (e.g., 0 or 1). Ignored if --device is set.')
     parser.add_argument('--device', type=str, default=None, help="Device to use: 'cpu', 'cuda', or 'cuda:N'")
@@ -2492,12 +2502,12 @@ def main():
         RESULT_DIR = args.result_dir
     else:
         dev_tag = 'cpu' if dev == 'cpu' else f'cuda{selected_gpu_index if selected_gpu_index is not None else 0}'
-        RESULT_DIR = f'./results_v6_iter{NUM_ITER}_batch{BATCH_SIZE}_seed{SEED}_{dev_tag}'
+        RESULT_DIR = f'./results_v7_iter{NUM_ITER}_batch{BATCH_SIZE}_seed{SEED}_{dev_tag}'
     LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
     VERIF_ROOT = os.path.join(RESULT_DIR, 'verification_results')
 
     set_reproducibility(SEED)
-    setup_logging_v6()
+    setup_logging_v7()
     device = dev
     logging.info(f"使用デバイス: {device} ({gpu_name})")
     logging.info(f"SOM(3type): size={SOM_X}x{SOM_Y}, iters={NUM_ITER}, batch={BATCH_SIZE}, nodes_chunk={NODES_CHUNK}")
