@@ -84,8 +84,28 @@ LABEL_LINE_RE = re.compile(
 VER_LABEL_LINE_RE = re.compile(
     r'^-\s*(6[ABC])\s*:\s*N_base=\s*(\d+)\s+Correct_base=\s*(\d+)\s+Recall_base=([0-9.]+)\s*\|\s*N_comp=\s*(\d+)\s+Correct_comp=\s*(\d+)\s+Recall_comp=([0-9.]+)'
 )
+# verification 用（base のみ。例: "- 6A : N_base=   1 Correct_base=   0 Recall_base=0.0000"）
+VER_LABEL_BASE_ONLY_RE = re.compile(
+    r'^-\s*(6[ABC])\s*:\s*N_base=\s*(\d+)\s+Correct_base=\s*(\d+)\s+Recall_base=([0-9.]+)'
+)
 
 LABELS_TARGET = ("6A", "6B", "6C")
+# 全15の基本ラベル（列順）
+LABELS_ALL = ("1", "2A", "2B", "2C", "2D", "3A", "3B", "3C", "3D", "4A", "4B", "5", "6A", "6B", "6C")
+
+# 学習/評価ログ（results.log/evaluation.log）用: 全ラベル行
+ALL_LABEL_LINE_RE = re.compile(
+    r'^-\s*(1|2A|2B|2C|2D|3A|3B|3C|3D|4A|4B|5|6A|6B|6C)\s*:\s*N=\s*(\d+)\s+Correct=\s*(\d+)\s+Recall=([0-9.]+)'
+)
+
+# 検証ログ用（base | comp の両方が並記されている行）
+VER_ALL_LABEL_LINE_RE = re.compile(
+    r'^-\s*(1|2A|2B|2C|2D|3A|3B|3C|3D|4A|4B|5|6A|6B|6C)\s*:\s*N_base=\s*(\d+)\s+Correct_base=\s*(\d+)\s+Recall_base=([0-9.]+)\s*\|\s*N_comp=.*$'
+)
+# 検証ログ用（base のみの行）
+VER_ALL_LABEL_BASE_ONLY_RE = re.compile(
+    r'^-\s*(1|2A|2B|2C|2D|3A|3B|3C|3D|4A|4B|5|6A|6B|6C)\s*:\s*N_base=\s*(\d+)\s+Correct_base=\s*(\d+)\s+Recall_base=([0-9.]+)'
+)
 
 
 def get_seed_from_path(path: str) -> Optional[int]:
@@ -281,16 +301,21 @@ def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, A
                 "typhoon_pairs": [],
                 "typhoon_ver": [],
                 "typhoon_ver_pairs": [],
+                # 検証時の 6A/6B/6C 統計（従来）
                 "ver_labels": {
                     "6A": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                     "6B": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                     "6C": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                 },
+                # 学習時の 6A/6B/6C 統計（従来）
                 "labels": {
                     "6A": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                     "6B": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                     "6C": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                 },
+                # 追加: 全15基本ラベルの再現率（学習・検証）をラベル別に蓄積
+                "train_label_recalls": {lab: [] for lab in LABELS_ALL},
+                "ver_label_recalls": {lab: [] for lab in LABELS_ALL},
             }
 
     # 解析: evaluation_v*.log
@@ -371,6 +396,29 @@ def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, A
             aggregate[base_name]["nodewise_matched"].append(matched)  # type: ignore[index]
             aggregate[base_name]["nodewise_total"].append(total)  # type: ignore[index]
             aggregate[base_name]["nodewise_pairs"].append((rate, get_seed_from_path(rp)))  # type: ignore[index]
+        # 追加収集: *_results.log 終盤の「各ラベルの再現率（代表ノード群ベース）」から全15基本ラベルの Recall を学習側として集計
+        try:
+            in_basic = False
+            with open(rp, "r", encoding="utf-8", errors="ignore") as f:
+                for raw in f:
+                    s = raw.strip()
+                    if "【各ラベルの再現率（代表ノード群ベース）】" in s:
+                        in_basic = True
+                        continue
+                    if s.startswith("[Summary]"):
+                        in_basic = False
+                    if in_basic:
+                        m_all = ALL_LABEL_LINE_RE.match(s)
+                        if m_all:
+                            lab = m_all.group(1)
+                            try:
+                                rec = float(m_all.group(4))
+                            except Exception:
+                                continue
+                            if lab in LABELS_ALL:
+                                aggregate[base_name]["train_label_recalls"][lab].append(rec)  # type: ignore[index]
+        except Exception:
+            pass
 
     # 収集/解析: verification_results/*_som/*_verification.log
     for dirpath, _dirnames, filenames in os.walk(root):
@@ -395,7 +443,55 @@ def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, A
                     with open(vp, "r", encoding="utf-8", errors="ignore") as vf:
                         for raw_v in vf:
                             s = raw_v.strip()
-                            # まず verification 専用フォーマットを試す
+                            # まず verification 専用フォーマットを試す（全ラベル→6A/6B/6Cの順）
+                            m_all = VER_ALL_LABEL_LINE_RE.match(s)
+                            if m_all:
+                                lab = m_all.group(1)
+                                try:
+                                    corr_base = int(m_all.group(3))
+                                    rec_base = float(m_all.group(4))
+                                except Exception:
+                                    continue
+                                if lab in ("6A", "6B"):
+                                    ty_vals_ver.append(rec_base)
+                                if lab in LABELS_TARGET:
+                                    try:
+                                        aggregate[base_name]["ver_labels"][lab]["correct_sum"] += corr_base  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["corrects"].append(corr_base)  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["recalls"].append(rec_base)  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["count"] += 1  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                if lab in LABELS_ALL:
+                                    try:
+                                        aggregate[base_name]["ver_label_recalls"][lab].append(rec_base)  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                continue
+                            m_all_base = VER_ALL_LABEL_BASE_ONLY_RE.match(s)
+                            if m_all_base:
+                                lab = m_all_base.group(1)
+                                try:
+                                    corr_base = int(m_all_base.group(3))
+                                    rec_base = float(m_all_base.group(4))
+                                except Exception:
+                                    continue
+                                if lab in ("6A", "6B"):
+                                    ty_vals_ver.append(rec_base)
+                                if lab in LABELS_TARGET:
+                                    try:
+                                        aggregate[base_name]["ver_labels"][lab]["correct_sum"] += corr_base  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["corrects"].append(corr_base)  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["recalls"].append(rec_base)  # type: ignore[index]
+                                        aggregate[base_name]["ver_labels"][lab]["count"] += 1  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                if lab in LABELS_ALL:
+                                    try:
+                                        aggregate[base_name]["ver_label_recalls"][lab].append(rec_base)  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                continue
                             m_ver = VER_LABEL_LINE_RE.match(s)
                             if m_ver:
                                 lab = m_ver.group(1)
@@ -412,6 +508,38 @@ def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, A
                                         aggregate[base_name]["ver_labels"][lab]["corrects"].append(corr_base)  # type: ignore[index]
                                         aggregate[base_name]["ver_labels"][lab]["recalls"].append(rec_base)  # type: ignore[index]
                                         aggregate[base_name]["ver_labels"][lab]["count"] += 1  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                # 追加: 全15基本ラベルの base Recall を収集
+                                if lab in LABELS_ALL:
+                                    try:
+                                        aggregate[base_name]["ver_label_recalls"][lab].append(rec_base)  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                continue
+                            # 追加: 複合系(Comp)の無い base のみの行にも対応
+                            m_ver_base = VER_LABEL_BASE_ONLY_RE.match(s)
+                            if m_ver_base:
+                                lab = m_ver_base.group(1)
+                                try:
+                                    corr_base = int(m_ver_base.group(3))
+                                    rec_base = float(m_ver_base.group(4))
+                                except Exception:
+                                    continue
+                                if lab in ("6A", "6B"):
+                                    ty_vals_ver.append(rec_base)
+                                if lab in LABELS_TARGET:
+                                    try:
+                                        aggregate[base_name]["ver_labels"][lab]["correct_sum"] += corr_base
+                                        aggregate[base_name]["ver_labels"][lab]["corrects"].append(corr_base)
+                                        aggregate[base_name]["ver_labels"][lab]["recalls"].append(rec_base)
+                                        aggregate[base_name]["ver_labels"][lab]["count"] += 1
+                                    except Exception:
+                                        pass
+                                # 追加: 全15基本ラベルの base Recall を収集
+                                if lab in LABELS_ALL:
+                                    try:
+                                        aggregate[base_name]["ver_label_recalls"][lab].append(rec_base)  # type: ignore[index]
                                     except Exception:
                                         pass
                                 continue
@@ -432,6 +560,12 @@ def collect_logs(root: str) -> Tuple[List[str], List[str], Dict[str, Dict[str, A
                                         aggregate[base_name]["ver_labels"][lab]["corrects"].append(corr_v)  # type: ignore[index]
                                         aggregate[base_name]["ver_labels"][lab]["recalls"].append(rec_v)  # type: ignore[index]
                                         aggregate[base_name]["ver_labels"][lab]["count"] += 1  # type: ignore[index]
+                                    except Exception:
+                                        pass
+                                # 追加: 旧式（学習形式）行でも base として扱い収集
+                                if lab in LABELS_ALL:
+                                    try:
+                                        aggregate[base_name]["ver_label_recalls"][lab].append(rec_v)  # type: ignore[index]
                                     except Exception:
                                         pass
                     if ty_vals_ver:
@@ -477,6 +611,15 @@ def std_or_nan(values: List[float]) -> float:
         return stats.stdev(values)
     except Exception:
         return float("nan")
+
+
+def has_any_values(aggregate: Dict[str, Dict[str, Any]], key: str) -> bool:
+    """aggregate の各 method で指定 key の配列に1つでも値があれば True。"""
+    for _m, metrics in aggregate.items():
+        vals = metrics.get(key, [])
+        if isinstance(vals, list) and len(vals) > 0:
+            return True
+    return False
 
 
 def fmt_float(v: float, prec: int) -> str:
@@ -630,6 +773,8 @@ def ensure_method_in_agg(agg: Dict[str, Dict[str, Any]], method: str):
                 "6B": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
                 "6C": {"correct_sum": 0, "corrects": [], "recalls": [], "count": 0},
             },
+            "train_label_recalls": {lab: [] for lab in LABELS_ALL},
+            "ver_label_recalls": {lab: [] for lab in LABELS_ALL},
         }
 
 
@@ -673,6 +818,17 @@ def merge_aggregates(aggregates: List[Dict[str, Dict[str, Any]]]) -> Dict[str, D
                 dstv["count"] += srcv.get("count", 0)  # type: ignore[index]
                 dstv["corrects"].extend(srcv.get("corrects", []))  # type: ignore[index]
                 dstv["recalls"].extend(srcv.get("recalls", []))  # type: ignore[index]
+            # 追加: 全15基本ラベル（学習/検証）の再現率をマージ
+            dst_train = merged[method].setdefault("train_label_recalls", {lab: [] for lab in LABELS_ALL})
+            src_train = m.get("train_label_recalls", {})
+            for lab in LABELS_ALL:
+                dst_train.setdefault(lab, [])
+                dst_train[lab].extend(src_train.get(lab, []))
+            dst_ver = merged[method].setdefault("ver_label_recalls", {lab: [] for lab in LABELS_ALL})
+            src_ver = m.get("ver_label_recalls", {})
+            for lab in LABELS_ALL:
+                dst_ver.setdefault(lab, [])
+                dst_ver[lab].extend(src_ver.get(lab, []))
     return merged
 
 
@@ -885,40 +1041,93 @@ def print_cross_root_ver_basic(per_root_aggregates: Dict[str, Dict[str, Dict[str
     print("")
 
 
+def print_per_label_pivot(aggregate: Dict[str, Dict[str, Any]], label_source: str, prec: int):
+    """
+    行=手法, 列=全15基本ラベル で、各ラベルの平均Recall（seed横断平均）を表示するピボット表。
+    label_source: "train" -> *_results.log（学習）由来, "ver" -> *_verification.log（検証）由来
+    """
+    if not aggregate:
+        return
+    key = "train_label_recalls" if label_source == "train" else "ver_label_recalls"
+    title = "横断ピボット表（学習: 基本ラベルごとの平均再現率）" if label_source == "train" else "横断ピボット表（検証: 基本ラベルごとの平均再現率）"
+    print(f"==== {title} ====")
+    header = f'{"[Pivot] Method":24s} ' + " ".join(f"{lab:>6s}" for lab in LABELS_ALL) + f' {"Overall":>8s} {"N_lab":>6s}'
+    print(header)
+    print("-" * len(header))
+
+    methods = sorted(aggregate.keys())
+
+    def overall_mean_method(meth: str) -> float:
+        recs_map: Dict[str, List[float]] = aggregate.get(meth, {}).get(key, {})  # type: ignore[assignment]
+        vals: List[float] = []
+        for lab in LABELS_ALL:
+            lv = mean_or_nan(recs_map.get(lab, []))
+            if not math.isnan(lv):
+                vals.append(lv)
+        return mean_or_nan(vals) if vals else float("nan")
+
+    methods.sort(key=lambda m: - (overall_mean_method(m) if not math.isnan(overall_mean_method(m)) else -1.0))
+
+    for meth in methods:
+        recs_map: Dict[str, List[float]] = aggregate.get(meth, {}).get(key, {})  # type: ignore[assignment]
+        label_means: List[float] = []
+        cells: List[str] = []
+        n_lab = 0
+        for lab in LABELS_ALL:
+            mv = mean_or_nan(recs_map.get(lab, []))
+            cells.append(fmt_float(mv, prec))
+            if not math.isnan(mv):
+                label_means.append(mv)
+                n_lab += 1
+        overall_m = mean_or_nan(label_means) if label_means else float("nan")
+        print(f"{meth:24s} " + " ".join(f"{c:>6s}" for c in cells) + f" {fmt_float(overall_m, prec):>8s} {n_lab:6d}")
+    print("")
+
+
 def print_all_tables_for_aggregate(aggregate: Dict[str, Dict[str, Any]], context_name: str, sort_mode: str, prec: int):
     print(f"==== 手法別 Macro Recall 統計（学習: 基本ラベル, evaluation_v*.log）[{context_name}] ====")
     print_table(aggregate, "[基本] Method", "basic", "basic_pairs", sort_mode, prec)
 
-    print(f"==== 手法別 Macro Recall 統計（学習: 基本+応用, evaluation_v*.log）[{context_name}] ====")
-    print_table(aggregate, "[基本+応用] Method", "combo", "combo_pairs", sort_mode, prec)
+    if has_any_values(aggregate, "combo"):
+        print(f"==== 手法別 Macro Recall 統計（学習: 基本+応用, evaluation_v*.log）[{context_name}] ====")
+        print_table(aggregate, "[基本+応用] Method", "combo", "combo_pairs", sort_mode, prec)
 
     print(f"==== 手法別 Macro Recall 統計（検証: 基本ラベル, *_verification.log）[{context_name}] ====")
     print_table(aggregate, "[Ver基本] Method", "ver_basic", "ver_basic_pairs", sort_mode, prec)
 
-    print(f"==== 手法別 Macro Recall 統計（検証: 基本+応用, *_verification.log）[{context_name}] ====")
-    print_table(aggregate, "[Ver基本+応用] Method", "ver_combo", "ver_combo_pairs", sort_mode, prec)
+    if has_any_values(aggregate, "ver_combo"):
+        print(f"==== 手法別 Macro Recall 統計（検証: 基本+応用, *_verification.log）[{context_name}] ====")
+        print_table(aggregate, "[Ver基本+応用] Method", "ver_combo", "ver_combo_pairs", sort_mode, prec)
 
     print_nodewise_table(aggregate, sort_mode, prec)
     print_label_stats_tables(aggregate, sort_mode, prec)
     print_ver_label_stats_tables(aggregate, sort_mode, prec)
+    # 新規ピボット（全15基本ラベル）
+    print_per_label_pivot(aggregate, "train", prec)
+    print_per_label_pivot(aggregate, "ver", prec)
 
 
 def print_overall_tables(overall_agg: Dict[str, Dict[str, Any]], sort_mode: str, prec: int):
     print("==== 手法別 Macro Recall 統計（学習: 基本ラベル, evaluation_v*.log）[Overall] ====")
     print_table(overall_agg, "[基本] Method", "basic", "basic_pairs", sort_mode, prec)
 
-    print("==== 手法別 Macro Recall 統計（学習: 基本+応用, evaluation_v*.log）[Overall] ====")
-    print_table(overall_agg, "[基本+応用] Method", "combo", "combo_pairs", sort_mode, prec)
+    if has_any_values(overall_agg, "combo"):
+        print("==== 手法別 Macro Recall 統計（学習: 基本+応用, evaluation_v*.log）[Overall] ====")
+        print_table(overall_agg, "[基本+応用] Method", "combo", "combo_pairs", sort_mode, prec)
 
     print("==== 手法別 Macro Recall 統計（検証: 基本ラベル, *_verification.log）[Overall] ====")
     print_table(overall_agg, "[Ver基本] Method", "ver_basic", "ver_basic_pairs", sort_mode, prec)
 
-    print("==== 手法別 Macro Recall 統計（検証: 基本+応用, *_verification.log）[Overall] ====")
-    print_table(overall_agg, "[Ver基本+応用] Method", "ver_combo", "ver_combo_pairs", sort_mode, prec)
+    if has_any_values(overall_agg, "ver_combo"):
+        print("==== 手法別 Macro Recall 統計（検証: 基本+応用, *_verification.log）[Overall] ====")
+        print_table(overall_agg, "[Ver基本+応用] Method", "ver_combo", "ver_combo_pairs", sort_mode, prec)
 
     print_nodewise_table(overall_agg, sort_mode, prec)
     print_label_stats_tables(overall_agg, sort_mode, prec)
     print_ver_label_stats_tables(overall_agg, sort_mode, prec)
+    # 新規ピボット（全15基本ラベル）
+    print_per_label_pivot(overall_agg, "train", prec)
+    print_per_label_pivot(overall_agg, "ver", prec)
 
 
 def recommend_methods(overall_agg: Dict[str, Dict[str, Any]], topk: int, prec: int, context_name: str = "Overall", roots_data: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None):

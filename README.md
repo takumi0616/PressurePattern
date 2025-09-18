@@ -390,7 +390,7 @@ Task Completed
 基本的な使い方（プロジェクトルートから）:
 
 ```bash
-nohup python search_results_v6.py  --root ./results_v6_iter1000 > search_results_v6.log 2>&1 &
+nohup python search_results_v7.py  --root ./results_v7_iter1000_128 > search_results_v7.log 2>&1 &
 ```
 
 主なオプション:
