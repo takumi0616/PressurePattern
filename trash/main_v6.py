@@ -49,8 +49,8 @@ DATA_FILE = './prmsl_era5_all_data_seasonal_large.nc'
 
 # 期間（学習/検証）
 LEARN_START = '1991-01-01'
-LEARN_END   = '1999-12-31'
-VALID_START = '2000-01-01'
+LEARN_END   = '1998-12-31'
+VALID_START = '1999-01-01'
 VALID_END   = '2000-12-31'
 
 # 出力先（v6）
@@ -2602,14 +2602,14 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(idx)} (index={idx})")
 
     methods = [
-        ('euclidean', 'euclidean'),
-        ('ssim5',     'ssim5'),
-        ('s1',        's1'),
-        ('gssim',     'gssim'),
+        # ('euclidean', 'euclidean'),
+        # ('ssim5',     'ssim5'),
+        # ('s1',        's1'),
+        # ('gssim',     'gssim'),
         ('kappa',     'kappa'),
         ('s1k',       's1k'),
-        ('gk',        'gk'),
-        ('s1gk',      's1gk'),
+        # ('gk',        'gk'),
+        # ('s1gk',      's1gk'),
     ]
     for mname, adist in methods:
         # 学習
