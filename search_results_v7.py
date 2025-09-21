@@ -49,14 +49,21 @@
   # 横断ピボット表（Verification Basic の平均）の CSV を出力
   python src/PressurePattern/search_results_v7.py --csv-out summary_ver_basic.csv
 
+  # NetCDF の基本ラベル分布をレポート（1991-01-01〜2000-12-31）
+  python src/PressurePattern/search_results_v7.py --nc-report --nc-file src/PressurePattern/prmsl_era5_all_data_seasonal_large.nc --nc-start 1991-01-01 --nc-end 2000-12-31
+
 オプション:
   --roots       複数の results ディレクトリを指定（最優先）
   --root        単一の results ディレクトリを指定（後方互換）
   --sort        並び順（rank/name/basic_combo）: デフォルト rank
-  --precision   小数点以下の表示桁数: デフォルト 3
+  --precision   小数点以下の表示桁数: デフォルト 2
   --recommend   総合スコアに基づく推奨手法 Top-K を表示
   --topk        推奨手法の件数（--recommend 使用時のみ）: 0 以下で全件表示（デフォルト 0）
   --csv-out     横断ピボット表（Verification Basic 平均）の CSV 出力先
+  --nc-report   NetCDF ファイルから指定期間の基本ラベル分布をレポート
+  --nc-file     NetCDF ファイルパス（既定: src/PressurePattern/prmsl_era5_all_data_seasonal_large.nc）
+  --nc-start    期間開始日（YYYY-MM-DD、既定: 1991-01-01）
+  --nc-end      期間終了日（YYYY-MM-DD、既定: 2000-12-31）
 """
 
 import os
@@ -67,6 +74,18 @@ import math
 import statistics as stats
 from decimal import Decimal, ROUND_HALF_UP
 import csv
+from collections import Counter
+from datetime import datetime, timezone, timedelta
+import sys
+import atexit
+import numpy as np
+import pandas as pd
+
+# xarray は存在すれば利用、無ければ後述の netCDF4 フォールバックを用いる
+try:
+    import xarray as xr  # type: ignore
+except Exception:
+    xr = None  # xarray が無い環境でも動作可能にする
 
 
 HEADER_RE = re.compile(r'^--- \[(.+?)\] ---')
@@ -639,6 +658,40 @@ def fmt_seed(seed: Optional[int]) -> str:
     return f"{seed:d}" if seed is not None else "-"
 
 
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+def setup_global_tee_logging(log_path: str) -> None:
+    """
+    全ての標準出力/標準エラー出力を指定ファイルに必ず保存する Tee を有効化する。
+    実行環境で `> xxx.log` などのリダイレクトがあっても、同時に log_path にも書き出される。
+    """
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        f = open(log_path, "a", encoding="utf-8")  # 追記モード。毎回上書きにしたい場合は "w" に変更
+    except Exception as e:
+        # ファイルが開けない場合でも処理は継続（標準出力のみ）
+        print(f"[WARN] ログファイル {log_path} を開けません: {e}")
+        return
+    # 現在の stdout/stderr を保持したまま Tee 化
+    sys.stdout = _Tee(sys.stdout, f)  # type: ignore[assignment]
+    sys.stderr = _Tee(sys.stderr, f)  # type: ignore[assignment]
+    atexit.register(f.close)
+    print(f"[INFO] Tee logging enabled -> {log_path}")
+
 def find_extreme_seeds(pairs: List[Tuple[float, Optional[int]]]) -> Tuple[Optional[int], Optional[int], float, float]:
     """
     pairs: [(value, seed), ...]
@@ -835,7 +888,7 @@ def merge_aggregates(aggregates: List[Dict[str, Dict[str, Any]]]) -> Dict[str, D
 def print_table(aggregate: Dict[str, Dict[str, Any]], title: str, value_key: str, pair_key: str, sort_mode: str, prec: int):
     header = (
         f'{title:24s} '
-        f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
+        f'{"N":>5s} {"Mean":>10s} {"Std":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
         f'{"MinSeed":>8s} {"MaxSeed":>8s}'
     )
     print(header)
@@ -863,9 +916,10 @@ def print_table(aggregate: Dict[str, Dict[str, Any]], title: str, value_key: str
         med_v = median_or_nan(vals)
         max_v = max_or_nan(vals)
         min_seed, max_seed, _mv, _xv = find_extreme_seeds(pairs)
+        std_v = std_or_nan(vals)
         print(
             f"{method:24s} {n:5d} "
-            f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
+            f"{fmt_float(mean_v, prec):>10s} {fmt_float(std_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
             f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s} "
             f"{fmt_seed(min_seed):>8s} {fmt_seed(max_seed):>8s}"
         )
@@ -875,7 +929,7 @@ def print_table(aggregate: Dict[str, Dict[str, Any]], title: str, value_key: str
 def print_nodewise_table(aggregate: Dict[str, Dict[str, Any]], sort_mode: str, prec: int):
     header_nodewise = (
         f'{"[Nodewise] Method":24s} '
-        f'{"N":>5s} {"Mean":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
+        f'{"N":>5s} {"Mean":>10s} {"Std":>10s} {"Min":>10s} {"Median":>10s} {"Max":>10s} '
         f'{"Σmatch":>10s} {"Σnodes":>10s} {"Overall":>10s} '
         f'{"MinSeed":>8s} {"MaxSeed":>8s}'
     )
@@ -907,9 +961,10 @@ def print_nodewise_table(aggregate: Dict[str, Dict[str, Any]], sort_mode: str, p
         sum_total = sum(metrics.get("nodewise_total", []))  # type: ignore[arg-type]
         overall = (sum_match / sum_total) if sum_total > 0 else float("nan")
         min_seed, max_seed, _mv, _xv = find_extreme_seeds(metrics.get("nodewise_pairs", []))  # type: ignore[arg-type]
+        std_v = std_or_nan(rates)
         print(
             f"{method:24s} {n:5d} "
-            f"{fmt_float(mean_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
+            f"{fmt_float(mean_v, prec):>10s} {fmt_float(std_v, prec):>10s} {fmt_float(min_v, prec):>10s} "
             f"{fmt_float(med_v, prec):>10s} {fmt_float(max_v, prec):>10s} "
             f"{sum_match:10d} {sum_total:10d} {fmt_float(overall, prec):>10s} "
             f"{fmt_seed(min_seed):>8s} {fmt_seed(max_seed):>8s}"
@@ -924,8 +979,8 @@ def print_label_stats_tables(aggregate: Dict[str, Dict[str, Any]], sort_mode: st
         header = (
             f'{"Method":24s} '
             f'{"N":>5s} '
-            f'{"Mean_C":>10s} {"Min_C":>10s} {"Med_C":>10s} {"Max_C":>10s} {"Sum_C":>10s} '
-            f'{"Mean_R":>10s}'
+            f'{"Mean_C":>10s} {"Std_C":>10s} {"Min_C":>10s} {"Med_C":>10s} {"Max_C":>10s} {"Sum_C":>10s} '
+            f'{"Mean_R":>10s} {"Std_R":>10s}'
         )
         print(header)
         print("-" * len(header))
@@ -936,24 +991,27 @@ def print_label_stats_tables(aggregate: Dict[str, Dict[str, Any]], sort_mode: st
             recalls: List[float] = info["recalls"]  # type: ignore[index]
             n = len(corrects)
             mean_c = stats.mean(corrects) if n > 0 else float("nan")
+            std_c = (stats.stdev(corrects) if n > 1 else (0.0 if n == 1 else float("nan")))
             min_c = min(corrects) if n > 0 else float("nan")
             med_c = stats.median(corrects) if n > 0 else float("nan")
             max_c = max(corrects) if n > 0 else float("nan")
             sum_c = info["correct_sum"]  # type: ignore[index]
             mean_r = mean_or_nan(recalls)
-            rows.append((method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r))
+            std_r = std_or_nan(recalls)
+            rows.append((method, n, mean_c, std_c, min_c, med_c, max_c, sum_c, mean_r, std_r))
 
         if sort_mode == "name":
             rows.sort(key=lambda x: x[0])
         else:
-            rows.sort(key=lambda x: (- (x[7] if not math.isnan(x[7]) else -1.0), x[0]))
+            # x[8] は Mean_R
+            rows.sort(key=lambda x: (- (x[8] if not math.isnan(x[8]) else -1.0), x[0]))
 
-        for method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r in rows:
+        for method, n, mean_c, std_c, min_c, med_c, max_c, sum_c, mean_r, std_r in rows:
             print(
                 f"{method:24s} {n:5d} "
-                f"{fmt_float(float(mean_c), prec):>10s} {fmt_float(float(min_c), prec):>10s} "
+                f"{fmt_float(float(mean_c), prec):>10s} {fmt_float(float(std_c), prec):>10s} {fmt_float(float(min_c), prec):>10s} "
                 f"{fmt_float(float(med_c), prec):>10s} {fmt_float(float(max_c), prec):>10s} "
-                f"{sum_c:10d} {fmt_float(mean_r, prec):>10s}"
+                f"{sum_c:10d} {fmt_float(mean_r, prec):>10s} {fmt_float(std_r, prec):>10s}"
             )
         print("")
     
@@ -965,8 +1023,8 @@ def print_ver_label_stats_tables(aggregate: Dict[str, Dict[str, Any]], sort_mode
         header = (
             f'{"Method":24s} '
             f'{"N":>5s} '
-            f'{"Mean_C":>10s} {"Min_C":>10s} {"Med_C":>10s} {"Max_C":>10s} {"Sum_C":>10s} '
-            f'{"Mean_R":>10s}'
+            f'{"Mean_C":>10s} {"Std_C":>10s} {"Min_C":>10s} {"Med_C":>10s} {"Max_C":>10s} {"Sum_C":>10s} '
+            f'{"Mean_R":>10s} {"Std_R":>10s}'
         )
         print(header)
         print("-" * len(header))
@@ -977,22 +1035,25 @@ def print_ver_label_stats_tables(aggregate: Dict[str, Dict[str, Any]], sort_mode
             recalls: List[float] = info.get("recalls", [])
             n = len(corrects)
             mean_c = stats.mean(corrects) if n > 0 else float("nan")
+            std_c = (stats.stdev(corrects) if n > 1 else (0.0 if n == 1 else float("nan")))
             min_c = min(corrects) if n > 0 else float("nan")
             med_c = stats.median(corrects) if n > 0 else float("nan")
             max_c = max(corrects) if n > 0 else float("nan")
             sum_c = info.get("correct_sum", 0)
             mean_r = mean_or_nan(recalls)
-            rows.append((method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r))
+            std_r = std_or_nan(recalls)
+            rows.append((method, n, mean_c, std_c, min_c, med_c, max_c, sum_c, mean_r, std_r))
         if sort_mode == "name":
             rows.sort(key=lambda x: x[0])
         else:
-            rows.sort(key=lambda x: (- (x[7] if not math.isnan(x[7]) else -1.0), x[0]))
-        for method, n, mean_c, min_c, med_c, max_c, sum_c, mean_r in rows:
+            # x[8] は Mean_R
+            rows.sort(key=lambda x: (- (x[8] if not math.isnan(x[8]) else -1.0), x[0]))
+        for method, n, mean_c, std_c, min_c, med_c, max_c, sum_c, mean_r, std_r in rows:
             print(
                 f"{method:24s} {n:5d} "
-                f"{fmt_float(float(mean_c), prec):>10s} {fmt_float(float(min_c), prec):>10s} "
+                f"{fmt_float(float(mean_c), prec):>10s} {fmt_float(float(std_c), prec):>10s} {fmt_float(float(min_c), prec):>10s} "
                 f"{fmt_float(float(med_c), prec):>10s} {fmt_float(float(max_c), prec):>10s} "
-                f"{sum_c:10d} {fmt_float(mean_r, prec):>10s}"
+                f"{sum_c:10d} {fmt_float(mean_r, prec):>10s} {fmt_float(std_r, prec):>10s}"
             )
         print("")
     
@@ -1082,8 +1143,52 @@ def print_per_label_pivot(aggregate: Dict[str, Dict[str, Any]], label_source: st
         overall_m = mean_or_nan(label_means) if label_means else float("nan")
         print(f"{meth:24s} " + " ".join(f"{c:>6s}" for c in cells) + f" {fmt_float(overall_m, prec):>8s} {n_lab:6d}")
     print("")
+    
+    
+def print_per_label_pivot_std(aggregate: Dict[str, Dict[str, Any]], label_source: str, prec: int):
+    """
+    行=手法, 列=全15基本ラベル で、各ラベルの標準偏差（seed横断の std）を表示するピボット表。
+    label_source: "train" -> *_results.log（学習）由来, "ver" -> *_verification.log（検証）由来
+    """
+    if not aggregate:
+        return
+    key = "train_label_recalls" if label_source == "train" else "ver_label_recalls"
+    title = "横断ピボット表（学習: 基本ラベルごとの標準偏差）" if label_source == "train" else "横断ピボット表（検証: 基本ラベルごとの標準偏差）"
+    print(f"==== {title} ====")
+    header = f'{"[Pivot-Std] Method":24s} ' + " ".join(f"{lab:>6s}" for lab in LABELS_ALL) + f' {"Overall":>8s} {"N_lab":>6s}'
+    print(header)
+    print("-" * len(header))
 
+    methods = sorted(aggregate.keys())
 
+    def overall_std_method(meth: str) -> float:
+        recs_map: Dict[str, List[float]] = aggregate.get(meth, {}).get(key, {})  # type: ignore[assignment]
+        vals: List[float] = []
+        for lab in LABELS_ALL:
+            lv = std_or_nan(recs_map.get(lab, []))
+            if not math.isnan(lv):
+                vals.append(lv)
+        return mean_or_nan(vals) if vals else float("nan")
+
+    # 並びは Overall（std の平均）降順
+    methods.sort(key=lambda m: - (overall_std_method(m) if not math.isnan(overall_std_method(m)) else -1.0))
+
+    for meth in methods:
+        recs_map: Dict[str, List[float]] = aggregate.get(meth, {}).get(key, {})  # type: ignore[assignment]
+        label_stds: List[float] = []
+        cells: List[str] = []
+        n_lab = 0
+        for lab in LABELS_ALL:
+            sv = std_or_nan(recs_map.get(lab, []))
+            cells.append(fmt_float(sv, prec))
+            if not math.isnan(sv):
+                label_stds.append(sv)
+                n_lab += 1
+        overall_s = mean_or_nan(label_stds) if label_stds else float("nan")
+        print(f"{meth:24s} " + " ".join(f"{c:>6s}" for c in cells) + f" {fmt_float(overall_s, prec):>8s} {n_lab:6d}")
+    print("")
+    
+    
 def print_all_tables_for_aggregate(aggregate: Dict[str, Dict[str, Any]], context_name: str, sort_mode: str, prec: int):
     print(f"==== 手法別 Macro Recall 統計（学習: 基本ラベル, evaluation_v*.log）[{context_name}] ====")
     print_table(aggregate, "[基本] Method", "basic", "basic_pairs", sort_mode, prec)
@@ -1105,6 +1210,9 @@ def print_all_tables_for_aggregate(aggregate: Dict[str, Dict[str, Any]], context
     # 新規ピボット（全15基本ラベル）
     print_per_label_pivot(aggregate, "train", prec)
     print_per_label_pivot(aggregate, "ver", prec)
+    # 新規ピボット（標準偏差）
+    print_per_label_pivot_std(aggregate, "train", prec)
+    print_per_label_pivot_std(aggregate, "ver", prec)
 
 
 def print_overall_tables(overall_agg: Dict[str, Dict[str, Any]], sort_mode: str, prec: int):
@@ -1128,6 +1236,9 @@ def print_overall_tables(overall_agg: Dict[str, Dict[str, Any]], sort_mode: str,
     # 新規ピボット（全15基本ラベル）
     print_per_label_pivot(overall_agg, "train", prec)
     print_per_label_pivot(overall_agg, "ver", prec)
+    # 新規ピボット（標準偏差）
+    print_per_label_pivot_std(overall_agg, "train", prec)
+    print_per_label_pivot_std(overall_agg, "ver", prec)
 
 
 def recommend_methods(overall_agg: Dict[str, Dict[str, Any]], topk: int, prec: int, context_name: str = "Overall", roots_data: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None):
@@ -1332,25 +1443,365 @@ def maybe_write_csv(csv_path: Optional[str], per_root_aggregates: Dict[str, Dict
             writer.writerow(row)
 
 
+def report_nc_labels(nc_path: str, start_date: str, end_date: str, basic_labels: Tuple[str, ...] = LABELS_ALL, prec: int = 3) -> None:
+    """
+    指定 NetCDF から期間 [start_date, end_date] を xarray で直接 .sel して抽出し、
+    変数 'label' の基本ラベル出現分布を集計して表示する。
+    main_v7.py の load_and_prepare_data_unified と同等の座標検出・期間フィルタ方式に合わせる。
+    """
+    print("==== NetCDF ラベル分布レポート ====")
+    print(f"ファイル: {nc_path}")
+    print(f"期間: {start_date} 〜 {end_date}")
+    if not os.path.isfile(nc_path):
+        print("[WARN] NetCDF ファイルが見つかりません。スキップします。")
+        print("")
+        return
+
+    # ラベル正規化: main_v7.py の basic_label_or_none に準拠（簡約版を内蔵）
+    def _normalize_to_base_candidate(label_str: Optional[str]) -> Optional[str]:
+        import unicodedata, re as _re
+        if label_str is None:
+            return None
+        s = str(label_str)
+        s = unicodedata.normalize('NFKC', s)
+        s = s.upper().strip()
+        s = s.replace('＋', '+').replace('－', '-').replace('−', '-')
+        # 英数字以外は除去
+        s = _re.sub(r'[^0-9A-Z\+\-]', '', s)
+        return s if s != '' else None
+
+    def basic_label_or_none(label_str: Optional[str], base_labels: Tuple[str, ...]) -> Optional[str]:
+        import re as _re
+        cand = _normalize_to_base_candidate(label_str)
+        if cand is None:
+            return None
+        # 完全一致を優先
+        if cand in base_labels:
+            return cand
+        # 先頭一致 + 残りに英数字が無い（例: '2A+' → '2A'）
+        for bl in base_labels:
+            if cand == bl:
+                return bl
+            if cand.startswith(bl):
+                rest = cand[len(bl):]
+                if _re.search(r'[0-9A-Z]', rest) is None:
+                    return bl
+        return None
+
+    try:
+        ds = None
+        # xarray で decode_times=True として開く（エンジンを順に試す）
+        if xr is not None:
+            open_errs = []
+            for engine in (None, "h5netcdf", "scipy"):
+                try:
+                    ds = xr.open_dataset(nc_path, decode_times=True, engine=engine if engine else None)
+                    break
+                except Exception as e:
+                    open_errs.append(str(e))
+                    ds = None
+            if ds is None:
+                raise RuntimeError("xarray での読み込みに失敗: " + " | ".join(open_errs))
+
+        # 時間座標名を判定
+        if "valid_time" in ds:
+            time_coord = "valid_time"
+        elif "time" in ds:
+            time_coord = "time"
+        else:
+            raise ValueError('No time coordinate named "valid_time" or "time".')
+
+        # 期間でスライス（デコード済みのため文字列 slice でOK）
+        sub = ds.sel({time_coord: slice(start_date, end_date)})
+
+        # 該当数
+        total = int(sub[time_coord].size)
+        if total == 0:
+            # xarray の decode_times=True でヒットしない場合に備え、numeric time でフォールバック
+            try:
+                open_errs_fb = []
+                ds_fb = None
+                for engine in (None, "h5netcdf", "scipy"):
+                    try:
+                        ds_fb = xr.open_dataset(nc_path, decode_times=False, engine=engine if engine else None)
+                        break
+                    except Exception as e:
+                        open_errs_fb.append(str(e))
+                        ds_fb = None
+                if ds_fb is None:
+                    print("[WARN] 指定期間に該当するデータがありません。フォールバック読み込みにも失敗しました。")
+                    print("")
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    return
+
+                # 時間座標を再判定
+                if "valid_time" in ds_fb:
+                    time_coord_fb = "valid_time"
+                elif "time" in ds_fb:
+                    time_coord_fb = "time"
+                else:
+                    print('[WARN] 指定期間に該当するデータがありません（時間座標が見つからず）。')
+                    print("")
+                    try:
+                        ds_fb.close()
+                    except Exception:
+                        pass
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    return
+
+                vt_vals = ds_fb[time_coord_fb].values
+                if vt_vals.dtype.kind not in ("i", "u", "f"):
+                    print("[WARN] 指定期間に該当するデータがありません（時間が数値でないためフォールバック不可）。")
+                    print("")
+                    try:
+                        ds_fb.close()
+                    except Exception:
+                        pass
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    return
+
+                # UTC で秒へ変換して範囲抽出
+                s_ts = pd.Timestamp(start_date).tz_localize("UTC")
+                e_ts = pd.Timestamp(end_date).tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+                start_sec = int(s_ts.timestamp())
+                end_sec = int(e_ts.timestamp())
+                idx = np.where((vt_vals >= start_sec) & (vt_vals <= end_sec))[0]
+                total_fb = int(idx.size)
+                if total_fb == 0:
+                    print("[WARN] 指定期間に該当するデータがありません。")
+                    print("")
+                    try:
+                        ds_fb.close()
+                    except Exception:
+                        pass
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    return
+
+                if "label" not in ds_fb.variables:
+                    print("[WARN] 'label' 変数が見つからないため、分布集計をスキップします。")
+                    print(f"対象データ数: {total_fb}")
+                    print("")
+                    try:
+                        ds_fb.close()
+                    except Exception:
+                        pass
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
+                    return
+
+                labels_da = ds_fb["label"].isel({time_coord_fb: idx})
+                raw_labels = labels_da.values.reshape(-1)
+
+                # デコード・正規化して集計
+                label_list: List[Optional[str]] = []
+                for v in raw_labels:
+                    try:
+                        if isinstance(v, (bytes, bytearray)):
+                            s = v.decode("utf-8", errors="ignore").strip()
+                        else:
+                            s = str(v).strip()
+                    except Exception:
+                        s = ""
+                    label_list.append(s if s != "" else None)
+
+                # 集計（基本ラベルに正規化してカウント）＋ 複合ラベル解析（フォールバック経路）
+                counts: Dict[str, int] = {lab: 0 for lab in basic_labels}
+                other = 0
+                for lab in label_list:
+                    bl = basic_label_or_none(lab, basic_labels)
+                    if bl is not None:
+                        counts[bl] += 1
+                    else:
+                        other += 1
+
+                comp_counts = Counter()
+                for lab in label_list:
+                    s = _normalize_to_base_candidate(lab)
+                    if not s:
+                        continue
+                    ops = [ch for ch in s if ch in ['+', '-']]
+                    if len(ops) != 1:
+                        continue
+                    op = ops[0]
+                    parts = s.split(op)
+                    if len(parts) != 2:
+                        continue
+                    left, right = parts[0], parts[1]
+                    if (left in basic_labels) and (right in basic_labels):
+                        key = f"{left}{op}{right}"
+                        comp_counts[key] += 1
+
+                print(f"対象データ数: {total_fb}")
+                header = f'{"Label":>6s} {"Count":>8s} {"Percent":>10s}'
+                print(header)
+                print("-" * len(header))
+                base_sum_fb = 0
+                for lab in basic_labels:
+                    c = counts[lab]
+                    base_sum_fb += c
+                    pct = (c / total_fb * 100.0) if total_fb > 0 else float("nan")
+                    print(f"{lab:>6s} {c:8d} {fmt_float(pct, prec):>10s}")
+                base_sum_pct_fb = (base_sum_fb / total_fb * 100.0) if total_fb > 0 else float("nan")
+                print("-" * len(header))
+                print(f"{'TOTAL':>6s} {base_sum_fb:8d} {fmt_float(base_sum_pct_fb, prec):>10s}")
+                if other > 0:
+                    pct = (other / total_fb * 100.0)
+                    print(f"{'OTHER':>6s} {other:8d} {fmt_float(pct, prec):>10s}")
+                print("")
+
+                comp_total_fb = sum(comp_counts.values())
+                comp_kinds_fb = len(comp_counts)
+                kinds_plus_fb = sum(1 for k in comp_counts if '+' in k)
+                kinds_minus_fb = sum(1 for k in comp_counts if '-' in k)
+                comp_pct_fb = (comp_total_fb / total_fb * 100.0) if total_fb > 0 else float("nan")
+
+                print("【複合ラベル（Base±Base）統計】")
+                print(f"- 出現総数: {comp_total_fb} / {total_fb} ({fmt_float(comp_pct_fb, prec)}%)")
+                print(f"- 異なる複合ラベルの種類数: {comp_kinds_fb}  (+' 種類: {kinds_plus_fb}, -' 種類: {kinds_minus_fb})")
+                if comp_kinds_fb > 0:
+                    print("- 出現上位（最大 30 件）:")
+                    for key, cnt in comp_counts.most_common(30):
+                        pctk = (cnt / total_fb * 100.0) if total_fb > 0 else float('nan')
+                        print(f"  {key:>8s} : {cnt:6d} ({fmt_float(pctk, prec)}%)")
+                print("")
+                try:
+                    ds_fb.close()
+                except Exception:
+                    pass
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                return
+            except Exception as _e_fb:
+                print(f"[WARN] フォールバック集計中に例外: {_e_fb}")
+                print("")
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+                return
+
+        # ラベル配列
+        if "label" not in sub.variables:
+            print("[WARN] 'label' 変数が見つからないため、分布集計をスキップします。")
+            print(f"対象データ数: {total}")
+            print("")
+            try:
+                ds.close()
+            except Exception:
+                pass
+            return
+
+        raw_labels = sub["label"].values  # 期待形状: (time,)
+        raw_labels = raw_labels.reshape(-1)
+
+        # デコード・正規化
+        label_list: List[Optional[str]] = []
+        for v in raw_labels:
+            try:
+                if isinstance(v, (bytes, bytearray)):
+                    s = v.decode("utf-8", errors="ignore").strip()
+                else:
+                    s = str(v).strip()
+            except Exception:
+                s = ""
+            label_list.append(s if s != "" else None)
+
+        # 集計（基本ラベルに正規化してカウント）＋ 複合ラベル（Base±Base）解析
+        counts: Dict[str, int] = {lab: 0 for lab in basic_labels}
+        other = 0
+        for lab in label_list:
+            bl = basic_label_or_none(lab, basic_labels)
+            if bl is not None:
+                counts[bl] += 1
+            else:
+                other += 1
+
+        # 複合ラベル（基本ラベル2つが + または - で接続）の出現集計
+        comp_counts = Counter()
+        for lab in label_list:
+            s = _normalize_to_base_candidate(lab)
+            if not s:
+                continue
+            ops = [ch for ch in s if ch in ['+', '-']]
+            if len(ops) != 1:
+                continue
+            op = ops[0]
+            parts = s.split(op)
+            if len(parts) != 2:
+                continue
+            left, right = parts[0], parts[1]
+            if (left in basic_labels) and (right in basic_labels):
+                key = f"{left}{op}{right}"
+                comp_counts[key] += 1
+
+        # 出力（基本15ラベル分布＋合計）
+        print(f"対象データ数: {total}")
+        header = f'{"Label":>6s} {"Count":>8s} {"Percent":>10s}'
+        print(header)
+        print("-" * len(header))
+        base_sum = 0
+        for lab in basic_labels:
+            c = counts[lab]
+            base_sum += c
+            pct = (c / total * 100.0) if total > 0 else float("nan")
+            print(f"{lab:>6s} {c:8d} {fmt_float(pct, prec):>10s}")
+        # 15ラベル合計
+        base_sum_pct = (base_sum / total * 100.0) if total > 0 else float("nan")
+        print("-" * len(header))
+        print(f"{'TOTAL':>6s} {base_sum:8d} {fmt_float(base_sum_pct, prec):>10s}")
+        if other > 0:
+            other_pct = (other / total * 100.0)
+            print(f"{'OTHER':>6s} {other:8d} {fmt_float(other_pct, prec):>10s}")
+        print("")
+
+        # 複合ラベルの詳細
+        comp_total = sum(comp_counts.values())
+        comp_kinds = len(comp_counts)
+        kinds_plus = sum(1 for k in comp_counts if '+' in k)
+        kinds_minus = sum(1 for k in comp_counts if '-' in k)
+        comp_pct = (comp_total / total * 100.0) if total > 0 else float("nan")
+
+        print("【複合ラベル（Base±Base）統計】")
+        print(f"- 出現総数: {comp_total} / {total} ({fmt_float(comp_pct, prec)}%)")
+        print(f"- 異なる複合ラベルの種類数: {comp_kinds}  (+' 種類: {kinds_plus}, -' 種類: {kinds_minus})")
+        if comp_kinds > 0:
+            print("- 出現上位（最大 30 件）:")
+            for key, cnt in comp_counts.most_common(30):
+                pctk = (cnt / total * 100.0) if total > 0 else float('nan')
+                print(f"  {key:>8s} : {cnt:6d} ({fmt_float(pctk, prec)}%)")
+        print("")
+    except Exception as e:
+        print(f"[ERROR] NetCDF レポート中に例外: {e}")
+        print("")
+    finally:
+        try:
+            if ds is not None:
+                ds.close()
+        except Exception:
+            pass
+
 def main():
     parser = argparse.ArgumentParser(description="複数 results_* ディレクトリのログから手法別の各種統計（学習/検証）を算出（横断・総合評価対応）")
     # 既定では src/PressurePattern/ 配下の results_v6_iter100/1000/10000 を自動探索（存在するものだけ）
     default_dir = os.path.dirname(os.path.abspath(__file__))
-    default_candidates = [
-        os.path.join(default_dir, "results_v6_iter100"),
-        os.path.join(default_dir, "results_v6_iter1000"),
-        os.path.join(default_dir, "results_v6_iter10000"),
-    ]
-    default_roots = [p for p in default_candidates if os.path.isdir(p)]
-    default_root_single = default_roots[0] if default_roots else os.path.join(default_dir, "results_v6_iter100")
+    default_root_single = os.path.join(default_dir, "results_v7_iter1000_128")
 
-    parser.add_argument(
-        "--roots",
-        type=str,
-        nargs="+",
-        default=default_roots,
-        help=f"探索対象の results ディレクトリを複数指定（空なら既定候補を自動使用）"
-    )
     parser.add_argument(
         "--root",
         type=str,
@@ -1367,8 +1818,8 @@ def main():
     parser.add_argument(
         "--precision",
         type=int,
-        default=3,
-        help="小数点以下の表示桁数 (default: 3)",
+        default=2,
+        help="小数点以下の表示桁数 (default: 2)",
     )
     parser.add_argument(
         "--recommend",
@@ -1381,84 +1832,49 @@ def main():
         default=0,
         help="--recommend 使用時の推奨件数。0 以下で全件表示 (default: 0=all)"
     )
-    parser.add_argument(
-        "--csv-out",
-        type=str,
-        default=None,
-        help="横断ピボット（Verification Basic の平均）の CSV 出力先"
-    )
-    parser.add_argument(
-        "--hide-overall",
-        action="store_true",
-        help="Overall（全ルート統合）表を非表示にする（ルート別のみ表示）"
-    )
     args = parser.parse_args()
+    # 常に固定ファイルへ tee 出力を有効化（どこで実行しても同じパスに保存）
+    setup_global_tee_logging("/Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v7.log")
 
-    # roots 決定（--roots 優先、未指定なら --root を使用、いずれも無ければ既定候補/単一）
-    roots: List[str] = []
-    if args.roots:
-        roots = args.roots
-    elif args.root:
-        roots = [args.root]
+
+    # root 決定（--root 優先、無ければ既定ディレクトリ）
+    if args.root:
+        root = args.root
     else:
-        roots = default_roots if default_roots else [default_root_single]
+        root = default_root_single
 
     # 実在チェック
-    roots = [r for r in roots if os.path.isdir(r)]
-    if not roots:
-        print(f"[ERROR] 指定のディレクトリが存在しません。--roots / --root を確認してください。")
+    if not os.path.isdir(root):
+        print(f"[ERROR] 指定のディレクトリが存在しません: {root}")
         return
 
-    # 収集
-    per_root_eval_counts: Dict[str, int] = {}
-    per_root_ver_counts: Dict[str, int] = {}
-    per_root_aggregates: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for r in roots:
-        eval_paths, ver_paths, agg = collect_logs(r)
-        per_root_eval_counts[r] = len(eval_paths)
-        per_root_ver_counts[r] = len(ver_paths)
-        per_root_aggregates[r] = agg
+    # 収集・集計（単一ルート）
+    eval_paths, ver_paths, aggregate = collect_logs(root)
 
-    # 統合
-    overall_agg = merge_aggregates(list(per_root_aggregates.values()))
-
-    print("==== results 集計（横断） ====")
-    print("探索対象（roots）:")
-    for r in roots:
-        print(f" - {r} (evaluation={per_root_eval_counts[r]} verification={per_root_ver_counts[r]})")
+    print("==== results 集計（単一ルート） ====")
+    print(f"探索対象（root）: {root} (evaluation={len(eval_paths)} verification={len(ver_paths)})")
     print("")
 
     prec = args.precision
     sort_mode = args.sort
 
-    # ルート別の表（例: results_v6_iter100 / 1000 / 10000）
-    for r in roots:
-        ctx = os.path.basename(r)
-        print_all_tables_for_aggregate(per_root_aggregates[r], ctx, sort_mode, prec)
-        if args.recommend:
-            recommend_methods(per_root_aggregates[r], args.topk, prec, context_name=ctx)
-
-    # Overall（全 roots 統合）の表（必要に応じて表示）
-    if not args.hide_overall:
-        print_overall_tables(overall_agg, sort_mode, prec)
-
-    # 追加: 横断ピボット表（Verification Basic の平均）
-    print_cross_root_ver_basic(per_root_aggregates, overall_agg, prec)
-
-    # 推奨手法
+    ctx = os.path.basename(root)
+    print_all_tables_for_aggregate(aggregate, ctx, sort_mode, prec)
     if args.recommend:
-        recommend_methods(overall_agg, args.topk, prec, context_name="Overall", roots_data=per_root_aggregates)
+        recommend_methods(aggregate, args.topk, prec, context_name=ctx)
 
-    # CSV 出力
-    maybe_write_csv(args.csv_out, per_root_aggregates, overall_agg, prec)
+    # NetCDF ラベル分布レポートを自動で最後に追記
+    print("==== ERA5 NetCDF ラベル分布レポート（自動） ====")
+    nc_auto_path = os.path.join(default_dir, "prmsl_era5_all_data_seasonal_large.nc")
+    report_nc_labels(nc_auto_path, "1991-01-01", "2000-12-31")
 
     print("注記:")
-    print(" - 学習(評価ログ)/検証(verification)の Macro Recall は [Summary] の値から算出（Mean/Min/Median/Max）。")
-    print(" - 各表では MinSeed / MaxSeed に、最小/最大値が出た seed を表示（同値が複数ある場合は最初に検出したもの）。")
-    print(" - 6A/6B/6C の Correct/Recall は「各ラベルの再現率（代表ノード群ベース）」の値を使用（学習評価ログ）。")
-    print(" - 横断ピボット表では各 Root（ディレクトリ）ごとの検証 Basic 平均と、Overall の平均/標準偏差/件数を確認できます。")
-    print(" - --recommend で総合スコア（Basic系: VerBasic/TrainBasic の Mean 平均 + Combo系: VerCombo/TrainCombo の Mean 平均 + Typhoon系: TrainTyphoonRecallMean + VerTyphoonRecallMean）による上位手法を出力します。")
-    print(" - 並び順は --sort オプションで制御可能。--precision で表示桁数を調整できます。")
+    print(" - Macro Recall は [Summary] の値から算出（Mean/Std/Min/Median/Max）。")
+    print(" - MinSeed / MaxSeed に最小/最大値が出た seed を表示（同値が複数ある場合は最初のもの）。")
+    print(" - 6A/6B/6C の Correct/Recall は「各ラベルの再現率（代表ノード群ベース）」の値を使用。")
+    print(" - 本スクリプトは単一の results ディレクトリのみ評価し、複数 iter の横断集計は削除済み。")
+    print(" - 実行完了時に ERA5 NetCDF（1991-01-01〜2000-12-31）のラベル分布レポートを末尾に自動追記します。")
+    print(" - すべての出力は /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v7.log にも Tee 保存されます。")
 
 
 if __name__ == "__main__":

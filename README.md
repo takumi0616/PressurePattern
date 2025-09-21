@@ -391,6 +391,9 @@ Task Completed
 
 ```bash
 nohup python search_results_v7.py  --root ./results_v7_iter1000_128 > search_results_v7.log 2>&1 &
+
+  nohup python search_results_v7.py --nc-report --nc-file prmsl_era5_all_data_seasonal_large.nc --nc-start 1991-01-01 --nc-end 2000-12-31 > search_results_v7.log 2>&1 &
+
 ```
 
 主なオプション:
