@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import os
 from typing import Tuple, Optional, List
 
 import torch
@@ -28,11 +29,9 @@ class MiniSom:
           'euclidean'（ユークリッド）
           'ssim5'    （5x5 窓・C=0 の SSIM: 距離は 1-SSIM）
           's1'       （Teweles–Wobus S1）
-          'gssim'    （勾配構造類似：1 - S_GS）
           'kappa'    （κ 曲率距離：0.5 * Σ|κ(X)-κ(W)| / Σmax(|κ(X)|,|κ(W)|)）
           's1k'      （S1 と κ の RMS 合成；S1 と κ を行方向 min–max 正規化後に RMS）
-          'gk'       （G-SSIM と κ の RMS 合成；κ を行方向 min–max 正規化後に RMS）
-          's1gk'     （S1 + G-SSIM + κ の RMS 合成；S1 と κ を行方向 min–max 正規化）
+          'emd'      （EMD：正負分離・部分マッチング。GPU対応Sinkhorn近似（ε→0, 反復増で厳密解に収束））
       - 学習は「ミニバッチ版バッチSOM」：BMU→近傍重み→分子/分母累積→一括更新
       - 全ての重い計算はGPU実行
       - σ（近傍幅）は学習全体で一方向に減衰させる（セグメント学習でも継続）
@@ -87,8 +86,8 @@ class MiniSom:
 
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'gssim', 'kappa', 's1k', 'gk', 's1gk'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","gssim","kappa","s1k","gk","s1gk"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'emd'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","emd"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -307,52 +306,6 @@ class MiniSom:
             out[:, start:end] = 0.5 * (num / (den + eps))
         return out
 
-    @torch.no_grad()
-    def _gssim_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
-        """
-        Gradient-Structure Similarity (G-SSIM) に基づく距離。D = 1 - S_GS
-        S_GS = Σ[w·S_mag·S_dir] / (Σ w + ε),  w = max(|∇X|, |∇W|)
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        eps = 1e-12
-        B, H, W = Xb.shape
-
-        # サンプル側勾配（共通領域）
-        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
-        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
-        gx = dXdx[:, :-1, :]
-        gy = dXdy[:, :, :-1]
-        gmagX = torch.sqrt(gx * gx + gy * gy + eps)  # (B, H-1, W-1)
-
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-
-        dWdx_full = self.weights[:, :, 1:] - self.weights[:, :, :-1]  # (m, H, W-1)
-        dWdy_full = self.weights[:, 1:, :] - self.weights[:, :-1, :]  # (m, H-1, W)
-
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            grx = dWdx_full[start:end, :-1, :]   # (Mc, H-1, W-1)
-            gry = dWdy_full[start:end, :, :-1]   # (Mc, H-1, W-1)
-            gmagW = torch.sqrt(grx * grx + gry * gry + eps)  # (Mc, H-1, W-1)
-
-            gx_b = gx.unsqueeze(1)     # (B,1,H-1,W-1)
-            gy_b = gy.unsqueeze(1)
-            gX_b = gmagX.unsqueeze(1)  # (B,1,H-1,W-1)
-            grx_m = grx.unsqueeze(0)   # (1,Mc,H-1,W-1)
-            gry_m = gry.unsqueeze(0)
-            gW_m = gmagW.unsqueeze(0)  # (1,Mc,H-1,W-1)
-
-            dot = gx_b * grx_m + gy_b * gry_m
-            cos = (dot / (gX_b * gW_m + eps)).clamp(-1.0, 1.0)
-            Sdir = 0.5 * (1.0 + cos)
-            Smag = (2.0 * gX_b * gW_m) / (gX_b * gX_b + gW_m * gW_m + eps)
-            S = Smag * Sdir
-            w = torch.maximum(gX_b, gW_m)
-            sim = (S * w).sum(dim=(2, 3)) / (w.sum(dim=(2, 3)) + eps)  # (B,Mc)
-            out[:, start:end] = 1.0 - sim
-
-        return out
 
     @torch.no_grad()
     def _s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
@@ -400,37 +353,324 @@ class MiniSom:
         dkn = (dk - dk_min) / (dk_max - dk_min + eps)
         return torch.sqrt((d1n * d1n + dkn * dkn) / 2.0)
 
-    @torch.no_grad()
-    def _gk_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        dk = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        eps = 1e-12
-        dk_min = dk.min(dim=1, keepdim=True).values
-        dk_max = dk.max(dim=1, keepdim=True).values
-        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
-        return torch.sqrt((dg * dg + dkn * dkn) / 2.0)
+
 
     @torch.no_grad()
-    def _s1gk_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+    def _emd_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
-        S1GK distance: RMS of row-normalized S1, G-SSIM distance, and row-normalized Kappa curvature distance.
-        Returns (B,m).
+        Earth Mover's Distance d_W±(x,w) のGPU向け近似（エントロピー正則化 Sinkhorn）。
+        速度最適化を追加:
+          - ダウンサンプリング: adaptive_avg_pool2d により (H,W) → (H/α,W/α)（α=self.emd_downscale, 既定2）
+          - AMP: CUDA環境での半精度/混合精度（self.emd_amp, 既定 True）
+          - 早期収束: スケーリングベクトルの平均変化量が self.emd_tol（既定1e-3）未満でbreak
+        正負の質量を分離し、各側で部分マッチング（スラック行/列）を balanced OT として解き、両側の平均を返す。
+        """
+        eps = 1e-12
+        B, H, W = Xb.shape
+        device, dtype = Xb.device, Xb.dtype
+        sqrt2 = math.sqrt(2.0)
+
+        # パラメータ（未設定なら既定値）
+        emd_eps: float = float(getattr(self, "emd_epsilon", 0.03))     # 正則化強度
+        emd_max_iter: int = int(getattr(self, "emd_max_iter", 200))    # 反復上限
+        emd_chunk: int = int(getattr(self, "emd_chunk", 4096))         # cdist チャンク幅
+        emd_downscale: int = int(getattr(self, "emd_downscale", 2))    # 距離専用ダウンサンプル係数(>=1)
+        emd_tol: float = float(getattr(self, "emd_tol", 1e-3))         # 早期収束の閾値
+        emd_amp: bool = bool(getattr(self, "emd_amp", False))           # AMP使用可否（CUDA時のみ有効）
+
+        # ダウンサンプリング（計算規模を縮小）
+        if emd_downscale > 1 and (H >= 4 or W >= 4):
+            h2 = max(16, max(1, H // emd_downscale))
+            w2 = max(16, max(1, W // emd_downscale))
+            Xb = F.adaptive_avg_pool2d(Xb.unsqueeze(1), (h2, w2)).squeeze(1)            # (B,h2,w2)
+            ref = F.adaptive_avg_pool2d(ref.unsqueeze(0).unsqueeze(0), (h2, w2)).squeeze(0).squeeze(0)  # (h2,w2)
+            H, W = int(h2), int(w2)
+
+        # グリッド座標（[0,1]^2）をキャッシュ
+        if not hasattr(self, "_emd_coords_cache"):
+            self._emd_coords_cache = {}
+        key = (int(H), int(W), device)
+        if key not in self._emd_coords_cache:
+            yy = torch.linspace(0.0, 1.0, H, device=device, dtype=self.dtype)
+            xx = torch.linspace(0.0, 1.0, W, device=device, dtype=self.dtype)
+            Y, X = torch.meshgrid(yy, xx, indexing='ij')
+            coords = torch.stack([Y.reshape(-1), X.reshape(-1)], dim=1)  # (N,2)
+            self._emd_coords_cache[key] = coords
+        coords = self._emd_coords_cache[key]  # (N,2)
+        N = coords.shape[0]
+
+        # AMP（混合精度）コンテキスト：CUDA時のみ有効
+        amp_enabled = (device.type == 'cuda') and emd_amp
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
+            # Precompute and cache full distance/kernel matrices to leverage VRAM
+            if not hasattr(self, '_emd_D_cache'):
+                self._emd_D_cache = {}
+            if not hasattr(self, '_emd_K_cache'):
+                self._emd_K_cache = {}
+            if not hasattr(self, '_emd_KD_cache'):
+                self._emd_KD_cache = {}
+
+            # persistent cache dir (e.g., RESULT_DIR/data) - set externally as som.persist_cache_dir
+            persist_dir = getattr(self, 'persist_cache_dir', None)
+            if persist_dir is not None:
+                os.makedirs(persist_dir, exist_ok=True)
+
+            # Load or build D_full on CPU, key by (H,W)
+            dkey = (int(H), int(W), 'cpu')
+            D_full = None
+            if dkey in self._emd_D_cache:
+                D_full = self._emd_D_cache[dkey]
+            else:
+                D_path = None if persist_dir is None else os.path.join(persist_dir, f"D_{H}x{W}.pt")
+                if D_path is not None and os.path.exists(D_path):
+                    D_full = torch.load(D_path, map_location='cpu')
+                else:
+                    # compute deterministically in float32 outside autocast
+                    with torch.amp.autocast('cuda', enabled=False):
+                        D_dev = torch.cdist(coords.to(torch.float32), coords.to(torch.float32), p=2) / sqrt2
+                    D_full = D_dev.detach().cpu()
+                    if D_path is not None:
+                        try:
+                            torch.save(D_full, D_path)
+                        except Exception:
+                            pass
+                self._emd_D_cache[dkey] = D_full
+            # Load or build K_full and KD_full on CPU, key by (H,W,eps)
+            eps_str = str(float(emd_eps)).replace('.', 'p')
+            kkey = (int(H), int(W), 'cpu', eps_str)
+            if kkey in self._emd_K_cache:
+                K_cpu = self._emd_K_cache[kkey]
+                KD_cpu = self._emd_KD_cache[kkey]
+            else:
+                K_path = None if persist_dir is None else os.path.join(persist_dir, f"K_{H}x{W}_eps{eps_str}.pt")
+                KD_path = None if persist_dir is None else os.path.join(persist_dir, f"KD_{H}x{W}_eps{eps_str}.pt")
+                if K_path is not None and KD_path is not None and os.path.exists(K_path) and os.path.exists(KD_path):
+                    K_cpu = torch.load(K_path, map_location='cpu')
+                    KD_cpu = torch.load(KD_path, map_location='cpu')
+                else:
+                    K_cpu = torch.exp(-(D_full / float(emd_eps)))
+                    KD_cpu = K_cpu * D_full
+                    if K_path is not None and KD_path is not None:
+                        try:
+                            torch.save(K_cpu, K_path)
+                            torch.save(KD_cpu, KD_path)
+                        except Exception:
+                            pass
+                self._emd_K_cache[kkey] = K_cpu
+                self._emd_KD_cache[kkey] = KD_cpu
+
+            # move to device/dtype for compute
+            D_full = D_full.to(device=device, dtype=dtype, non_blocking=True)
+            K_full = self._emd_K_cache[kkey].to(device=device, dtype=dtype, non_blocking=True)
+            KD_full = self._emd_KD_cache[kkey].to(device=device, dtype=dtype, non_blocking=True)
+            def _K_dot_v(v_real: Tensor, v_slack: Tensor, eps_reg: float) -> Tensor:
+                # Use precomputed full kernel: K_full @ v + slack
+                res = (K_full @ v_real.to(K_full.dtype)).to(dtype)
+                res = res + v_slack.to(res.dtype)  # cost=0 → K_{i,slack}=1
+                return res
+
+            def _KT_dot_u(u_real: Tensor, u_slack: Tensor, eps_reg: float) -> Tensor:
+                # Use precomputed full kernel: K_full^T @ u + slack
+                res = (K_full.transpose(0, 1) @ u_real.to(K_full.dtype)).to(dtype)
+                res = res + u_slack.to(res.dtype)  # cost=0 → K_{slack,j}=1
+                return res
+
+            def _cost_sum(u_real: Tensor, v_real: Tensor, eps_reg: float) -> Tensor:
+                # Full-matrix form: u^T (K ⊙ D) v
+                s = (u_real.to(KD_full.dtype) @ (KD_full @ v_real.to(KD_full.dtype))).to(dtype)
+                return s
+
+            def _emd_side_sinkhorn(m_src: Tensor, m_dst: Tensor) -> Tensor:
+                # m_src, m_dst: (N,) on device. Returns scalar tensor distance in [0,1]
+                M_src = float(m_src.sum().item()); M_dst = float(m_dst.sum().item())
+                if M_src <= eps and M_dst <= eps:
+                    return torch.zeros((), device=device, dtype=dtype)
+                if (M_src <= eps and M_dst > eps) or (M_src > eps and M_dst <= eps):
+                    return torch.ones((), device=device, dtype=dtype)
+
+                if M_src >= M_dst:
+                    # 目的側にスラック（列）: b = [b_real, b_slack], 合計 = M_src
+                    a_real = m_src.clone()          # (N,)
+                    b_real = m_dst.clone()          # (N,)
+                    b_slack = torch.tensor(M_src - M_dst, device=device, dtype=dtype)
+                    # 初期 u,v
+                    u = torch.ones_like(a_real)
+                    v_real = torch.ones_like(b_real)
+                    v_slack = torch.ones((), device=device, dtype=dtype)
+                    # 反復（早期収束）
+                    for _ in range(emd_max_iter):
+                        u_prev = u
+                        v_prev = v_real
+                        Kv = _K_dot_v(v_real, v_slack, emd_eps) + eps
+                        u = a_real / Kv
+                        KTu_real = _KT_dot_u(u, torch.zeros((), device=device, dtype=dtype), emd_eps) + eps
+                        v_real = b_real / KTu_real
+                        # slack 列: K^T u の slack 成分は Σ_i u_i
+                        KTu_slack = u.sum() + eps
+                        v_slack = b_slack / KTu_slack
+                        # 早期収束チェック
+                        du = (u - u_prev).abs().mean()
+                        dv = (v_real - v_prev).abs().mean()
+                        if float(torch.max(du, dv).item()) < emd_tol:
+                            break
+                    # コスト: 実セル間のみ。分母は M_match = M_dst
+                    cost = _cost_sum(u, v_real, emd_eps)
+                    denom = torch.tensor(M_dst, device=device, dtype=dtype)
+                    res = (cost / (denom + eps)).clamp(0.0, 1.0)
+                    return torch.nan_to_num(res, nan=1.0, posinf=1.0, neginf=0.0)
+                else:
+                    # 供給側にスラック（行）: a = [a_real, a_slack], 合計 = M_dst
+                    a_real = m_src.clone()
+                    a_slack = torch.tensor(M_dst - M_src, device=device, dtype=dtype)
+                    b_real = m_dst.clone()
+                    # 初期 u,v
+                    u_real = torch.ones_like(a_real)
+                    u_slack = torch.ones((), device=device, dtype=dtype)
+                    v = torch.ones_like(b_real)
+                    for _ in range(emd_max_iter):
+                        u_prev = u_real
+                        v_prev = v
+                        # K v for real rows
+                        Kv_real = torch.zeros((N,), device=device, dtype=coords.dtype)
+                        for j0 in range(0, N, emd_chunk):
+                            j1 = min(j0 + emd_chunk, N)
+                            d = torch.cdist(coords, coords[j0:j1], p=2) / sqrt2  # (N, j1-j0)
+                            Kv_real += (torch.exp(-d / emd_eps) @ v[j0:j1].to(d.dtype))
+                        Kv_real = Kv_real.to(dtype)
+                        Kv_slack = v.sum() + eps  # cost=0 → K_{slack,j}=1
+                        u_real = a_real / (Kv_real + eps)
+                        u_slack = a_slack / (Kv_slack)
+                        # K^T u for real cols
+                        KTu_real = torch.zeros((N,), device=device, dtype=coords.dtype)
+                        for i0 in range(0, N, emd_chunk):
+                            i1 = min(i0 + emd_chunk, N)
+                            d = torch.cdist(coords[i0:i1], coords, p=2) / sqrt2  # (i1-i0, N)
+                            K = torch.exp(-d / emd_eps)
+                            KTu_real += (K.transpose(0, 1) @ u_real[i0:i1].to(K.dtype))
+                        KTu_real = (KTu_real.to(dtype) + u_slack)  # slack 行からの寄与
+                        v = b_real / (KTu_real + eps)
+                        # 早期収束チェック
+                        du = (u_real - u_prev).abs().mean()
+                        dv = (v - v_prev).abs().mean()
+                        if float(torch.max(du, dv).item()) < emd_tol:
+                            break
+                    # コスト: 実セル間のみ。分母は M_match = M_src
+                    cost = _cost_sum(u_real, v, emd_eps)
+                    denom = torch.tensor(M_src, device=device, dtype=dtype)
+                    res = (cost / (denom + eps)).clamp(0.0, 1.0)
+                    return torch.nan_to_num(res, nan=1.0, posinf=1.0, neginf=0.0)
+
+            # バッチ処理（各サンプルで正負を分離して平均）- 全列同時SinkhornでGEMM活用
+            Xp = torch.clamp(Xb, min=0.0).reshape(B, -1)       # (B,N)
+            Xn_abs = torch.clamp(-Xb, min=0.0).reshape(B, -1)  # (B,N)
+            Rp = torch.clamp(ref, min=0.0).reshape(-1)         # (N,)
+            Rn_abs = torch.clamp(-ref, min=0.0).reshape(-1)    # (N,)
+
+            def _K_dot_V(V_real: Tensor, v_slack: Tensor) -> Tensor:
+                # V_real: (N,Bc), v_slack: (Bc,) -> (N,Bc)
+                return (K_full @ V_real) + v_slack.unsqueeze(0)
+
+            def _KT_dot_U(U_real: Tensor, u_slack: Tensor) -> Tensor:
+                # U_real: (N,Bc), u_slack: (Bc,) -> (N,Bc)
+                return (K_full.transpose(0, 1) @ U_real) + u_slack.unsqueeze(0)
+
+            def _cost_sum_batch(U_real: Tensor, V_real: Tensor) -> Tensor:
+                # returns (Bc,)
+                return (U_real * (KD_full @ V_real)).sum(dim=0)
+
+            def _emd_side_sinkhorn_batch(A_bN: Tensor, b_real_N: Tensor) -> Tensor:
+                # A_bN: (B,N), b_real_N: (N,)
+                Bc = A_bN.shape[0]
+                out_side = torch.empty((Bc,), device=device, dtype=dtype)
+                if Bc == 0:
+                    return out_side
+                # masses
+                M_src = A_bN.sum(dim=1)           # (B,)
+                M_dst = float(b_real_N.sum().item())
+
+                # cases
+                epsl = torch.tensor(eps, device=device, dtype=dtype)
+                both_zero = (M_src <= epsl) & (M_dst <= eps)
+                only_one_zero = ((M_src <= epsl) & (M_dst > eps)) | ((M_src > epsl) & (M_dst <= eps))
+                maskA = (M_src > epsl) & (M_dst > eps) & (M_src >= M_dst)   # column slack (dest slack)
+                maskB = (M_src > epsl) & (M_dst > eps) & (M_src <  M_dst)   # row slack (source slack)
+
+                out_side[both_zero] = 0.0
+                out_side[only_one_zero] = 1.0
+
+                # common tensors
+                aT = A_bN.transpose(0, 1)         # (N,B)
+
+                # Case A: column slack, solve all columns in a single GEMM loop
+                idxA = torch.nonzero(maskA, as_tuple=False).flatten()
+                if idxA.numel() > 0:
+                    aA = aT[:, idxA]                              # (N,BA)
+                    b_slack = (M_src[idxA] - M_dst)               # (BA,)
+                    # init
+                    U = torch.ones_like(aA)                       # (N,BA)
+                    V = torch.ones((N, idxA.numel()), device=device, dtype=dtype)
+                    v_slack = torch.ones((idxA.numel(),), device=device, dtype=dtype)
+                    bR = b_real_N.view(-1, 1).expand(-1, idxA.numel())  # (N,BA)
+                    for _ in range(emd_max_iter):
+                        U_prev = U
+                        V_prev = V
+                        Kv = _K_dot_V(V, v_slack) + eps
+                        U = aA / Kv
+                        KTu = _KT_dot_U(U, torch.zeros((idxA.numel(),), device=device, dtype=dtype)) + eps
+                        V = bR / KTu
+                        v_slack = b_slack / (U.sum(dim=0) + eps)
+                        # early stop
+                        if torch.max((U - U_prev).abs().mean(), (V - V_prev).abs().mean()) < emd_tol:
+                            break
+                    cost = _cost_sum_batch(U, V)                  # (BA,)
+                    out_side[idxA] = (cost / (M_dst + eps)).clamp(0.0, 1.0)
+
+                # Case B: row slack
+                idxB = torch.nonzero(maskB, as_tuple=False).flatten()
+                if idxB.numel() > 0:
+                    aB = aT[:, idxB]                              # (N,BB)
+                    a_slack = (M_dst - M_src[idxB])               # (BB,)
+                    U = torch.ones_like(aB)                       # (N,BB)
+                    u_slack = torch.ones((idxB.numel(),), device=device, dtype=dtype)
+                    V = torch.ones((N, idxB.numel()), device=device, dtype=dtype)
+                    bR = b_real_N.view(-1, 1).expand(-1, idxB.numel())  # (N,BB)
+                    for _ in range(emd_max_iter):
+                        U_prev = U
+                        V_prev = V
+                        Kv = (K_full @ V) + eps                   # (N,BB)
+                        U = aB / Kv
+                        u_slack = a_slack / (V.sum(dim=0) + eps)
+                        KTu = (K_full.transpose(0, 1) @ U) + u_slack.unsqueeze(0) + eps
+                        V = bR / KTu
+                        if torch.max((U - U_prev).abs().mean(), (V - V_prev).abs().mean()) < emd_tol:
+                            break
+                    cost = _cost_sum_batch(U, V)                  # (BB,)
+                    out_side[idxB] = (cost / (M_src[idxB] + eps)).clamp(0.0, 1.0)
+
+                return out_side
+
+            dp = _emd_side_sinkhorn_batch(Xp, Rp)    # (B,)
+            dn = _emd_side_sinkhorn_batch(Xn_abs, Rn_abs)  # (B,)
+            res = 0.5 * (dp + dn)
+            return torch.nan_to_num(res, nan=1.0, posinf=1.0, neginf=0.0)
+
+    @torch.no_grad()
+    def _emd_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        EMD距離（バッチ vs 全ノード）: (B,m)
+        GPU上のSinkhorn反復（エントロピー正則化OT）で計算するため高コスト（ε, 反復, chunk で調整）。
         """
         if nodes_chunk is None:
             nodes_chunk = self.nodes_chunk
-        eps = 1e-12
-        d1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)     # (B,m)
-        dg = self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m) in [0,1]
-        dk = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)  # (B,m)
-        d1_min = d1.min(dim=1, keepdim=True).values
-        d1_max = d1.max(dim=1, keepdim=True).values
-        dk_min = dk.min(dim=1, keepdim=True).values
-        dk_max = dk.max(dim=1, keepdim=True).values
-        d1n = (d1 - d1_min) / (d1_max - d1_min + eps)
-        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
-        return torch.sqrt((d1n * d1n + dg * dg + dkn * dkn) / 3.0)
+        B = Xb.shape[0]
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            for k in range(start, end):
+                ref = self.weights[k]
+                out[:, k] = self._emd_to_ref(Xb, ref)
+        return torch.nan_to_num(out, nan=1.0, posinf=1.0, neginf=0.0)
 
     @torch.no_grad()
     def _distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
@@ -440,16 +680,12 @@ class MiniSom:
             return self._euclidean_distance_batch(Xb)
         elif self.activation_distance == 'ssim5':
             return self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'gssim':
-            return self._gssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'kappa':
             return self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 's1k':
             return self._s1k_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'gk':
-            return self._gk_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 's1gk':
-            return self._s1gk_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'emd':
+            return self._emd_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -512,33 +748,6 @@ class MiniSom:
         s1 = 100.0 * (num_dx + num_dy) / (den_dx + den_dy + 1e-12)
         return s1
 
-    @torch.no_grad()
-    def _gssim_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
-        """
-        gssim の対参照距離： D = 1 - S_GS （勾配強度・方向の重み付き類似度）
-        """
-        eps = 1e-12
-        B, H, W = Xb.shape
-        dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
-        dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
-        gx = dXdx[:, :-1, :]
-        gy = dXdy[:, :, :-1]
-        gmagX = torch.sqrt(gx * gx + gy * gy + eps)     # (B, H-1, W-1)
-
-        dRdx = ref[:, 1:] - ref[:, :-1]
-        dRdy = ref[1:, :] - ref[:-1, :]
-        grx = dRdx[:-1, :]
-        gry = dRdy[:, :-1]
-        gmagR = torch.sqrt(grx * grx + gry * gry + eps) # (H-1, W-1)
-
-        dot = gx * grx.unsqueeze(0) + gy * gry.unsqueeze(0)                     # (B,.,.)
-        cos = (dot / (gmagX * gmagR.unsqueeze(0) + eps)).clamp(-1.0, 1.0)
-        Sdir = 0.5 * (1.0 + cos)
-        Smag = (2.0 * gmagX * gmagR.unsqueeze(0)) / (gmagX * gmagX + gmagR.unsqueeze(0) * gmagR.unsqueeze(0) + eps)
-        S = Smag * Sdir
-        w = torch.maximum(gmagX, gmagR.unsqueeze(0))
-        sim = (S * w).flatten(1).sum(dim=1) / (w.flatten(1).sum(dim=1) + eps)   # (B,)
-        return 1.0 - sim
 
     @torch.no_grad()
     def _kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -565,32 +774,7 @@ class MiniSom:
         dkn = (dk - dk_min) / (dk_max - dk_min + eps)
         return torch.sqrt((d1n * d1n + dkn * dkn) / 2.0)
 
-    @torch.no_grad()
-    def _gk_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
-        eps = 1e-12
-        dg = self._gssim_to_ref(Xb, ref)
-        dk = self._kappa_to_ref(Xb, ref)
-        dk_min, _ = dk.min(dim=0, keepdim=True)
-        dk_max, _ = dk.max(dim=0, keepdim=True)
-        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
-        return torch.sqrt((dg * dg + dkn * dkn) / 2.0)
 
-    @torch.no_grad()
-    def _s1gk_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
-        """
-        S1GK (to ref): RMS of row-normalized S1, G-SSIM distance, and row-normalized Kappa curvature distance.
-        """
-        eps = 1e-12
-        d1 = self._s1_to_ref(Xb, ref)        # (B,)
-        dg = self._gssim_to_ref(Xb, ref)     # (B,)
-        dk = self._kappa_to_ref(Xb, ref)     # (B,)
-        d1_min, _ = d1.min(dim=0, keepdim=True)
-        d1_max, _ = d1.max(dim=0, keepdim=True)
-        dk_min, _ = dk.min(dim=0, keepdim=True)
-        dk_max, _ = dk.max(dim=0, keepdim=True)
-        d1n = (d1 - d1_min) / (d1_max - d1_min + eps)
-        dkn = (dk - dk_min) / (dk_max - dk_min + eps)
-        return torch.sqrt((d1n * d1n + dg * dg + dkn * dkn) / 3.0)
 
     @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -603,16 +787,12 @@ class MiniSom:
             return self._ssim5_to_ref(Xb, ref)
         elif self.activation_distance == 's1':
             return self._s1_to_ref(Xb, ref)
-        elif self.activation_distance == 'gssim':
-            return self._gssim_to_ref(Xb, ref)
         elif self.activation_distance == 'kappa':
             return self._kappa_to_ref(Xb, ref)
         elif self.activation_distance == 's1k':
             return self._s1k_to_ref(Xb, ref)
-        elif self.activation_distance == 'gk':
-            return self._gk_to_ref(Xb, ref)
-        elif self.activation_distance == 's1gk':
-            return self._s1gk_to_ref(Xb, ref)
+        elif self.activation_distance == 'emd':
+            return self._emd_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
