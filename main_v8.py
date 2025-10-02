@@ -39,10 +39,10 @@ SEED = 1
 # SOM学習・推論（全期間版：3方式）
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 5
-BATCH_SIZE = 1024
-NODES_CHUNK = 1024 # VRAM16GB:2, VRAM24GB:4
-LOG_INTERVAL = 1
-SOM_EVAL_SEGMENTS = 1  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+BATCH_SIZE = 128
+NODES_CHUNK = 32 # VRAM16GB:2, VRAM24GB:4
+LOG_INTERVAL = 10
+SOM_EVAL_SEGMENTS = 5  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
 
@@ -1331,12 +1331,12 @@ def _emd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     sqrt2 = math.sqrt(2.0)
 
     # チューニング（必要なら上流から渡す設計にもできる）
-    emd_eps: float = 0.03
+    emd_eps: float = 0.05
     emd_max_iter: int = 200
     emd_chunk: int = 4096
-    emd_downscale: int = 2
-    emd_tol: float = 5e-3
-    emd_amp: bool = False
+    emd_downscale: int = 3
+    emd_tol: float = 1e-2
+    emd_amp: bool = True
 
     # ダウンサンプリング
     if emd_downscale > 1 and (H >= 4 or W >= 4):
@@ -2260,9 +2260,10 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
     som.random_weights_init(data_all)
     # EMD 数値安定化のためのパラメータ設定（minisom 側で getattr 参照）
     try:
-        som.emd_epsilon = 0.03
-        som.emd_tol = 5e-3
-        som.emd_amp = False
+        som.emd_epsilon = 0.05
+        som.emd_tol = 1e-2
+        som.emd_amp = True
+        som.emd_downscale = 3
     except Exception:
         pass
     # 永続キャッシュディレクトリ（RESULT_DIR/data）をMiniSomに渡す
