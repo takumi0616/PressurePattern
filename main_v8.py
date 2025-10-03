@@ -40,7 +40,7 @@ SEED = 1
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 1000
 BATCH_SIZE = 128
-NODES_CHUNK = 64 # VRAM16GB:2, VRAM24GB:4
+NODES_CHUNK = 128 # VRAM16GB:2, VRAM24GB:4
 LOG_INTERVAL = 10
 SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
@@ -1334,7 +1334,7 @@ def _emd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     emd_eps: float = 0.05
     emd_max_iter: int = 200
     emd_chunk: int = 4096
-    emd_downscale: int = 3
+    emd_downscale: int = 1
     emd_tol: float = 1e-2
     emd_amp: bool = True
 
