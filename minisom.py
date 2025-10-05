@@ -363,6 +363,7 @@ class MiniSom:
           - ダウンサンプリング: adaptive_avg_pool2d により (H,W) → (H/α,W/α)（α=self.emd_downscale, 既定2）
           - AMP: CUDA環境での半精度/混合精度（self.emd_amp, 既定 True）
           - 早期収束: スケーリングベクトルの平均変化量が self.emd_tol（既定1e-3）未満でbreak
+          - スパース化: 遠距離ピクセル間の輸送を制限（max_distance_ratio で制御）
         正負の質量を分離し、各側で部分マッチング（スラック行/列）を balanced OT として解き、両側の平均を返す。
         """
         eps = 1e-12
@@ -376,7 +377,8 @@ class MiniSom:
         emd_chunk: int = int(getattr(self, "emd_chunk", 4096))         # cdist チャンク幅
         emd_downscale: int = int(getattr(self, "emd_downscale", 2))    # 距離専用ダウンサンプル係数(>=1)
         emd_tol: float = float(getattr(self, "emd_tol", 1e-3))         # 早期収束の閾値
-        emd_amp: bool = bool(getattr(self, "emd_amp", False))           # AMP使用可否（CUDA時のみ有効）
+        emd_amp: bool = bool(getattr(self, "emd_amp", False))          # AMP使用可否（CUDA時のみ有効）
+        emd_max_dist_ratio: float = float(getattr(self, "emd_max_distance_ratio", 1.0))  # スパース化：対角線の何%以内のみ輸送許可（1.0=制限なし）
 
         # ダウンサンプリング（計算規模を縮小）
         if emd_downscale > 1 and (H >= 4 or W >= 4):
@@ -435,21 +437,32 @@ class MiniSom:
                         except Exception:
                             pass
                 self._emd_D_cache[dkey] = D_full
-            # Load or build K_full and KD_full on CPU, key by (H,W,eps)
+            
+            # スパース化：遠距離ピクセル間の輸送を制限
+            if emd_max_dist_ratio < 1.0:
+                max_allowed_dist = emd_max_dist_ratio * 1.0  # 正規化座標での対角線は√2だが、D_fullは既に/sqrt2済みなので上限1.0
+                D_sparse_mask = (D_full <= max_allowed_dist)
+                # スパース化した距離行列（遠方は非常に大きな値に設定してK≈0にする）
+                D_full_sparse = torch.where(D_sparse_mask, D_full, torch.tensor(1e6, dtype=D_full.dtype))
+            else:
+                D_full_sparse = D_full
+            
+            # Load or build K_full and KD_full on CPU, key by (H,W,eps,max_dist_ratio)
             eps_str = str(float(emd_eps)).replace('.', 'p')
-            kkey = (int(H), int(W), 'cpu', eps_str)
+            ratio_str = str(float(emd_max_dist_ratio)).replace('.', 'p')
+            kkey = (int(H), int(W), 'cpu', eps_str, ratio_str)
             if kkey in self._emd_K_cache:
                 K_cpu = self._emd_K_cache[kkey]
                 KD_cpu = self._emd_KD_cache[kkey]
             else:
-                K_path = None if persist_dir is None else os.path.join(persist_dir, f"K_{H}x{W}_eps{eps_str}.pt")
-                KD_path = None if persist_dir is None else os.path.join(persist_dir, f"KD_{H}x{W}_eps{eps_str}.pt")
+                K_path = None if persist_dir is None else os.path.join(persist_dir, f"K_{H}x{W}_eps{eps_str}_dist{ratio_str}.pt")
+                KD_path = None if persist_dir is None else os.path.join(persist_dir, f"KD_{H}x{W}_eps{eps_str}_dist{ratio_str}.pt")
                 if K_path is not None and KD_path is not None and os.path.exists(K_path) and os.path.exists(KD_path):
                     K_cpu = torch.load(K_path, map_location='cpu')
                     KD_cpu = torch.load(KD_path, map_location='cpu')
                 else:
-                    K_cpu = torch.exp(-(D_full / float(emd_eps)))
-                    KD_cpu = K_cpu * D_full
+                    K_cpu = torch.exp(-(D_full_sparse / float(emd_eps)))
+                    KD_cpu = K_cpu * D_full  # コストは元の距離を使用
                     if K_path is not None and KD_path is not None:
                         try:
                             torch.save(K_cpu, K_path)

@@ -2258,12 +2258,18 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         area_weight=area_w_map
     )
     som.random_weights_init(data_all)
-    # EMD 数値安定化のためのパラメータ設定（minisom 側で getattr 参照）
+    # EMD 最適化パラメータ（スパースEMD対応）
+    # データ解像度: 161x161, 範囲: 40度x40度 (北緯15-55度, 東経115-155度)
+    # ダウンサンプリングなし: 元解像度161x161をそのまま使用
+    # 輸送距離制限: 対角線の30% = 正規化座標で0.3 ≈ グリッド68セル ≈ 1200km
+    # → 気圧配置の特徴的スケール（数百km〜1000km）に対応
     try:
-        som.emd_epsilon = 0.05
-        som.emd_tol = 1e-2
-        som.emd_amp = True
-        som.emd_downscale = 3
+        som.emd_epsilon = 0.05              # エントロピー正則化強度
+        som.emd_max_distance_ratio = 0.3   # スパース化：対角線の30%以内のみ輸送許可（0.25-0.35推奨）
+        som.emd_downscale = 1               # ダウンサンプリング無効（元解像度161x161を使用）
+        som.emd_tol = 1e-2                  # 早期収束閾値
+        som.emd_max_iter = 200              # 最大反復回数
+        som.emd_amp = True                  # 混合精度演算（CUDA時）
     except Exception:
         pass
     # 永続キャッシュディレクトリ（RESULT_DIR/data）をMiniSomに渡す
