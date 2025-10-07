@@ -26,7 +26,7 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
 # 3type版 SOM（Euclidean/SSIM/S1対応, batchSOM）
-from minisom import MiniSom as MultiDistMiniSom
+from PressurePattern.minisom_v8 import MiniSom as MultiDistMiniSom
 
 # Persistent cache dir for EMD core matrices; set in main() as RESULT_DIR/data
 EMD_PERSIST_DIR: Optional[str] = None
