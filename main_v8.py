@@ -1375,6 +1375,159 @@ def _spot_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     Dn = _emd_side(An, Wn)
     return 0.5 * (Dp + Dn)
 
+def _cl_gaussian_kernel1d(sigma: float, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    if sigma <= 0:
+        k = torch.tensor([1.0], device=device, dtype=dtype)
+        return k / k.sum()
+    r = max(1, int(math.ceil(3.0 * float(sigma))))
+    xs = torch.arange(-r, r + 1, device=device, dtype=dtype)
+    k = torch.exp(-(xs * xs) / (2.0 * (sigma ** 2)))
+    return k / (k.sum() + 1e-12)
+
+def _cl_gaussian_blur2d(Z: torch.Tensor, sigma: float) -> torch.Tensor:
+    # Z: (B,H,W) or (H,W). Accept both; internally handle batch if needed.
+    if Z.dim() == 2:
+        Z = Z.unsqueeze(0)
+    B, H, W = Z.shape
+    device, dtype = Z.device, Z.dtype
+    k1 = _cl_gaussian_kernel1d(sigma, dtype, device)
+    k1c = k1.view(1, 1, 1, -1)
+    k1r = k1.view(1, 1, -1, 1)
+    X = Z.unsqueeze(1)  # (B,1,H,W)
+    pad_h = (k1.shape[0] // 2)
+    Xh = F.pad(X, (pad_h, pad_h, 0, 0), mode='reflect')
+    Xh = F.conv2d(Xh, k1c)
+    pad_v = (k1.shape[0] // 2)
+    Xv = F.pad(Xh, (0, 0, pad_v, pad_v), mode='reflect')
+    Xs = F.conv2d(Xv, k1r)
+    return Xs.squeeze(1)  # (B,H,W)
+
+def _cl_unique_extrema_mask(S: torch.Tensor, k: int, mode: str) -> torch.Tensor:
+    """
+    S: (H,W), k odd window, mode: 'min'|'max'
+    Strict unique local minima/maxima via pooling and uniqueness check; exclude r-border.
+    """
+    assert k >= 1 and (k % 2 == 1)
+    r = k // 2
+    H, W = S.shape
+    Z1 = S.view(1, 1, H, W)
+    if mode == 'min':
+        pooled = -F.max_pool2d(-Z1, kernel_size=k, stride=1, padding=r)
+        eq = (Z1 == pooled)
+    else:
+        pooled = F.max_pool2d(Z1, kernel_size=k, stride=1, padding=r)
+        eq = (Z1 == pooled)
+    cnt = F.avg_pool2d(eq.float(), kernel_size=k, stride=1, padding=r) * float(k * k)
+    unique = (eq & (cnt == 1.0)).squeeze(0).squeeze(0)
+    if H > 2 * r and W > 2 * r:
+        unique[:r, :] = False
+        unique[-r:, :] = False
+        unique[:, :r] = False
+        unique[:, -r:] = False
+    else:
+        unique[:, :] = False
+    return unique
+
+def _cl_extract_features_single_main(Z: torch.Tensor, radius: int, sigma: float, topk: int) -> Tuple[torch.Tensor, ...]:
+    """
+    Z: (H,W) anomaly [hPa] with per-sample spatial-mean removed.
+    Returns:
+      (lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang)
+      positions normalized to [0,1], vlen in [0,sqrt(2)], vang in [-pi,pi].
+    """
+    eps = torch.tensor(1e-12, device=Z.device, dtype=Z.dtype)
+    H, W = Z.shape
+    # Smooth (Gaussian, separable)
+    S = _cl_gaussian_blur2d(Z, sigma).squeeze(0)
+    k = 2 * int(radius) + 1
+    if k % 2 == 0:
+        k += 1
+    # strict minima/maxima masks
+    min_mask = _cl_unique_extrema_mask(S, k=k, mode='min')
+    max_mask = _cl_unique_extrema_mask(S, k=k, mode='max')
+    # strength maps from anomaly (mean-removed)
+    lows_val = (-Z).clamp(min=0.0)
+    highs_val = (Z).clamp(min=0.0)
+
+    def _centroid(mask: torch.Tensor, wmap: torch.Tensor, K: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+        if ys.numel() == 0:
+            return (torch.tensor(0.5, device=Z.device, dtype=Z.dtype),
+                    torch.tensor(0.5, device=Z.device, dtype=Z.dtype),
+                    torch.tensor(0.0, device=Z.device, dtype=Z.dtype))
+        ws = wmap[ys, xs]
+        if ws.numel() == 0 or float(ws.sum().item()) <= 0.0:
+            idx = torch.argmin(S) if wmap.data_ptr() == lows_val.data_ptr() else torch.argmax(S)
+            y = (idx // W).to(torch.long); x = (idx % W).to(torch.long)
+            cx = x.to(Z.dtype) / max(1.0, (W - 1)); cy = y.to(Z.dtype) / max(1.0, (H - 1))
+            return cx, cy, torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
+        K_eff = int(min(K, ws.numel()))
+        vals, order = torch.topk(ws, k=K_eff, largest=True, sorted=False)
+        xs_sel = xs[order]; ys_sel = ys[order]; w = vals; wsum = w.sum()
+        cx = ((xs_sel.to(Z.dtype) / max(1.0, (W - 1))) * w).sum() / (wsum + eps)
+        cy = ((ys_sel.to(Z.dtype) / max(1.0, (H - 1))) * w).sum() / (wsum + eps)
+        return cx, cy, wsum
+
+    lcx, lcy, lsum = _centroid(min_mask, lows_val, topk)
+    hcx, hcy, hsum = _centroid(max_mask, highs_val, topk)
+    vx = hcx - lcx; vy = hcy - lcy
+    vlen = torch.sqrt(vx * vx + vy * vy + eps)
+    vang = torch.atan2(vy, vx)
+    return lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang
+
+def _cl_pairwise_distance_main(feat_b: Tuple[torch.Tensor, ...],
+                               feat_r: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """
+    Batch features (B,8) vs ref features (8,) -> (B,) in [0,1]
+    """
+    eps = 1e-12
+    (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b) = feat_b
+    (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r) = feat_r
+
+    d_l_pos = torch.sqrt((lcx_b - lcx_r) ** 2 + (lcy_b - lcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
+    d_h_pos = torch.sqrt((hcx_b - hcx_r) ** 2 + (hcy_b - hcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
+
+    denom_l = torch.clamp(torch.maximum(lsum_b, lsum_r), min=eps)
+    denom_h = torch.clamp(torch.maximum(hsum_b, hsum_r), min=eps)
+    d_l_str = torch.where((lsum_b <= eps) & (lsum_r <= eps), torch.zeros_like(lsum_b), torch.abs(lsum_b - lsum_r) / denom_l)
+    d_h_str = torch.where((hsum_b <= eps) & (hsum_r <= eps), torch.zeros_like(hsum_b), torch.abs(hsum_b - hsum_r) / denom_h)
+
+    def _angle_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        d = torch.abs(a - b)
+        d = torch.remainder(d, 2.0 * math.pi)
+        d = torch.where(d > math.pi, 2.0 * math.pi - d, d)
+        return d / math.pi
+
+    d_ang = _angle_diff(vang_b, vang_r)
+    d_ang = torch.where((vlen_b <= 1e-6) | (vlen_r <= 1e-6), torch.zeros_like(d_ang), d_ang)
+    d_mag = torch.abs(vlen_b - vlen_r) / math.sqrt(2.0)
+    D = torch.sqrt((d_l_pos * d_l_pos + d_h_pos * d_h_pos + d_l_str * d_l_str + d_h_str * d_h_str + d_ang * d_ang + d_mag * d_mag) / 6.0 + 1e-12)
+    return D.clamp(0.0, 1.0)
+
+def _cl_to_ref(Xb: torch.Tensor, ref: torch.Tensor, radius: int = 6, sigma: float = 2.0, topk: int = 5) -> torch.Tensor:
+    """
+    CL distance (user method) vs single reference, on anomaly fields (mean removed) in [hPa].
+    Xb: (B,H,W), ref: (H,W) -> (B,) in [0,1]
+    """
+    B, H, W = Xb.shape
+    # ref features
+    lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r = _cl_extract_features_single_main(ref, radius, sigma, topk)
+    # batch features
+    lcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    lcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    lsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    hcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    hcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    hsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    vlen_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    vang_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+    for i in range(B):
+        lcx_b[i], lcy_b[i], lsum_b[i], hcx_b[i], hcy_b[i], hsum_b[i], vlen_b[i], vang_b[i] = \
+            _cl_extract_features_single_main(Xb[i], radius, sigma, topk)
+    feat_b = (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b)
+    feat_r = (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r)
+    return _cl_pairwise_distance_main(feat_b, feat_r)
+
 def _gvd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
     GVD to ref: second-derivative invariants distance averaged over inner grid.
@@ -1920,29 +2073,8 @@ def compute_node_true_medoids(
             elif method_name == 'spot':
                 # SPOT: sliced Wasserstein-1 (正負平均)
                 D = pairwise_by_ref(lambda Xb, ref: _spot_to_ref(Xb, ref), Xcand)
-            elif method_name == 'emd':
-                # EMD: single-GPU incremental prune（部分和が現ベストを超えたら早期打ち切り）
-                C = Xcand.shape[0]
-                best_cost = torch.tensor(float('inf'), device=Xcand.device, dtype=Xcand.dtype)
-                best_idx = 0
-                emd_pair_chunk = 128  # j側のチャンク幅
-                for i in range(C):
-                    ref = Xcand[i]
-                    cost_i = torch.tensor(0.0, device=Xcand.device, dtype=Xcand.dtype)
-                    for j0 in range(0, C, emd_pair_chunk):
-                        j1 = min(j0 + emd_pair_chunk, C)
-                        dchunk = _emd_to_ref(Xcand[j0:j1], ref)  # (j1-j0,)
-                        cost_i = cost_i + dchunk.sum()
-                        if cost_i >= best_cost:
-                            cost_i = torch.tensor(float('inf'), device=Xcand.device, dtype=Xcand.dtype)
-                            break
-                    if cost_i < best_cost:
-                        best_cost = cost_i
-                        best_idx = i
-                imin = int(best_idx)
-                node_to_medoid_idx[(ix, iy)] = int(idxs[imin])
-                node_to_medoid_avgdist[(ix, iy)] = float((best_cost / C).item())
-                continue
+            elif method_name == 'cl':
+                D = pairwise_by_ref(lambda Xb, ref: _cl_to_ref(Xb, ref), Xcand)
             elif method_name == 'gvd':
                 # GVD: 二階微分不変量
                 D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
@@ -2496,18 +2628,11 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         area_weight=area_w_map
     )
     som.random_weights_init(data_all)
-    # EMD 最適化パラメータ（スパースEMD対応）
-    # データ解像度: 161x161, 範囲: 40度x40度 (北緯15-55度, 東経115-155度)
-    # ダウンサンプリングなし: 元解像度161x161をそのまま使用
-    # 輸送距離制限: 対角線の30% = 正規化座標で0.3 ≈ グリッド68セル ≈ 1200km
-    # → 気圧配置の特徴的スケール（数百km〜1000km）に対応
+    # CL距離の既定パラメータ（ユーザ法相当）
     try:
-        som.emd_epsilon = 0.05              # エントロピー正則化強度
-        som.emd_max_distance_ratio = 0.3   # スパース化：対角線の30%以内のみ輸送許可（0.25-0.35推奨）
-        som.emd_downscale = 1               # ダウンサンプリング無効（元解像度161x161を使用）
-        som.emd_tol = 1e-2                  # 早期収束閾値
-        som.emd_max_iter = 200              # 最大反復回数
-        som.emd_amp = True                  # 混合精度演算（CUDA時）
+        som.cl_radius = 6
+        som.cl_sigma = 2.0
+        som.cl_topk = 5
     except Exception:
         pass
     # 永続キャッシュディレクトリ（RESULT_DIR/data）をMiniSomに渡す
@@ -3050,7 +3175,7 @@ def main():
         # ('s1',        's1'),
         # ('kappa',     'kappa'),
         # ('s1k',       's1k'),
-        ('emd',       'emd'),
+        ('cl',       'cl'),
     ]
     for mname, adist in methods:
         # 学習

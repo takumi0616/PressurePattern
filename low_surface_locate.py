@@ -59,7 +59,7 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 
-from scipy.ndimage import gaussian_filter, minimum_filter
+from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
 from shapely.geometry import Point
 from PIL import Image
 from tqdm import tqdm
@@ -332,6 +332,57 @@ def draw_msl_panel(ax,
     return cf
 
 
+def draw_msl_panel_dual(ax,
+                        lon: np.ndarray,
+                        lat: np.ndarray,
+                        msl_hpa_2d: np.ndarray,
+                        lows_mask: Optional[np.ndarray],
+                        highs_mask: Optional[np.ndarray],
+                        panel_title: str,
+                        add_colorbar: bool = False):
+    """
+    ユーザ法（CLパラメータ準拠）で検出した低気圧(青×)・高気圧(赤×)を同一パネルに可視化
+    """
+    proj = ccrs.PlateCarree()
+    ax.set_extent([LON_W, LON_E, LAT_S, LAT_N], crs=proj)
+    ax.coastlines(resolution="10m", color="gray")
+    ax.add_feature(cfeature.BORDERS, linestyle=":", edgecolor="gray", alpha=0.7)
+    ax.add_feature(cfeature.LAKES, alpha=0.4)
+    ax.add_feature(cfeature.RIVERS, alpha=0.5)
+
+    cf = None
+    try:
+        anom = msl_hpa_2d - np.nanmean(msl_hpa_2d)
+        cf = ax.contourf(lon, lat, anom, levels=ANOM_LEVELS, cmap=ANOM_CMAP,
+                         extend="both", alpha=ANOM_ALPHA, transform=proj)
+        if add_colorbar and cf is not None:
+            fig = ax.get_figure()
+            cb = fig.colorbar(cf, orientation="horizontal", aspect=65, shrink=0.75, pad=0.05, extendrect=True)
+            cb.set_label("MSLP anomaly (hPa)", size="large")
+    except Exception:
+        pass
+
+    try:
+        cs = ax.contour(lon, lat, msl_hpa_2d, levels=MSLP_LEVELS, colors="black", linewidths=0.8, transform=proj)
+        ax.clabel(cs, fmt="%4.0f", fontsize=8)
+    except Exception:
+        pass
+
+    # 低(青×)
+    if lows_mask is not None and lows_mask.shape == msl_hpa_2d.shape:
+        ys, xs = np.where(lows_mask)
+        if len(xs) > 0:
+            ax.plot(lon[xs], lat[ys], "bx", markersize=8, transform=proj)
+    # 高(赤×)
+    if highs_mask is not None and highs_mask.shape == msl_hpa_2d.shape:
+        ys, xs = np.where(highs_mask)
+        if len(xs) > 0:
+            ax.plot(lon[xs], lat[ys], "rx", markersize=8, transform=proj)
+
+    ax.set_title(panel_title, fontsize=12)
+    return cf
+
+
 # =========================
 # 低気圧中心検出（2実装）
 # =========================
@@ -361,6 +412,32 @@ def detect_centers_user(slp_hpa_2d: np.ndarray, radius: int = USER_RADIUS, sigma
         local_min[:, -1] = False
 
     return local_min
+
+
+def detect_centers_user_high(slp_hpa_2d: np.ndarray, radius: int = USER_RADIUS, sigma: float = USER_SIGMA) -> np.ndarray:
+    """
+    ユーザ実装（高気圧版）: ガウシアン平滑 → 厳密局所最大（中心除外）→ 外周1セル除外
+    戻り値: bool mask (True=高気圧中心)
+    """
+    data = slp_hpa_2d.astype(np.float32)
+    data_filled = np.where(np.isnan(data), -np.inf, data)
+    smoothed = gaussian_filter(data_filled, sigma=sigma)
+
+    # footprint: (2r+1)^2 の正方形で中心セルは False
+    footprint = np.ones((2 * radius + 1, 2 * radius + 1), dtype=bool)
+    footprint[radius, radius] = False
+
+    neigh_max = maximum_filter(smoothed, footprint=footprint, mode="constant", cval=-np.inf)
+    local_max = smoothed > neigh_max
+
+    # 外周 1 セルは除外
+    if local_max.shape[0] > 2 and local_max.shape[1] > 2:
+        local_max[0, :] = False
+        local_max[-1, :] = False
+        local_max[:, 0] = False
+        local_max[:, -1] = False
+
+    return local_max
 
 
 def detect_centers_storm(slp_hpa_2d: np.ndarray, nsize: int = STORM_NSIZE) -> np.ndarray:
@@ -654,8 +731,12 @@ def main():
     parser.add_argument("--user-radius", type=int, default=USER_RADIUS, help="ユーザ法: 近傍半径 r")
     parser.add_argument("--user-sigma", type=float, default=USER_SIGMA, help="ユーザ法: ガウシアン σ")
     parser.add_argument("--storm-nsize", type=int, default=STORM_NSIZE, help="storm 法: minimum_filter のサイズ")
-    parser.add_argument("--start-year", type=int, default=None, help="処理開始年（例: 1940）")
-    parser.add_argument("--end-year", type=int, default=None, help="処理終了年（例: 2024、指定時はその年まで含む）")
+    # CL（ユーザ法）ハイパーパラメータ（SOM側と整合する名称で上書き可）
+    parser.add_argument("--cl-radius", type=int, default=None, help="CL/user法: 近傍半径 r の上書き（未指定で --user-radius を使用）")
+    parser.add_argument("--cl-sigma", type=float, default=None, help="CL/user法: ガウシアン σ の上書き（未指定で --user-sigma を使用）")
+    parser.add_argument("--cl-topk", type=int, default=5, help="CL距離で使用するTop-K（可視化では未使用）")
+    parser.add_argument("--start-year", type=int, default=1991, help="処理開始年（デフォルト: 1991）")
+    parser.add_argument("--end-year", type=int, default=2000, help="処理終了年（デフォルト: 2000、指定時はその年まで含む）")
     parser.add_argument("--years", type=int, nargs="+", default=None, help="処理対象の年（複数指定可, 例: --years 1980 1981 1990）")
     parser.add_argument("--limit", type=int, default=None, help="最大時刻数（None で全時刻）")
     parser.add_argument("--skip", type=int, default=1, help="時間の間引き（例: 24 → 1日毎に）")
@@ -702,13 +783,26 @@ def main():
     # =============
     # 低圧中心検出（ユーザ法 vs storm法）を並列表示で保存
     # =============
+    # 統計カウンタ（ユーザ法: 低/高の検出数を各時刻でカウント）
+    det_stats = {"times": [], "low_counts": [], "high_counts": []}
     for ti in tqdm(sel_idx, desc="Plot (user vs storm)", unit="t"):
         slp_pa = ds["msl"].isel(valid_time=ti).values
         slp_hpa = to_hpa(slp_pa)
         slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
 
-        # 両手法でマスク計算
-        mask_user = detect_centers_user(slp_sub, radius=args.user_radius, sigma=args.user_sigma)
+        # CLパラメータ（ユーザ法）適用（上書きがあれば優先）
+        used_r = args.cl_radius if args.cl_radius is not None else args.user_radius
+        used_s = args.cl_sigma if args.cl_sigma is not None else args.user_sigma
+        # ユーザ法: 低/高の両方を検出
+        mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
+        mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+        # 統計: 各時刻の検出数を記録
+        low_n = int(np.count_nonzero(mask_user_low))
+        high_n = int(np.count_nonzero(mask_user_high))
+        det_stats["times"].append(pd.to_datetime(times[ti]))
+        det_stats["low_counts"].append(low_n)
+        det_stats["high_counts"].append(high_n)
+        # storm 法（従来通り: 低のみ）
         mask_storm = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
 
         tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
@@ -719,10 +813,10 @@ def main():
         ax1 = plt.subplot(1, 2, 1, projection=proj)
         ax2 = plt.subplot(1, 2, 2, projection=proj)
 
-        title1 = f"[User] MSLP (hPa) centers {tstr} (R={args.user_radius}, sigma={args.user_sigma})"
-        title2 = f"[Storm] MSLP (hPa) centers {tstr} (nsize={args.storm_nsize})"
+        title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
+        title2 = f"[Storm] Minima centers {tstr} (nsize={args.storm_nsize})"
 
-        cf1 = draw_msl_panel(ax1, lon_sub, lat_sub, slp_sub, mask_user, title1, add_colorbar=False)
+        cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
         _cf2 = draw_msl_panel(ax2, lon_sub, lat_sub, slp_sub, mask_storm, title2, add_colorbar=False)
 
         # 共有カラーバー（下部）
@@ -737,6 +831,60 @@ def main():
         out_png = out_dirs["compare"] / f"compare_{tstr}.png"
         fig.savefig(out_png, dpi=180, bbox_inches="tight")
         plt.close(fig)
+
+    # =============
+    # ユーザ法 検出統計（1991-01-01〜2000-12-31の要件に適合する既定範囲で集計）
+    # =============
+    try:
+        total_steps = len(det_stats["times"])
+        larr = np.array(det_stats["low_counts"], dtype=int) if total_steps > 0 else np.array([], dtype=int)
+        harr = np.array(det_stats["high_counts"], dtype=int) if total_steps > 0 else np.array([], dtype=int)
+        n_low_pos = int((larr > 0).sum()) if total_steps > 0 else 0
+        n_high_pos = int((harr > 0).sum()) if total_steps > 0 else 0
+        n_both_pos = int(((larr > 0) & (harr > 0)).sum()) if total_steps > 0 else 0
+        n_none = int(((larr == 0) & (harr == 0)).sum()) if total_steps > 0 else 0
+        avg_low = float(larr.mean()) if total_steps > 0 else float("nan")
+        avg_high = float(harr.mean()) if total_steps > 0 else float("nan")
+
+        # 期間表記
+        if len(sel_times) > 0:
+            date1 = pd.to_datetime(sel_times[0]).strftime("%Y-%m-%dT%H")
+            dateN = pd.to_datetime(sel_times[-1]).strftime("%Y-%m-%dT%H")
+        else:
+            date1, dateN = "NA", "NA"
+
+        # CSV（各時刻のカウント）
+        df_counts = pd.DataFrame({
+            "time": [pd.to_datetime(t).strftime("%Y-%m-%dT%H") for t in det_stats["times"]],
+            "low_count": det_stats["low_counts"],
+            "high_count": det_stats["high_counts"],
+        })
+        out_counts_csv = ensure_dirs()["txt"] / f"user_detect_counts_{date1}_{dateN}.csv"
+        df_counts.to_csv(out_counts_csv, index=False, encoding="utf-8-sig")
+
+        # サマリTXT
+        out_summary_txt = ensure_dirs()["txt"] / f"user_detect_summary_{date1}_{dateN}.txt"
+        with out_summary_txt.open("w", encoding="utf-8") as fsum:
+            fsum.write(f"Detection summary (User method) for [{date1} .. {dateN}]\n")
+            fsum.write(f"Total timesteps: {total_steps}\n")
+            fsum.write(f"Low detected (>=1): {n_low_pos}  ({(n_low_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+            fsum.write(f"High detected(>=1): {n_high_pos}  ({(n_high_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+            fsum.write(f"Both detected     : {n_both_pos}  ({(n_both_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+            fsum.write(f"None detected     : {n_none}  ({(n_none/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+            fsum.write(f"Avg # of lows per timestep : {avg_low:.3f}\n")
+            fsum.write(f"Avg # of highs per timestep: {avg_high:.3f}\n")
+
+        # コンソールにも出力
+        print(f"[STATS] User method detection [{date1}..{dateN}]")
+        print(f"  Steps={total_steps}, Low>=1={n_low_pos} ({(n_low_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%), "
+              f"High>=1={n_high_pos} ({(n_high_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%), "
+              f"Both={n_both_pos} ({(n_both_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%), "
+              f"None={n_none} ({(n_none/total_steps*100.0 if total_steps>0 else 0):.2f}%)")
+        print(f"  Avg lows/t={avg_low:.3f}, Avg highs/t={avg_high:.3f}")
+        print(f"  -> CSV: {out_counts_csv}")
+        print(f"  -> Summary: {out_summary_txt}")
+    except Exception as e:
+        print(f"[WARN] Failed to build detection statistics: {e}")
 
     # =============
     # storm_tracking 互換の minima テキスト化・トラック作成・作図

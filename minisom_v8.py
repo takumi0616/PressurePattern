@@ -96,6 +96,12 @@ class MiniSom:
         self.sigma_decay = sigma_decay
         self.nodes_chunk = int(nodes_chunk)
 
+        # CL distance params (user method): neighborhood radius r, Gaussian sigma, and top-K centers
+        # Defaults aligned with low_surface_locate.py: r=6, sigma=2.0
+        self.cl_radius = 6
+        self.cl_sigma = 2.0
+        self.cl_topk = 5
+
         # 学習全体の反復管理（σ継続減衰用）
         self.global_iter: int = 0
         self.total_iters: Optional[int] = None
@@ -108,8 +114,8 @@ class MiniSom:
 
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'emd'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","emd"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'cl'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","cl"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -491,6 +497,238 @@ class MiniSom:
 
 
     @torch.no_grad()
+    def _gaussian_kernel1d(self, sigma: float, dtype: torch.dtype, device: torch.device) -> Tensor:
+        # radius ~ 3*sigma, ensure odd length
+        if sigma <= 0:
+            k = torch.tensor([1.0], device=device, dtype=dtype)
+            return k / k.sum()
+        r = max(1, int(math.ceil(3.0 * float(sigma))))
+        xs = torch.arange(-r, r + 1, device=device, dtype=dtype)
+        k = torch.exp(-(xs * xs) / (2.0 * (sigma ** 2)))
+        return k / (k.sum() + 1e-12)
+
+    @torch.no_grad()
+    def _gaussian_blur2d(self, Z: Tensor, sigma: float) -> Tensor:
+        # Z: (H,W) -> (H,W), separable conv with reflect padding
+        H, W = Z.shape
+        device, dtype = Z.device, Z.dtype
+        k1 = self._gaussian_kernel1d(sigma, dtype, device)
+        k1c = k1.view(1, 1, 1, -1)
+        k1r = k1.view(1, 1, -1, 1)
+        # horizontal
+        pad_h = (k1.shape[0] // 2)
+        X = Z.view(1, 1, H, W)
+        Xh = F.pad(X, (pad_h, pad_h, 0, 0), mode='reflect')
+        Xh = F.conv2d(Xh, k1c)
+        # vertical
+        pad_v = (k1.shape[0] // 2)
+        Xv = F.pad(Xh, (0, 0, pad_v, pad_v), mode='reflect')
+        Xs = F.conv2d(Xv, k1r)
+        return Xs.squeeze(0).squeeze(0)
+
+    @torch.no_grad()
+    def _unique_extrema_mask(self, Z: Tensor, k: int, mode: str) -> Tensor:
+        """
+        Z: (H,W), k: window size (odd), mode: 'min' or 'max'
+        returns boolean mask of strict unique local minima/maxima.
+        Uses pooling with SAME padding and rejects r-border to avoid padding artifacts.
+        """
+        assert k >= 1 and (k % 2 == 1)
+        r = k // 2
+        H, W = Z.shape
+        Z1 = Z.view(1, 1, H, W)
+        if mode == 'min':
+            pooled = -F.max_pool2d(-Z1, kernel_size=k, stride=1, padding=r)
+            eq = (Z1 == pooled)
+        else:
+            pooled = F.max_pool2d(Z1, kernel_size=k, stride=1, padding=r)
+            eq = (Z1 == pooled)
+        # count of occurrences of pooled value in the window
+        cnt = F.avg_pool2d(eq.float(), kernel_size=k, stride=1, padding=r) * float(k * k)
+        unique = (eq & (cnt == 1.0)).squeeze(0).squeeze(0)
+        # exclude r-border
+        if H > 2 * r and W > 2 * r:
+            unique[:r, :] = False
+            unique[-r:, :] = False
+            unique[:, :r] = False
+            unique[:, -r:] = False
+        else:
+            unique[:, :] = False
+        return unique
+
+    @torch.no_grad()
+    def _cl_extract_features_single(self, Z: Tensor, radius: int, sigma: float, topk: int) -> Tuple[Tensor, ...]:
+        """
+        Extract CL features from a single 2D anomaly field Z (H,W) [hPa].
+        Returns tuple:
+          (lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang)
+        where positions are in [0,1], lsum/hsum are sum of positive strengths (abs anomaly) for lows/highs,
+        vlen in [0,sqrt(2)] (before normalization), vang in radians [-pi,pi].
+        """
+        eps = torch.tensor(1e-12, device=Z.device, dtype=Z.dtype)
+        H, W = Z.shape
+        # Smooth
+        S = self._gaussian_blur2d(Z, sigma)
+        k = 2 * int(radius) + 1
+        if k % 2 == 0:
+            k += 1
+        # unique minima/maxima
+        min_mask = self._unique_extrema_mask(S, k=k, mode='min')
+        max_mask = self._unique_extrema_mask(S, k=k, mode='max')
+
+        # weights
+        lows_val = (-Z).clamp(min=0.0)
+        highs_val = (Z).clamp(min=0.0)
+
+        # indices and weights
+        def _centroid(mask: Tensor, wmap: Tensor, K: int) -> Tuple[Tensor, Tensor, Tensor]:
+            ys, xs = torch.nonzero(mask, as_tuple=True)
+            if ys.numel() == 0:
+                return torch.tensor(0.5, device=Z.device, dtype=Z.dtype), torch.tensor(0.5, device=Z.device, dtype=Z.dtype), torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
+            ws = wmap[ys, xs]
+            if ws.numel() == 0 or float(ws.sum().item()) <= 0.0:
+                # fallback to global extremum
+                if wmap is lows_val:
+                    # global min
+                    idx = torch.argmin(S)
+                else:
+                    idx = torch.argmax(S)
+                y = (idx // W).to(torch.long)
+                x = (idx % W).to(torch.long)
+                cx = x.to(Z.dtype) / max(1.0, (W - 1))
+                cy = y.to(Z.dtype) / max(1.0, (H - 1))
+                return cx, cy, torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
+            # top-K by weight
+            K_eff = int(min(K, ws.numel()))
+            vals, order = torch.topk(ws, k=K_eff, largest=True, sorted=False)
+            xs_sel = xs[order]
+            ys_sel = ys[order]
+            w = vals
+            wsum = w.sum()
+            cx = ( (xs_sel.to(Z.dtype) / max(1.0, (W - 1))) * w ).sum() / (wsum + eps)
+            cy = ( (ys_sel.to(Z.dtype) / max(1.0, (H - 1))) * w ).sum() / (wsum + eps)
+            return cx, cy, wsum
+
+        lcx, lcy, lsum = _centroid(min_mask, lows_val, topk)
+        hcx, hcy, hsum = _centroid(max_mask, highs_val, topk)
+
+        vx = hcx - lcx
+        vy = hcy - lcy
+        vlen = torch.sqrt(vx * vx + vy * vy + eps)  # up to sqrt(2)
+        vang = torch.atan2(vy, vx)                 # [-pi,pi]
+        return lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang
+
+    @torch.no_grad()
+    def _cl_pairwise_distance(self,
+                              feat_b: Tuple[Tensor, ...],
+                              feat_r: Tuple[Tensor, ...]) -> Tensor:
+        """
+        Compute CL distance between batch features (B,8) and single ref features (8,) -> (B,) in [0,1]
+        """
+        eps = 1e-12
+        (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b) = feat_b
+        (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r) = feat_r
+
+        # positional terms (normalized by sqrt(2))
+        d_l_pos = torch.sqrt((lcx_b - lcx_r) ** 2 + (lcy_b - lcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
+        d_h_pos = torch.sqrt((hcx_b - hcx_r) ** 2 + (hcy_b - hcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
+
+        # strength terms
+        denom_l = torch.clamp(torch.maximum(lsum_b, lsum_r), min=eps)
+        denom_h = torch.clamp(torch.maximum(hsum_b, hsum_r), min=eps)
+        d_l_str = torch.where((lsum_b <= eps) & (lsum_r <= eps), torch.zeros_like(lsum_b), torch.abs(lsum_b - lsum_r) / denom_l)
+        d_h_str = torch.where((hsum_b <= eps) & (hsum_r <= eps), torch.zeros_like(hsum_b), torch.abs(hsum_b - hsum_r) / denom_h)
+
+        # vector relation: angle and magnitude
+        # angle difference normalized by pi
+        def _angle_diff(a: Tensor, b: Tensor) -> Tensor:
+            d = torch.abs(a - b)
+            d = torch.remainder(d, 2.0 * math.pi)
+            d = torch.where(d > math.pi, 2.0 * math.pi - d, d)
+            return d / math.pi
+
+        d_ang = _angle_diff(vang_b, vang_r)
+        # if either vector length ~ 0, ignore angle (set 0)
+        d_ang = torch.where((vlen_b <= 1e-6) | (vlen_r <= 1e-6), torch.zeros_like(d_ang), d_ang)
+        d_mag = torch.abs(vlen_b - vlen_r) / math.sqrt(2.0)
+
+        D = torch.sqrt((d_l_pos * d_l_pos +
+                        d_h_pos * d_h_pos +
+                        d_l_str * d_l_str +
+                        d_h_str * d_h_str +
+                        d_ang * d_ang +
+                        d_mag * d_mag) / 6.0 + 1e-12)
+        return D.clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def _cl_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        CL distance against single reference: (B,) in [0,1]
+        Uses user-method-like unique local minima/maxima after Gaussian smoothing.
+        """
+        B, H, W = Xb.shape
+        r = int(getattr(self, 'cl_radius', 6))
+        s = float(getattr(self, 'cl_sigma', 2.0))
+        K = int(getattr(self, 'cl_topk', 5))
+
+        # ref features
+        lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r = self._cl_extract_features_single(ref, r, s, K)
+        # batch features
+        lcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        lcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        lsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        vlen_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        vang_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        for i in range(B):
+            lcx_b[i], lcy_b[i], lsum_b[i], hcx_b[i], hcy_b[i], hsum_b[i], vlen_b[i], vang_b[i] = \
+                self._cl_extract_features_single(Xb[i], r, s, K)
+
+        feat_b = (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b)
+        feat_r = (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r)
+        return self._cl_pairwise_distance(feat_b, feat_r)
+
+    @torch.no_grad()
+    def _cl_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        CL distance (batch vs all nodes): (B,m) in [0,1]
+        Precompute batch features once, then compare to each node's CL features.
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        B, H, W = Xb.shape
+        r = int(getattr(self, 'cl_radius', 6))
+        s = float(getattr(self, 'cl_sigma', 2.0))
+        K = int(getattr(self, 'cl_topk', 5))
+
+        # batch features
+        lcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        lcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        lsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        hsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        vlen_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        vang_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
+        for i in range(B):
+            lcx_b[i], lcy_b[i], lsum_b[i], hcx_b[i], hcy_b[i], hsum_b[i], vlen_b[i], vang_b[i] = \
+                self._cl_extract_features_single(Xb[i], r, s, K)
+        feat_b = (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b)
+
+        out = torch.empty((B, self.m), device=Xb.device, dtype=Xb.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            for k in range(start, end):
+                ref = self.weights[k]
+                lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r = \
+                    self._cl_extract_features_single(ref, r, s, K)
+                feat_r = (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r)
+                out[:, k] = self._cl_pairwise_distance(feat_b, feat_r)
+        return out
+
+    @torch.no_grad()
     def _emd_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         Earth Mover's Distance d_W±(x,w) のGPU向け近似（エントロピー正則化 Sinkhorn）。
@@ -843,8 +1081,8 @@ class MiniSom:
             return self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 's1k':
             return self._s1k_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'emd':
-            return self._emd_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'cl':
+            return self._cl_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -1013,8 +1251,8 @@ class MiniSom:
             return self._kappa_to_ref(Xb, ref)
         elif self.activation_distance == 's1k':
             return self._s1k_to_ref(Xb, ref)
-        elif self.activation_distance == 'emd':
-            return self._emd_to_ref(Xb, ref)
+        elif self.activation_distance == 'cl':
+            return self._cl_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
