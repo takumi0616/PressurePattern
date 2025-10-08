@@ -28,8 +28,6 @@ from matplotlib.colors import Normalize
 # 3type版 SOM（Euclidean/SSIM/S1対応, batchSOM）
 from PressurePattern.minisom_v8 import MiniSom as MultiDistMiniSom
 
-# Persistent cache dir for EMD core matrices; set in main() as RESULT_DIR/data
-EMD_PERSIST_DIR: Optional[str] = None
 
 # =====================================================
 # ユーザ調整パラメータ
@@ -1691,206 +1689,6 @@ def _s1gcurv_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     Dcurv = 0.5 * Dc
     return torch.sqrt((D1n * D1n + Dg * Dg + Dcurv * Dcurv) / 3.0)
 
-def _emd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """
-    EMD（Earth Mover's Distance）GPU近似（Sinkhorn）を高速化:
-      - ダウンサンプリング: adaptive_avg_pool2d により (H,W)→(H/α,W/α)（α=2）
-      - AMP: CUDAで半精度/混合精度（既定ON）
-      - 早期収束: スケーリングベクトル変化の平均が閾値未満でbreak
-      - 永続キャッシュ: RESULT_DIR/data に D_full/K_full/KD_full を保存・再利用
-    正負分離・スラック行/列による部分マッチング・合計フロー正規化は維持。
-    戻り: (B,)
-    """
-    eps = 1e-12
-    B, H, W = Xb.shape
-    device, dtype = Xb.device, Xb.dtype
-    sqrt2 = math.sqrt(2.0)
-
-    # チューニング（必要なら上流から渡す設計にもできる）
-    emd_eps: float = 0.05
-    emd_max_iter: int = 200
-    emd_chunk: int = 4096
-    emd_downscale: int = 1
-    emd_tol: float = 1e-2
-    emd_amp: bool = True
-
-    # ダウンサンプリング
-    if emd_downscale > 1 and (H >= 4 or W >= 4):
-        h2 = max(16, max(1, H // emd_downscale))
-        w2 = max(16, max(1, W // emd_downscale))
-        Xb = F.adaptive_avg_pool2d(Xb.unsqueeze(1), (h2, w2)).squeeze(1)
-        ref = F.adaptive_avg_pool2d(ref.unsqueeze(0).unsqueeze(0), (h2, w2)).squeeze(0).squeeze(0)
-        H, W = int(h2), int(w2)
-
-    # 座標キャッシュ
-    if not hasattr(_emd_to_ref, "_coords_cache"):
-        _emd_to_ref._coords_cache = {}
-    key = (int(H), int(W), device)
-    if key not in _emd_to_ref._coords_cache:
-        yy = torch.linspace(0.0, 1.0, H, device=device, dtype=dtype)
-        xx = torch.linspace(0.0, 1.0, W, device=device, dtype=dtype)
-        Y, X = torch.meshgrid(yy, xx, indexing='ij')
-        coords = torch.stack([Y.reshape(-1), X.reshape(-1)], dim=1)  # (N,2)
-        _emd_to_ref._coords_cache[key] = coords
-    coords = _emd_to_ref._coords_cache[key]
-    N = coords.shape[0]
-
-    amp_enabled = (device.type == 'cuda') and emd_amp
-    with torch.amp.autocast('cuda', enabled=amp_enabled):
-        # Precompute and cache full distance/kernel matrices with persistent disk cache
-        if not hasattr(_emd_to_ref, "_D_cache"):
-            _emd_to_ref._D_cache = {}
-        if not hasattr(_emd_to_ref, "_K_cache"):
-            _emd_to_ref._K_cache = {}
-        if not hasattr(_emd_to_ref, "_KD_cache"):
-            _emd_to_ref._KD_cache = {}
-
-        # persistent cache dir (RESULT_DIR/data), configured in main()
-        persist_dir = EMD_PERSIST_DIR
-        if persist_dir is not None:
-            os.makedirs(persist_dir, exist_ok=True)
-
-        # D_full on CPU keyed by (H,W)
-        dkey = (int(H), int(W), 'cpu')
-        if dkey in _emd_to_ref._D_cache:
-            D_cpu = _emd_to_ref._D_cache[dkey]
-        else:
-            D_path = None if persist_dir is None else os.path.join(persist_dir, f"D_{H}x{W}.pt")
-            if D_path is not None and os.path.exists(D_path):
-                D_cpu = torch.load(D_path, map_location='cpu')
-            else:
-                with torch.amp.autocast('cuda', enabled=False):
-                    D_dev = torch.cdist(coords.to(torch.float32), coords.to(torch.float32), p=2) / sqrt2
-                D_cpu = D_dev.detach().cpu()
-                if D_path is not None:
-                    try:
-                        torch.save(D_cpu, D_path)
-                    except Exception:
-                        pass
-            _emd_to_ref._D_cache[dkey] = D_cpu
-
-        # K_full/KD_full on CPU keyed by (H,W,eps)
-        eps_str = str(float(emd_eps)).replace('.', 'p')
-        kkey = (int(H), int(W), 'cpu', eps_str)
-        if kkey in _emd_to_ref._K_cache:
-            K_cpu = _emd_to_ref._K_cache[kkey]
-            KD_cpu = _emd_to_ref._KD_cache[kkey]
-        else:
-            K_path = None if persist_dir is None else os.path.join(persist_dir, f"K_{H}x{W}_eps{eps_str}.pt")
-            KD_path = None if persist_dir is None else os.path.join(persist_dir, f"KD_{H}x{W}_eps{eps_str}.pt")
-            if K_path is not None and KD_path is not None and os.path.exists(K_path) and os.path.exists(KD_path):
-                K_cpu = torch.load(K_path, map_location='cpu')
-                KD_cpu = torch.load(KD_path, map_location='cpu')
-            else:
-                K_cpu = torch.exp(-(D_cpu / float(emd_eps)))
-                KD_cpu = K_cpu * D_cpu
-                if K_path is not None and KD_path is not None:
-                    try:
-                        torch.save(K_cpu, K_path)
-                        torch.save(KD_cpu, KD_path)
-                    except Exception:
-                        pass
-            _emd_to_ref._K_cache[kkey] = K_cpu
-            _emd_to_ref._KD_cache[kkey] = KD_cpu
-
-        # move to compute device/dtype
-        D_full = D_cpu.to(device=device, dtype=dtype, non_blocking=True)
-        K_full = _emd_to_ref._K_cache[kkey].to(device=device, dtype=dtype, non_blocking=True)
-        KD_full = _emd_to_ref._KD_cache[kkey].to(device=device, dtype=dtype, non_blocking=True)
-        def _K_dot_v(v_real: torch.Tensor, v_slack: torch.Tensor) -> torch.Tensor:
-            # Use precomputed full kernel: K_full @ v + slack
-            res = (K_full @ v_real.to(K_full.dtype)).to(dtype)
-            res = res + v_slack.to(res.dtype)  # cost=0 → K_{i,slack}=1
-            return res
-
-        def _KT_dot_u(u_real: torch.Tensor, u_slack: torch.Tensor) -> torch.Tensor:
-            # Use precomputed full kernel: K_full^T @ u + slack
-            res = (K_full.transpose(0, 1) @ u_real.to(K_full.dtype)).to(dtype)
-            res = res + u_slack.to(res.dtype)  # cost=0 → K_{slack,j}=1
-            return res
-
-        def _cost_sum(u_real: torch.Tensor, v_real: torch.Tensor) -> torch.Tensor:
-            # Full-matrix form: u^T (K ⊙ D) v
-            s = (u_real.to(KD_full.dtype) @ (KD_full @ v_real.to(KD_full.dtype))).to(dtype)
-            return s
-
-        def _emd_side_sinkhorn(m_src: torch.Tensor, m_dst: torch.Tensor) -> torch.Tensor:
-            M_src = float(m_src.sum().item()); M_dst = float(m_dst.sum().item())
-            if M_src <= eps and M_dst <= eps:
-                return torch.zeros((), device=device, dtype=dtype)
-            if (M_src <= eps and M_dst > eps) or (M_src > eps and M_dst <= eps):
-                return torch.ones((), device=device, dtype=dtype)
-
-            if M_src >= M_dst:
-                a_real = m_src.clone()
-                b_real = m_dst.clone()
-                b_slack = torch.tensor(M_src - M_dst, device=device, dtype=dtype)
-                u = torch.ones_like(a_real)
-                v_real = torch.ones_like(b_real)
-                v_slack = torch.ones((), device=device, dtype=dtype)
-                for _ in range(emd_max_iter):
-                    u_prev = u
-                    v_prev = v_real
-                    Kv = _K_dot_v(v_real, v_slack) + eps
-                    u = a_real / Kv
-                    KTu_real = _KT_dot_u(u, torch.zeros((), device=device, dtype=dtype)) + eps
-                    v_real = b_real / KTu_real
-                    KTu_slack = u.sum() + eps
-                    v_slack = b_slack / KTu_slack
-                    du = (u - u_prev).abs().mean()
-                    dv = (v_real - v_prev).abs().mean()
-                    if float(torch.max(du, dv).item()) < emd_tol:
-                        break
-                cost = _cost_sum(u, v_real)
-                denom = torch.tensor(M_dst, device=device, dtype=dtype)
-                res = (cost / (denom + eps)).clamp(0.0, 1.0)
-                return torch.nan_to_num(res, nan=1.0, posinf=1.0, neginf=0.0)
-            else:
-                a_real = m_src.clone()
-                a_slack = torch.tensor(M_dst - M_src, device=device, dtype=dtype)
-                b_real = m_dst.clone()
-                u_real = torch.ones_like(a_real)
-                u_slack = torch.ones((), device=device, dtype=dtype)
-                v = torch.ones_like(b_real)
-                for _ in range(emd_max_iter):
-                    u_prev = u_real
-                    v_prev = v
-                    Kv_real = torch.zeros((N,), device=device, dtype=coords.dtype)
-                    for j0 in range(0, N, emd_chunk):
-                        j1 = min(j0 + emd_chunk, N)
-                        d = torch.cdist(coords, coords[j0:j1], p=2) / sqrt2
-                        Kv_real += (torch.exp(-d / emd_eps) @ v[j0:j1].to(d.dtype))
-                    Kv_real = Kv_real.to(dtype)
-                    Kv_slack = v.sum() + eps
-                    u_real = a_real / (Kv_real + eps)
-                    u_slack = a_slack / (Kv_slack)
-                    KTu_real = torch.zeros((N,), device=device, dtype=coords.dtype)
-                    for i0 in range(0, N, emd_chunk):
-                        i1 = min(i0 + emd_chunk, N)
-                        d = torch.cdist(coords[i0:i1], coords, p=2) / sqrt2
-                        K = torch.exp(-d / emd_eps)
-                        KTu_real += (K.transpose(0, 1) @ u_real[i0:i1].to(K.dtype))
-                    KTu_real = (KTu_real.to(dtype) + u_slack)
-                    v = b_real / (KTu_real + eps)
-                    du = (u_real - u_prev).abs().mean()
-                    dv = (v - v_prev).abs().mean()
-                    if float(torch.max(du, dv).item()) < emd_tol:
-                        break
-                cost = _cost_sum(u_real, v)
-                denom = torch.tensor(M_src, device=device, dtype=dtype)
-                res = (cost / (denom + eps)).clamp(0.0, 1.0)
-                return torch.nan_to_num(res, nan=1.0, posinf=1.0, neginf=0.0)
-
-        out = torch.empty((B,), device=device, dtype=dtype)
-        Xp = torch.clamp(Xb, min=0.0).reshape(B, -1)
-        Xn_abs = torch.clamp(-Xb, min=0.0).reshape(B, -1)
-        Rp = torch.clamp(ref, min=0.0).reshape(-1)
-        Rn_abs = torch.clamp(-ref, min=0.0).reshape(-1)
-        for b in range(B):
-            dp = _emd_side_sinkhorn(Xp[b], Rp)
-            dn = _emd_side_sinkhorn(Xn_abs[b], Rn_abs)
-            out[b] = 0.5 * (dp + dn)
-        return torch.nan_to_num(out, nan=1.0, posinf=1.0, neginf=0.0)
 
 def compute_node_true_medoids(
     method_name: str,
@@ -1904,7 +1702,7 @@ def compute_node_true_medoids(
     """
     各ノードについて「総距離最小（true medoid）」のサンプルを選ぶ。
     - 各ノードの割当集合 Ic の中で、候補 i∈Ic について cost(i) = Σ_{j∈Ic} d(X_j, X_i) を計算し最小の i を選ぶ。
-    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k' | 'emd'
+    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k' | 'cl'
     - 戻りの距離は、選ばれたメドイドに対する平均距離（sum/|Ic|）。
     """
     H, W = field_shape
@@ -3075,10 +2873,10 @@ def main():
     処理の詳細:
       - デバイス解決と再現性設定、ログ初期化。
       - 学習/検証期間のデータを読み込み、hPa偏差へ変換。
-      - 指定の距離手法（例: emd）でSOM学習し、True Medoidや各種図表・CSVを保存。
+      - 指定の距離手法（例: cl）でSOM学習し、True Medoidや各種図表・CSVを保存。
       - 学習代表（基本ラベル）を用いた検証評価と可視化を実施。
       - 各手法の再現率ブロックを抜粋した集約ログを生成。
-      - EMD計算のための永続キャッシュ（RESULT_DIR/data）も初期化。
+      - キャッシュディレクトリ（RESULT_DIR/data）も初期化。
     出力:
       - 画像/CSV/ログ群をRESULT_DIR以下に保存し、標準出力/ログへ進捗を出力する。
     """
@@ -3129,10 +2927,6 @@ def main():
         RESULT_DIR = f'./results_v8_iter{NUM_ITER}_batch{BATCH_SIZE}_seed{SEED}_{dev_tag}'
     LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
     VERIF_ROOT = os.path.join(RESULT_DIR, 'verification_results')
-    # 永続キャッシュ用ディレクトリ（RESULT_DIR/data）を設定
-    global EMD_PERSIST_DIR
-    EMD_PERSIST_DIR = os.path.join(RESULT_DIR, 'data')
-    os.makedirs(EMD_PERSIST_DIR, exist_ok=True)
 
     set_reproducibility(SEED)
     setup_logging_v8()
