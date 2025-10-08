@@ -70,6 +70,19 @@ BASE_LABELS = [
 # 再現性・ログ
 # =====================================================
 def set_reproducibility(seed: int = 42):
+    """
+    概要:
+      実験の再現性を高めるために、Python/NumPy/PyTorchおよびBLAS系の乱数や実行モードを固定する。
+    引数:
+      - seed (int): 乱数シード値。すべての乱数源に同じ値を設定する。
+    処理の詳細:
+      - 各種環境変数を設定（スレッド数やハッシュシード、CUDAのワークスペース設定など）。
+      - Pythonのrandom、NumPy、PyTorch（CPU/CUDA）のシードを固定。
+      - 可能であればPyTorchの決定論的アルゴリズムモードを有効化し、cudnnの最適化を固定。
+      - ENABLE_TF32=1 が設定されている場合はTF32を有効化（速度向上のため）。
+    戻り値:
+      - なし（副作用としてグローバルな実行環境の設定を変更する）。
+    """
     os.environ['PYTHONHASHSEED'] = str(seed)
     os.environ['OPENBLAS_NUM_THREADS'] = '1'
     os.environ['MKL_NUM_THREADS'] = '1'
@@ -106,6 +119,18 @@ def set_reproducibility(seed: int = 42):
 
 
 def setup_logging_v8():
+    """
+    概要:
+      出力ディレクトリの作成とログの初期化を行う（コンソール＋ファイルへ同時出力）。
+    引数:
+      - なし（グローバルのRESULT_DIRなどを使用）。
+    処理の詳細:
+      - 結果出力用のディレクトリを作成。
+      - 既存のログファイルがあれば削除。
+      - logging.basicConfigでファイル・ストリームの2ハンドラを設定。
+    戻り値:
+      - なし（副作用としてrun_v8.logが作成される）。
+    """
     for d in [RESULT_DIR, LEARNING_ROOT, VERIF_ROOT]:
         os.makedirs(d, exist_ok=True)
     log_path = os.path.join(RESULT_DIR, 'run_v8.log')
@@ -154,6 +179,33 @@ def load_and_prepare_data_unified(filepath: str,
                                   start_date: Optional[str],
                                   end_date: Optional[str],
                                   device: str = 'cpu'):
+    """
+    概要:
+      NetCDFの海面更正気圧(msl)を読み込み、時空間の前処理（hPa換算・各サンプルの空間平均の除去）を行う。
+      学習・推論に使う2D偏差場や付随情報（lat/lon/時刻/ラベル）を統一フォーマットで返す。
+    引数:
+      - filepath (str): 入力NetCDFパス（msl変数を含むこと）。
+      - start_date (Optional[str]): 開始日（Noneのときは下限なし）。
+      - end_date (Optional[str]): 終了日（Noneのときは上限なし）。
+      - device (str): 返却するテンソル（X_for_s1）の配置先（'cpu' | 'cuda[:N]'）。
+    処理の詳細:
+      - xarrayでデータセットを開き、time/valid_time座標を自動検出。
+      - 指定期間でスライス、mslを抽出しfloat32へ変換。
+      - 緯度・経度の次元名を自動同定し、(N,H,W)へ並べ替え。
+      - NaNを含む時刻サンプルを除外し、必要に応じてラベルを文字列化。
+      - Pa→hPaへ換算後、各サンプルの空間平均を差し引いた「偏差」を作成。
+      - 偏差の平坦化/復元配列、座標配列、時刻配列を整備。
+    戻り値:
+      - X_for_s1 (torch.Tensor): 偏差[hPa]の2Dを平坦化したテンソル (N, D) on device。
+      - msl_hpa (np.ndarray): 元のmslをhPaへ換算した3D配列 (N,H,W)。
+      - anomaly_hpa (np.ndarray): 空間平均を差し引いた偏差3D配列 (N,H,W)。
+      - lat (np.ndarray): 緯度配列 (H,)。
+      - lon (np.ndarray): 経度配列 (W,)。
+      - nlat (int): 緯度グリッド数。
+      - nlon (int): 経度グリッド数。
+      - times (np.ndarray): 有効な時刻（NaN行除外後）の配列。
+      - labels (Optional[List[str]]): （存在する場合）各サンプルのラベル文字列。
+    """
     logging.info(f"データ読み込み: {filepath}")
     ds = xr.open_dataset(filepath, decode_times=True)
 
@@ -278,6 +330,21 @@ def primary_base_label(raw_label: Optional[str], base_labels: List[str]) -> Opti
 def build_confusion_matrix_only_base(clusters: List[List[int]],
                                      all_labels: List[Optional[str]],
                                      base_labels: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    概要:
+      SOMクラスタ割当（各ノードに属するサンプルのインデックス集合）とラベルから、
+      基本ラベルのみを対象にした混同行列（ラベル×クラスタ列）を作成する。
+    引数:
+      - clusters (List[List[int]]): 各クラスタに属するサンプルのインデックスのリスト。
+      - all_labels (List[Optional[str]]): 各サンプルの元ラベル（None可）。
+      - base_labels (List[str]): 評価対象の基本ラベル一覧。
+    処理の詳細:
+      - 各クラスタ列ごとに、属するサンプルの基本ラベルをカウント。
+      - pd.DataFrame形の混同行列を構築（index=base_labels, columns=Cluster_k）。
+    戻り値:
+      - cm (pd.DataFrame): 基本ラベル×クラスタ列のカウント行列。
+      - cluster_names (List[str]): 列名（'Cluster_1', ...）の配列。
+    """
     num_clusters = len(clusters)
     cluster_names = [f'Cluster_{i+1}' for i in range(num_clusters)]
     cm = pd.DataFrame(0, index=base_labels, columns=cluster_names, dtype=int)
@@ -297,6 +364,21 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
                                 all_labels: List[Optional[str]],
                                 base_labels: List[str],
                                 title: str = "評価（基本ラベルのみ）") -> Optional[Dict[str, float]]:
+    """
+    概要:
+      基本ラベルのみを用いてクラスタ品質を評価し、クラスタ代表（多数決）に基づくMacro Recallを算出する。
+    引数:
+      - clusters (List[List[int]]): 各クラスタのサンプルインデックス集合。
+      - all_labels (List[Optional[str]]): 各サンプルの元ラベル。
+      - base_labels (List[str]): 基本ラベルのリスト（評価対象）。
+      - title (str): ログ出力用の見出し。
+    処理の詳細:
+      - 混同行列（基本ラベル×クラスタ列）を構築。
+      - 各クラスタの多数決ラベル（基本ラベル）を決定。
+      - 各基本ラベルについて、代表クラスタ群の合計正解数から再現率を算出し、Macro平均を計算。
+    戻り値:
+      - metrics (Dict[str, float] | None): {'MacroRecall_majority': float} を含む辞書。ラベル無ならNone。
+    """
     logging.info(f"\n--- {title} ---")
     if not all_labels:
         logging.warning("ラベル無しのため評価をスキップします。")
@@ -409,6 +491,14 @@ def save_metrics_history_to_csv(history: Dict[str, List[float]], out_csv: str) -
 # 3type_som側のユーティリティ（ログ・評価・可視化）
 # =====================================================
 class Logger:
+    """
+    概要:
+      簡易ロガー。標準出力とログファイルの双方へ同時に文字列を書き出す。
+    使い方:
+      - write(str)で追記、close()でクローズ。
+    注意:
+      - 明示的にclose()を呼び出してファイルハンドラを閉じること。
+    """
     def __init__(self, path):
         self.path = path
         self.f = open(path, 'w', encoding='utf-8')
@@ -421,6 +511,17 @@ class Logger:
 
 
 def winners_to_clusters(winners_xy, som_shape):
+    """
+    概要:
+      BMUの座標配列（winners_xy）から、各SOMノードに属するサンプルのインデックス集合を作る。
+    引数:
+      - winners_xy (np.ndarray | List[Tuple[int,int]]): 各サンプルのBMU位置 (x,y)。
+      - som_shape (Tuple[int,int]): SOMのサイズ (X,Y)。
+    処理の詳細:
+      - ノードを一意のインデックスへ変換（x*Y + y）し、そのリストへサンプル番号iを追加。
+    戻り値:
+      - clusters (List[List[int]]): 各ノードに対応するサンプルのインデックスリスト。
+    """
     clusters = [[] for _ in range(som_shape[0]*som_shape[1])]
     for i,(ix,iy) in enumerate(winners_xy):
         k = ix*som_shape[1] + iy
@@ -430,7 +531,21 @@ def winners_to_clusters(winners_xy, som_shape):
 
 def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, save_path, title):
     """
-    ノード平均（セントロイド）マップ（偏差[hPa]）
+    概要:
+      各SOMノードに割り当てられたサンプルの平均（セントロイド）パターンを地図上に並べて可視化する。
+    引数:
+      - data_flat (np.ndarray): 偏差[hPa]の平坦化配列 (N, H*W)。
+      - winners_xy (np.ndarray): 各サンプルのBMU座標 (N,2)。
+      - lat (np.ndarray), lon (np.ndarray): 緯度・経度配列。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - save_path (str): 画像保存先パス。
+      - title (str): 図タイトル。
+    処理の詳細:
+      - ノードごとに属するサンプルを抽出し、平均2Dパターンを計算。
+      - Cartopyでエリアを限定（115–155E, 15–55N）し、等値線/塗り分けで描画。
+      - 画像全体に共通のカラーバーとタイトルを設定。
+    戻り値:
+      - なし（画像ファイルを保存）。
     """
     H, W = len(lat), len(lon)
     X2 = data_flat.reshape(-1, H, W)  # 偏差[hPa]
@@ -486,7 +601,19 @@ def plot_som_node_average_patterns(data_flat, winners_xy, lat, lon, som_shape, s
 
 def save_each_node_mean_image(data_flat, winners_xy, lat, lon, som_shape, out_dir, prefix):
     """
-    ノード平均（セントロイド）の個別図を保存
+    概要:
+      各ノードの平均（セントロイド）パターンを1ノード1ファイルで保存する。
+    引数:
+      - data_flat (np.ndarray): 偏差[hPa]の平坦化配列 (N, H*W)。
+      - winners_xy (np.ndarray): 各サンプルのBMU座標 (N,2)。
+      - lat (np.ndarray), lon (np.ndarray): 緯度・経度配列。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - out_dir (str): 保存ディレクトリ。
+      - prefix (str): 出力ファイル名の接頭辞。
+    処理の詳細:
+      - ノードごとの平均2Dパターンを算出し、CartopyでプロットしてPNG保存。
+    戻り値:
+      - なし（画像ファイルを複数保存）。
     """
     os.makedirs(out_dir, exist_ok=True)
     H, W = len(lat), len(lon)
@@ -525,7 +652,21 @@ def plot_label_distributions_base(winners_xy, labels_raw: List[Optional[str]],
                                   base_labels: List[str], som_shape: Tuple[int,int],
                                   save_dir: str, title_prefix: str):
     """
-    基本ラベルのみの分布ヒートマップ（15種類を1枚にまとめる）
+    概要:
+      基本ラベル（例: 15種類）ごとに、SOMノード上の出現分布をヒートマップとして並べて表示する。
+    引数:
+      - winners_xy (np.ndarray): BMU座標 (N,2)。
+      - labels_raw (List[Optional[str]]): 元ラベルの配列（複合/移行は基本ラベル抽出後に集計）。
+      - base_labels (List[str]): 対象とする基本ラベルの一覧。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - save_dir (str): 保存ディレクトリ。
+      - title_prefix (str): 図タイトル接頭辞（All/Verificationなど）。
+    処理の詳細:
+      - 各サンプルの基本ラベルを抽出して、ノードごとにカウント。
+      - ラベルごとにX×Yの行列を作り、imshowで可視化（90度回転して見やすさを調整）。
+      - 1枚に複数サブプロットで並べ、凡例としてカラーバーを付与。
+    戻り値:
+      - なし（画像ファイルを保存）。
     """
     os.makedirs(save_dir, exist_ok=True)
     node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
@@ -562,7 +703,19 @@ def save_label_distributions_base_individual(winners_xy, labels_raw: List[Option
                                              base_labels: List[str], som_shape: Tuple[int,int],
                                              save_dir: str, title_prefix: str):
     """
-    基本ラベルのみの分布ヒートマップ（各ラベルごとの個別画像を追加保存）
+    概要:
+      基本ラベルごとに1ファイルずつ、SOMノード分布ヒートマップを個別保存する。
+    引数:
+      - winners_xy (np.ndarray): BMU座標 (N,2)。
+      - labels_raw (List[Optional[str]]): 元ラベル配列。
+      - base_labels (List[str]): 基本ラベル一覧。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - save_dir (str): 保存ディレクトリ。
+      - title_prefix (str): 図タイトル接頭辞。
+    処理の詳細:
+      - plot_label_distributions_baseと同等の集計を行いつつ、各ラベルを個別のPNGに保存。
+    戻り値:
+      - なし（画像ファイルを複数保存）。
     """
     os.makedirs(save_dir, exist_ok=True)
     node_counts = {lbl: np.zeros((som_shape[0], som_shape[1]), dtype=int) for lbl in base_labels}
@@ -594,7 +747,20 @@ def analyze_nodes_detail_to_log(clusters: List[List[int]],
                                 log: Logger,
                                 title: str):
     """
-    ノードごとの詳細（基本ラベル構成・月別分布・純度・代表ラベル[raw]）を results.log に追記。
+    概要:
+      各ノードの詳細統計（元ラベルの多数決、基本ラベル構成、月別分布、純度など）をログへ出力する。
+    引数:
+      - clusters (List[List[int]]): ノードごとのサンプルインデックス集合。
+      - labels (List[Optional[str]]): サンプルの元ラベル。
+      - timestamps (np.ndarray): サンプルの時刻配列（pandasで日時化可能）。
+      - base_labels (List[str]): 基本ラベル一覧。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - log (Logger): 出力先ロガー。
+      - title (str): セクション見出し。
+    処理の詳細:
+      - 代表（元）ラベルの多数決、基本ラベルカウント、純度=多数決割合、月別ヒストグラムを計算し整形出力。
+    戻り値:
+      - なし（ログファイルに追記）。
     """
     log.write(f'\n--- {title} ---\n')
     for k, idxs in enumerate(clusters):
@@ -641,6 +807,23 @@ def log_som_recall_by_label_with_nodes(
     som_shape: Tuple[int, int],
     section_title: str
 ):
+    """
+    概要:
+      学習データ上でノード多数決（基本ラベル）を代表とみなし、各基本ラベルの再現率や代表ノード一覧をログ出力する。
+    引数:
+      - log (Logger): 出力先ロガー。
+      - winners_xy (np.ndarray): BMU座標 (N,2)。
+      - labels_all (List[Optional[str]]): 元ラベル配列。
+      - base_labels (List[str]): 基本ラベル一覧。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - section_title (str): セクション見出し。
+    処理の詳細:
+      - ノードごとの基本ラベル分布→代表ラベルを抽出。
+      - 代表ラベルが同じノードをラベルごとに列挙。
+      - 実ラベル=代表ラベル一致の割合（再現率）をラベル別に算出し、Macro平均も集計。
+    戻り値:
+      - なし（ログファイルに追記）。
+    """
     if labels_all is None or len(labels_all) == 0:
         log.write("\nラベルが無いため、代表ノード群ベースの再現率出力をスキップします。\n")
         return
@@ -709,6 +892,17 @@ def log_som_recall_by_label_with_nodes(
 # True Medoid / 距離計算ユーティリティ（SSIM/S1等）
 # =====================================================
 def _euclidean_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    概要:
+      参照1枚（ref）に対する各バッチ2D場（Xb）のユークリッド距離（L2）を計算する。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - 差分を画素ごとに二乗和して平方根を取り、サンプルごとのスカラー距離(B,)を得る。
+    戻り値:
+      - d (torch.Tensor): 距離ベクトル (B,)。
+    """
     # Xb: (B,H,W), ref: (H,W) -> (B,)
     diff = Xb - ref.view(1, *ref.shape)
     d2 = (diff*diff).sum(dim=(1,2))
@@ -719,7 +913,16 @@ def _euclidean_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _ssim5_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    1 - mean(SSIM_map) with 5x5 moving window, C1=C2=0 (denominator epsilon guarded)
+    概要:
+      5×5窓のSSIMを全画素で平均した類似度Sに対し、距離D=1-Sを返す（C1=C2=0、分母のゼロ割はepsilonで保護）。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - 反射パディング→移動平均によりμ・分散・共分散を推定し、SSIMマップを計算。
+      - 画素平均でSSIMを集約し、1-SSIMを距離とみなして返す。
+    戻り値:
+      - d (torch.Tensor): 距離ベクトル (B,) in [0,2] 相当（C=0のため理論上の上限はケースに依存）。
     """
     B, H, W = Xb.shape
     device = Xb.device
@@ -758,8 +961,16 @@ def _ssim5_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _ssimN_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor, win: int) -> torch.Tensor:
     """
-    1 - mean(SSIM_map) with NxN moving window (N>=1), C1=C2=0.
-    Even N uses asymmetric SAME padding to preserve size.
+    概要:
+      任意N×N窓のSSIMに基づく距離D=1-SSIM（平均）を返す。Nが偶数の場合は非対称SAMEパディングでサイズ保持。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+      - win (int): 窓サイズ（1以上の整数）。
+    処理の詳細:
+      - 非対称パディング後、移動平均で局所統計を算出しSSIM→平均→(1-SSIM)。
+    戻り値:
+      - d (torch.Tensor): 距離ベクトル (B,)。
     """
     B, H, W = Xb.shape
     device, dtype = Xb.device, Xb.dtype
@@ -800,6 +1011,18 @@ def _ssimN_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor, win: int) -> torch.T
     return 1.0 - ssim_avg
 
 def _s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    概要:
+      Teweles–Wobus S1（勾配差の規格化比）を計算し、各サンプルのスカラー距離を返す。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - x/y方向の一次差分をとり、|∇X-∇R| の総和を max(|∇X|,|∇R|) の総和で割る。
+      - 係数100を掛けた一般的な定義に従い距離を返す。
+    戻り値:
+      - s1 (torch.Tensor): 距離ベクトル (B,)（値域はおおむね 0〜200 程度）。
+    """
     # Teweles–Wobus S1: 100 * sum|∇X-∇ref| / sum max(|∇X|,|∇ref|)
     dXdx = Xb[:,:,1:] - Xb[:,:,:-1]
     dXdy = Xb[:,1:,:] - Xb[:,:-1,:]
@@ -1814,6 +2037,21 @@ def save_each_node_medoid_image(
     out_dir: str,
     prefix: str
 ):
+    """
+    概要:
+      各ノードのTrue Medoid（総距離最小サンプル）を地図上に個別に描画し、ファイル出力する。
+    引数:
+      - data_flat (np.ndarray): 偏差[hPa]の平坦化配列 (N, H*W)。
+      - node_to_medoid_idx (Dict[(int,int)->int]): ノード→メドイドのサンプルインデックス。
+      - lat, lon (np.ndarray): 緯度・経度配列。
+      - som_shape (Tuple[int,int]): SOMサイズ (X,Y)。
+      - out_dir (str): 保存先ディレクトリ。
+      - prefix (str): ファイル名接頭辞。
+    処理の詳細:
+      - ノードごとにメドイドサンプルを復元し、Cartopyで描画→PNG保存。
+    戻り値:
+      - なし（画像ファイルを複数保存）。
+    """
     os.makedirs(out_dir, exist_ok=True)
     H, W = len(lat), len(lon)
 
@@ -2641,10 +2879,18 @@ def run_one_method_verification(method_name: str,
 # =====================================================
 def write_evaluation_summary(learning_root: str, result_root: str, methods: List[Tuple[str, str]]) -> str:
     """
-    learning_result/{method}_som/{method}_results.log の中から
-    「【SOM代表ノード群ベースの再現率（基本/複合）】」ブロックを抜き出して集約ログを作成。
-    出力先: {result_root}/evaluation_v8.log
-    戻り値: 出力ファイルパス
+    概要:
+      学習時の各手法ログ（{learning_root}/{method}_som/{method}_results.log）から
+      「SOM代表ノード群ベースの再現率」に関するブロックを抜粋し、1つの集約ログにまとめる。
+    引数:
+      - learning_root (str): 学習結果ルートディレクトリ。
+      - result_root (str): 出力（集約ログ）を置くディレクトリ。
+      - methods (List[Tuple[str,str]]): 手法名と距離名のタプル一覧（手法識別に使用）。
+    処理の詳細:
+      - 各ログファイルを読み、所定見出し以降〜次セクションの直前までを切り出し。
+      - メソッド名を見出しに付けて連結し、evaluation_v8.logとして保存。
+    戻り値:
+      - out_path (str): 集約ログのファイルパス。
     """
     out_path = os.path.join(result_root, 'evaluation_v8.log')
     start_tokens = [
@@ -2693,6 +2939,24 @@ def write_evaluation_summary(learning_root: str, result_root: str, methods: List
 # メイン
 # =====================================================
 def main():
+    """
+    概要:
+      圧力パターンSOM v8のエントリポイント。データ前処理→各距離手法（EMD等）でのSOM学習→検証→集約レポート作成までを自動実行。
+    入力(引数):
+      - --seed (int): 乱数シード。
+      - --gpu (int|None): 使用GPUインデックス（--device優先）。
+      - --device (str|None): 'cpu' / 'cuda' / 'cuda:N' の明示指定。
+      - --result-dir (str|None): 出力ルートの明示パス。未指定時はパラメータから自動命名。
+    処理の詳細:
+      - デバイス解決と再現性設定、ログ初期化。
+      - 学習/検証期間のデータを読み込み、hPa偏差へ変換。
+      - 指定の距離手法（例: emd）でSOM学習し、True Medoidや各種図表・CSVを保存。
+      - 学習代表（基本ラベル）を用いた検証評価と可視化を実施。
+      - 各手法の再現率ブロックを抜粋した集約ログを生成。
+      - EMD計算のための永続キャッシュ（RESULT_DIR/data）も初期化。
+    出力:
+      - 画像/CSV/ログ群をRESULT_DIR以下に保存し、標準出力/ログへ進捗を出力する。
+    """
     global SEED, RESULT_DIR, LEARNING_ROOT, VERIF_ROOT
     parser = argparse.ArgumentParser(description="PressurePattern SOM v8")
     parser.add_argument('--seed', type=int, default=SEED, help='random seed')

@@ -15,10 +15,32 @@ except Exception:
 
 
 def _to_device(x: np.ndarray, device: torch.device, dtype=torch.float32) -> Tensor:
+    """
+    概要:
+      NumPy配列を指定デバイス・dtypeのtorch.Tensorへ変換する薄いユーティリティ。
+    引数:
+      - x (np.ndarray): 変換対象の配列。
+      - device (torch.device): 配置先デバイス（CPU/GPU）。
+      - dtype (torch.dtype): 変換後のデータ型（既定: torch.float32）。
+    処理の詳細:
+      - torch.as_tensorでコピー/ビューを作成し、device/dtypeを指定。
+    戻り値:
+      - Tensor: 指定条件のTensor。
+    """
     return torch.as_tensor(x, device=device, dtype=dtype)
 
 
 def _as_numpy(x: Tensor) -> np.ndarray:
+    """
+    概要:
+      PyTorch Tensor を NumPy 配列へ安全に変換する。
+    引数:
+      - x (Tensor): 変換対象のテンソル。
+    処理の詳細:
+      - .detach() で計算グラフから切り離し、.cpu() でCPUへ移動してから .numpy() を呼ぶ。
+    戻り値:
+      - np.ndarray: 変換結果のNumPy配列。
+    """
     return x.detach().cpu().numpy()
 
 
@@ -124,11 +146,30 @@ class MiniSom:
 
     # ---------- 外部制御 ----------
     def set_total_iterations(self, total_iters: int):
-        """学習全体の反復回数を設定（σ減衰の基準）。複数回train_batchを呼ぶ前に設定してください。"""
+        """
+        概要:
+          学習全体で見込む総反復回数を設定し、σ（近傍幅）の減衰スケジュールの基準にする。
+        引数:
+          - total_iters (int): 学習全体の反復回数（train_batchを分割呼び出しする場合も合計値）。
+        処理の詳細:
+          - self.total_iters を更新。train_batch 内で self.global_iter と合わせて σ を計算。
+        戻り値:
+          - なし
+        """
         self.total_iters = int(total_iters)
 
     def set_medoid_replace_every(self, k: Optional[int]):
-        """k反復ごとにメドイド置換（各ノード重みを距離的に最も近いサンプルへ置換）を行う。Noneまたは0で無効。"""
+        """
+        概要:
+          k 反復ごとに“メドイド置換”を行う頻度を設定する。None/0 の場合は無効。
+        引数:
+          - k (Optional[int]): 置換頻度（例: 100 なら100反復ごと）。None または 0 で無効。
+        処理の詳細:
+          - train_batch の各反復末に条件を満たせば、各ノードの重みを
+            そのノードに割り当てられたサンプルの中で最も距離が近いサンプルへ置き換える。
+        戻り値:
+          - なし
+        """
         if k is None or k <= 0:
             self.medoid_replace_every = None
         else:
@@ -136,8 +177,14 @@ class MiniSom:
 
     def set_eval_indices(self, idx: Optional[np.ndarray]):
         """
-        評価（quantization_error/predict等の固定評価で使用）用のインデックスを設定。
-        Noneで解除。idxはデータ配列に対する行インデックス。
+        概要:
+          評価時（quantization_error/predict等）に用いる固定サンプルの行インデックスを設定する。
+        引数:
+          - idx (Optional[np.ndarray]): データ配列に対する行インデックス配列。None で固定評価を解除。
+        処理の詳細:
+          - self.eval_indices をTensor化して保持。quantization_error でサンプリングの揺らぎを抑える用途に有効。
+        戻り値:
+          - なし
         """
         if idx is None:
             self.eval_indices = None
@@ -146,12 +193,32 @@ class MiniSom:
 
     # ---------- ユーティリティ ----------
     def get_weights(self) -> np.ndarray:
+        """
+        概要:
+          現在のSOMノード重みを (x, y, H*W) 形状のNumPy配列として取得する。
+        引数:
+          - なし（内部状態から取得）
+        処理の詳細:
+          - (m,H,W) の重みを (x,y,H*W) に整形し、CPUへ移してNumPy化。
+        戻り値:
+          - np.ndarray: 形状 (x, y, H*W) の重み配列。
+        """
         H, W = self.field_shape
         w_flat = self.weights.reshape(self.m, H * W)
         w_grid = w_flat.reshape(self.x, self.y, H * W)
         return _as_numpy(w_grid)
 
     def random_weights_init(self, data: np.ndarray):
+        """
+        概要:
+          入力データからランダムにサンプリングして、SOM重みを初期化する。
+        引数:
+          - data (np.ndarray): 形状 (N, H*W) の入力データ。
+        処理の詳細:
+          - N < m なら重複ありで、N >= m なら重複なしで m サンプルを抽出し、(m,H,W) に整形して設定。
+        戻り値:
+          - なし
+        """
         H, W = self.field_shape
         n = data.shape[0]
         if n < self.m:
@@ -163,6 +230,17 @@ class MiniSom:
 
     # ---------- スケジューラ ----------
     def _sigma_at_val(self, t: int, max_iter: int) -> float:
+        """
+        概要:
+          学習反復 t における近傍幅 σ を減衰スケジュールに基づいて計算する。
+        引数:
+          - t (int): 現在の学習反復（グローバル）。
+          - max_iter (int): 想定する総反復数（set_total_iterations で設定）。
+        処理の詳細:
+          - 'asymptotic_decay' または 'linear_decay' に従って σ を計算。
+        戻り値:
+          - float: 現在の σ 値。
+        """
         if self.sigma_decay == 'asymptotic_decay':
             return self.sigma0 / (1 + t / (max_iter / 2.0))
         elif self.sigma_decay == 'linear_decay':
@@ -173,6 +251,17 @@ class MiniSom:
     # ---------- 近傍関数 ----------
     @torch.no_grad()
     def _neighborhood(self, bmu_flat: Tensor, sigma: float) -> Tensor:
+        """
+        概要:
+          BMUノードを中心としたガウシアン近傍重み h を計算する。
+        引数:
+          - bmu_flat (Tensor): 各サンプルのBMUをフラットインデックスで表した (B,) テンソル。
+          - sigma (float): 近傍幅。
+        処理の詳細:
+          - SOMグリッド座標上のユークリッド距離の二乗 d^2 を計算し、h = exp(-d^2/(2σ^2)) を返す。
+        戻り値:
+          - Tensor: 形状 (B, m) の近傍重み行列。
+        """
         bmu_xy = self.grid_coords[bmu_flat]  # (B,2)
         d2 = ((bmu_xy.unsqueeze(1) - self.grid_coords.unsqueeze(0)) ** 2).sum(dim=-1)  # (B,m)
         h = torch.exp(-d2 / (2 * (sigma ** 2) + 1e-9))
@@ -181,12 +270,31 @@ class MiniSom:
     # ---------- 内部ヘルパ（SSIM） ----------
     @torch.no_grad()
     def _ensure_kernel5(self):
+        """
+        概要:
+          SSIM計算に用いる移動平均カーネル（self._kernel5）を遅延初期化する。
+        引数:
+          - なし（内部状態を参照）
+        処理の詳細:
+          - まだ作成されていなければ、(1,1,win,win) の平均フィルタを生成して保持。
+        戻り値:
+          - なし
+        """
         if self._kernel5 is None:
             k = torch.ones((1, 1, self._win5_size, self._win5_size), device=self.device, dtype=self.dtype) / float(self._win5_size * self._win5_size)
             self._kernel5 = k
 
     def _ssim_pad_tuple(self) -> Tuple[int, int, int, int]:
-        # Asymmetric SAME padding for arbitrary window size (odd/even)
+        """
+        概要:
+          任意の窓サイズ（奇数/偶数）に対して出力サイズを維持する非対称SAMEパディング量を返す。
+        引数:
+          - なし（self._win5_size を参照）
+        処理の詳細:
+          - 左右/上下で (pl, pr, pt, pb) を計算（偶数長では左右非対称になる）。
+        戻り値:
+          - Tuple[int,int,int,int]: (left, right, top, bottom) のパディング。
+        """
         k = int(self._win5_size)
         pl = k // 2
         pr = k - 1 - pl
@@ -267,8 +375,15 @@ class MiniSom:
     @torch.no_grad()
     def _kappa_field(self, X: Tensor) -> Tensor:
         """
-        Curvature field κ = div(∇X/|∇X|) computed with centered differences on the inner common grid.
-        Input: X (B,H,W), Output: (B,H-3,W-3)
+        概要:
+          κ(X) = div(∇X/|∇X|) を内側グリッドで中心差分により計算し、κの2D場を返す。
+        引数:
+          - X (Tensor): 入力2D場のバッチ (B,H,W)。
+        処理の詳細:
+          - 勾配 (gx, gy) とその正規化 (nx, ny) を算出。
+          - 中心差分で ∂nx/∂x + ∂ny/∂y を評価し、周縁2セル分を除いた (H-3,W-3) を返す。
+        戻り値:
+          - Tensor: 形状 (B,H-3,W-3) の曲率場。
         """
         eps = 1e-12
         B, H, W = X.shape
@@ -310,7 +425,16 @@ class MiniSom:
     @torch.no_grad()
     def _s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         """
-        Xb: (B,H,W) 戻り (B,m) S1距離
+        概要:
+          Teweles–Wobus S1 距離をサンプル一括で全ノードに対して計算する。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード側の分割処理チャンクサイズ。None なら self.nodes_chunk。
+        処理の詳細:
+          - 入力のx/y方向一次差分を計算し、各ノード重みの差分と比較。
+          - |∇X-∇W| の総和を max(|∇X|,|∇W|) の総和で割り、100倍したS1を (B,m) で返す。
+        戻り値:
+          - Tensor: 形状 (B,m) のS1距離。
         """
         if nodes_chunk is None:
             nodes_chunk = self.nodes_chunk
@@ -340,6 +464,17 @@ class MiniSom:
 
     @torch.no_grad()
     def _s1k_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          S1 と κ（Kappa 曲率）距離を行方向 min–max 正規化した後、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - _s1_distance_batch と _kappa_distance_batch を計算し、各行で min–max 正規化 → RMS 合成。
+        戻り値:
+          - Tensor: 形状 (B,m) の合成距離。
+        """
         if nodes_chunk is None:
             nodes_chunk = self.nodes_chunk
         d1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
@@ -687,6 +822,17 @@ class MiniSom:
 
     @torch.no_grad()
     def _distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          現在設定されている activation_distance に応じて、(B,m) の距離行列を返すディスパッチャ。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - 's1'/'euclidean'/'ssim5'/'kappa'/'s1k'/'emd' の各実装を呼び分ける。
+        戻り値:
+          - Tensor: 形状 (B,m) の距離。
+        """
         if self.activation_distance == 's1':
             return self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'euclidean':
@@ -704,6 +850,17 @@ class MiniSom:
 
     @torch.no_grad()
     def bmu_indices(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          入力バッチ各サンプルに対して、最短距離ノード（BMU）のフラットインデックスを返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): 距離計算でのノード分割チャンク。
+        処理の詳細:
+          - _distance_batch で (B,m) の距離を求め、各行の最小位置をargminで取得。
+        戻り値:
+          - Tensor: 形状 (B,) のBMUフラットインデックス。
+        """
         dists = self._distance_batch(Xb, nodes_chunk=nodes_chunk)
         bmu = torch.argmin(dists, dim=1)
         return bmu
@@ -711,6 +868,17 @@ class MiniSom:
     # ---------- 距離計算（バッチ→単一参照：メドイド置換等で使用） ----------
     @torch.no_grad()
     def _euclidean_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        概要:
+          参照1枚 ref に対する各サンプルのユークリッド距離（L2）を計算する。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - ref (Tensor): 参照 (H,W)。
+        処理の詳細:
+          - 差分の二乗和をとり平方根を取って (B,) の距離ベクトルを返す。
+        戻り値:
+          - Tensor: 形状 (B,) の距離。
+        """
         # Xb: (B,H,W), ref: (H,W) -> (B,)
         diff = Xb - ref.view(1, *ref.shape)
         d2 = (diff * diff).sum(dim=(1, 2))
@@ -718,6 +886,17 @@ class MiniSom:
 
     @torch.no_grad()
     def _ssim5_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        概要:
+          5x5 窓（C=0）のSSIMに基づく対参照距離 D = 1 - mean(SSIM_map) を計算する。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - ref (Tensor): 参照 (H,W)。
+        処理の詳細:
+          - 反射パディングと移動平均により局所統計を算出し、SSIMマップを平均後 1-SSIM を距離とする。
+        戻り値:
+          - Tensor: 形状 (B,) の距離。
+        """
         # 1 - mean(SSIM_map(5x5, C=0)) 対参照
         self._ensure_kernel5()
         eps = 1e-12
@@ -750,6 +929,17 @@ class MiniSom:
 
     @torch.no_grad()
     def _s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        概要:
+          対参照の Teweles–Wobus S1 距離を計算する。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - ref (Tensor): 参照 (H,W)。
+        処理の詳細:
+          - x/y方向の一次差分を用いて |∇X-∇ref| / max(|∇X|,|∇ref|) を計算し、100倍して返す。
+        戻り値:
+          - Tensor: 形状 (B,) のS1距離。
+        """
         dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
         dXdy = Xb[:, 1:, :] - Xb[:, :-1, :]
         dRdx = ref[:, 1:] - ref[:, :-1]
@@ -765,7 +955,15 @@ class MiniSom:
     @torch.no_grad()
     def _kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
-        Kappa curvature distance to ref in [0,1]: D_k = 0.5 * Σ|κ(X)-κ(ref)| / Σ max(|κ(X)|,|κ(ref)|)
+        概要:
+          対参照の Kappa 曲率距離 D_k を [0,1] で計算する。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - ref (Tensor): 参照 (H,W)。
+        処理の詳細:
+          - κ(X)=div(∇X/|∇X|) を内側グリッドで算出し、0.5 * Σ|κ(X)-κ(ref)| / Σmax(|κ(X)|,|κ(ref)|) を返す。
+        戻り値:
+          - Tensor: 形状 (B,) の距離。
         """
         eps = 1e-12
         kx = self._kappa_field(Xb)                       # (B,hk,wk)
@@ -776,6 +974,17 @@ class MiniSom:
 
     @torch.no_grad()
     def _s1k_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        概要:
+          対参照の S1 と κ 距離を行方向min–max正規化し、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - ref (Tensor): 参照 (H,W)。
+        処理の詳細:
+          - _s1_to_ref, _kappa_to_ref を計算し、min–max正規化後に RMS 合成。
+        戻り値:
+          - Tensor: 形状 (B,) の合成距離。
+        """
         eps = 1e-12
         d1 = self._s1_to_ref(Xb, ref)
         dk = self._kappa_to_ref(Xb, ref)
@@ -820,8 +1029,24 @@ class MiniSom:
                     update_per_iteration: bool = False,
                     shuffle: bool = True):
         """
-        σは self.total_iters を基準に self.global_iter + it で一方向に減衰。
-        複数回に分けて呼んでも、set_total_iterations(total) 済みなら継続減衰します。
+        概要:
+          ミニバッチ版のバッチSOM学習を実行する。BMU算出→ガウシアン近傍重みによる分子/分母の累積→一括更新。
+        引数:
+          - data (np.ndarray): 学習データ (N, H*W)。
+          - num_iteration (int): 今回実行する反復回数（self.global_iterに加算される）。
+          - batch_size (int): ミニバッチサイズ。
+          - verbose (bool): tqdm による進捗表示の有無。
+          - log_interval (int): 量子化誤差（QE）を記録する間隔（反復数）。
+          - update_per_iteration (bool): 反復内でも逐次更新を行うか（Trueなら分子/分母をその都度反映）。
+          - shuffle (bool): 各反復のデータ順序をランダム化するか。
+        処理の詳細:
+          - total_iters が未設定なら今回の num_iteration を総回数とみなす。
+          - 各反復で σ をスケジュールに従い更新しつつ、全データをミニバッチで走査。
+          - BMU と近傍重みを用いて、各ノードの分子/分母を累積し、反復末に一括で weights を更新。
+          - medoid_replace_every が設定されていれば、指定周期で各ノード重みを最近傍サンプルへ置換。
+          - log_interval ごとに quantization_error を計算し履歴に格納。
+        戻り値:
+          - List[float]: 収集した量子化誤差（QE）の履歴。
         """
         N, D = data.shape
         H, W = self.field_shape
@@ -905,6 +1130,19 @@ class MiniSom:
     # ---------- 評価 ----------
     @torch.no_grad()
     def quantization_error(self, data: np.ndarray, sample_limit: Optional[int] = None, batch_size: int = 64) -> float:
+        """
+        概要:
+          量子化誤差（QE）を計算する。各サンプルに対してBMUまでの距離の平均。
+        引数:
+          - data (np.ndarray): 入力データ (N, H*W)。
+          - sample_limit (Optional[int]): サンプリングして評価する上限数（None なら全件）。
+          - batch_size (int): バッチ分割のサイズ。
+        処理の詳細:
+          - eval_indices が設定されていれば固定インデックスに対して評価し、安定した比較を可能にする。
+          - _distance_batch を用いて最小距離を集計し、平均を返す。
+        戻り値:
+          - float: QE の平均値。
+        """
         N, D = data.shape
         H, W = self.field_shape
         if self.eval_indices is not None:
@@ -929,6 +1167,17 @@ class MiniSom:
 
     @torch.no_grad()
     def predict(self, data: np.ndarray, batch_size: int = 64) -> np.ndarray:
+        """
+        概要:
+          入力データ各サンプルのBMU座標 (x,y) を推論する。
+        引数:
+          - data (np.ndarray): 入力データ (N, H*W)。
+          - batch_size (int): 距離計算のバッチサイズ。
+        処理の詳細:
+          - _distance_batch → argmin によりフラットインデックスを取得し、(x,y) に変換して返す。
+        戻り値:
+          - np.ndarray: 形状 (N,2) の BMU 座標配列（列順は [x, y]）。
+        """
         N, D = data.shape
         H, W = self.field_shape
         X = _to_device(data, self.device, self.dtype).reshape(N, H, W)
