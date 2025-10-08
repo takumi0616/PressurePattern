@@ -38,7 +38,7 @@
 - 依存: xarray, numpy, scipy, shapely, matplotlib, cartopy, pandas, tqdm, Pillow
 
 実行例:
-  nohup python low_surface_locate.py --workers 24 > low_surface_locate.out 2>&1 &
+nohup python low_surface_locate.py --workers 24 > low_surface_locate.out 2>&1 &
 
 """
 
@@ -152,11 +152,12 @@ def _worker_minima(ti: int,
     slp_pa = ds["msl"].isel(valid_time=ti).values
     slp_hpa = to_hpa(slp_pa)
     slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+    slp_anom_sub = slp_sub - np.nanmean(slp_sub)
 
     if method == "user":
-        mask = detect_centers_user(slp_sub, radius=user_radius, sigma=user_sigma)
+        mask = detect_centers_user(slp_anom_sub, radius=user_radius, sigma=user_sigma)
     else:
-        mask = detect_centers_storm(slp_sub, nsize=storm_nsize)
+        mask = detect_centers_storm(slp_anom_sub, nsize=storm_nsize)
 
     ys, xs = np.where(mask)
     items: List[Tuple[float, float, float]] = []
@@ -186,31 +187,32 @@ def _worker_plot_compare(ti: int,
     slp_pa = ds["msl"].isel(valid_time=ti).values
     slp_hpa = to_hpa(slp_pa)
     slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+    slp_anom_sub = slp_sub - np.nanmean(slp_sub)
 
-    # ユーザ法
-    mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
-    mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+    # ユーザ法（領域平均を差し引いた偏差で検出）
+    mask_user_low = detect_centers_user(slp_anom_sub, radius=used_r, sigma=used_s)
+    mask_user_high = detect_centers_user_high(slp_anom_sub, radius=used_r, sigma=used_s)
     low_n = int(np.count_nonzero(mask_user_low))
     high_n = int(np.count_nonzero(mask_user_high))
 
-    # storm 法
-    mask_storm_low = detect_centers_storm(slp_sub, nsize=storm_nsize)
-    mask_storm_high = detect_centers_storm_high(slp_sub, nsize=storm_nsize)
+    # storm 法（偏差で検出：等号判定は一定オフセットでは不変）
+    mask_storm_low = detect_centers_storm(slp_anom_sub, nsize=storm_nsize)
+    mask_storm_high = detect_centers_storm_high(slp_anom_sub, nsize=storm_nsize)
 
     proj = ccrs.PlateCarree()
     fig = plt.figure(figsize=(18, 8))
     ax1 = plt.subplot(1, 2, 1, projection=proj)
     ax2 = plt.subplot(1, 2, 2, projection=proj)
 
-    cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
-    _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+    cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_anom_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+    _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_anom_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
 
     try:
         if cf1 is not None:
             fig.subplots_adjust(bottom=0.16)
             cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
             cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
-            cb.set_label("MSLP anomaly (hPa)")
+            cb.set_label("Sea Level Pressure Anomaly (hPa)")
     except Exception:
         pass
 
@@ -374,10 +376,8 @@ def plot_msl_with_centers(save_path: Path,
     fig = plt.figure(figsize=(10, 8))
     ax = plt.axes(projection=proj)
     ax.set_extent([LON_W, LON_E, LAT_S, LAT_N], crs=proj)
-    ax.coastlines(resolution="10m", color="gray")
-    ax.add_feature(cfeature.BORDERS, linestyle=":", edgecolor="gray", alpha=0.7)
-    ax.add_feature(cfeature.LAKES, alpha=0.4)
-    ax.add_feature(cfeature.RIVERS, alpha=0.5)
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
+    ax.set_xticks([]); ax.set_yticks([])
 
     # 圧力偏差（領域平均を差し引き）で塗りつぶし（低=青, 高=赤）
     try:
@@ -385,14 +385,14 @@ def plot_msl_with_centers(save_path: Path,
         cf = ax.contourf(lon, lat, anom, levels=ANOM_LEVELS, cmap=ANOM_CMAP,
                          extend="both", alpha=ANOM_ALPHA, transform=proj)
         cb = fig.colorbar(cf, orientation="horizontal", aspect=65, shrink=0.75, pad=0.05, extendrect=True)
-        cb.set_label("MSLP anomaly (hPa)", size="large")
+        cb.set_label("Sea Level Pressure Anomaly (hPa)", size="large")
     except Exception:
         pass
 
     # 等圧線
     try:
-        cs = ax.contour(lon, lat, msl_hpa_2d, levels=MSLP_LEVELS, colors="black", linewidths=0.8, transform=proj)
-        ax.clabel(cs, fmt="%4.0f", fontsize=8)
+        anom = msl_hpa_2d - np.nanmean(msl_hpa_2d) if 'anom' not in locals() else anom
+        cs = ax.contour(lon, lat, anom, levels=ANOM_LEVELS, colors="k", linewidths=0.3, transform=proj)
     except Exception:
         # 等値線が引けないケース（領域外や NaN 過多）を許容
         pass
@@ -423,10 +423,8 @@ def draw_msl_panel(ax,
     """
     proj = ccrs.PlateCarree()
     ax.set_extent([LON_W, LON_E, LAT_S, LAT_N], crs=proj)
-    ax.coastlines(resolution="10m", color="gray")
-    ax.add_feature(cfeature.BORDERS, linestyle=":", edgecolor="gray", alpha=0.7)
-    ax.add_feature(cfeature.LAKES, alpha=0.4)
-    ax.add_feature(cfeature.RIVERS, alpha=0.5)
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
+    ax.set_xticks([]); ax.set_yticks([])
 
     cf = None
     try:
@@ -436,13 +434,13 @@ def draw_msl_panel(ax,
         if add_colorbar and cf is not None:
             fig = ax.get_figure()
             cb = fig.colorbar(cf, orientation="horizontal", aspect=65, shrink=0.75, pad=0.05, extendrect=True)
-            cb.set_label("MSLP anomaly (hPa)", size="large")
+            cb.set_label("Sea Level Pressure Anomaly (hPa)", size="large")
     except Exception:
         pass
 
     try:
-        cs = ax.contour(lon, lat, msl_hpa_2d, levels=MSLP_LEVELS, colors="black", linewidths=0.8, transform=proj)
-        ax.clabel(cs, fmt="%4.0f", fontsize=8)
+        anom = msl_hpa_2d - np.nanmean(msl_hpa_2d) if 'anom' not in locals() else anom
+        cs = ax.contour(lon, lat, anom, levels=ANOM_LEVELS, colors="k", linewidths=0.3, transform=proj)
     except Exception:
         pass
 
@@ -470,10 +468,8 @@ def draw_msl_panel_dual(ax,
     """
     proj = ccrs.PlateCarree()
     ax.set_extent([LON_W, LON_E, LAT_S, LAT_N], crs=proj)
-    ax.coastlines(resolution="10m", color="gray")
-    ax.add_feature(cfeature.BORDERS, linestyle=":", edgecolor="gray", alpha=0.7)
-    ax.add_feature(cfeature.LAKES, alpha=0.4)
-    ax.add_feature(cfeature.RIVERS, alpha=0.5)
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
+    ax.set_xticks([]); ax.set_yticks([])
 
     cf = None
     try:
@@ -483,13 +479,13 @@ def draw_msl_panel_dual(ax,
         if add_colorbar and cf is not None:
             fig = ax.get_figure()
             cb = fig.colorbar(cf, orientation="horizontal", aspect=65, shrink=0.75, pad=0.05, extendrect=True)
-            cb.set_label("MSLP anomaly (hPa)", size="large")
+            cb.set_label("Sea Level Pressure Anomaly (hPa)", size="large")
     except Exception:
         pass
 
     try:
-        cs = ax.contour(lon, lat, msl_hpa_2d, levels=MSLP_LEVELS, colors="black", linewidths=0.8, transform=proj)
-        ax.clabel(cs, fmt="%4.0f", fontsize=8)
+        anom = msl_hpa_2d - np.nanmean(msl_hpa_2d)
+        cs = ax.contour(lon, lat, anom, levels=ANOM_LEVELS, colors="k", linewidths=0.3, transform=proj)
     except Exception:
         pass
 
@@ -659,11 +655,12 @@ def build_minima_list_for_all_times(ds: xr.Dataset,
 
         # 範囲サブセット
         slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+        slp_anom_sub = slp_sub - np.nanmean(slp_sub)
 
         if method == "user":
-            mask = detect_centers_user(slp_sub, radius=user_radius, sigma=user_sigma)
+            mask = detect_centers_user(slp_anom_sub, radius=user_radius, sigma=user_sigma)
         elif method == "storm":
-            mask = detect_centers_storm(slp_sub, nsize=storm_nsize)
+            mask = detect_centers_storm(slp_anom_sub, nsize=storm_nsize)
         else:
             raise ValueError("method must be 'user' or 'storm'")
 
@@ -840,9 +837,8 @@ def build_msl_tracking_frames_and_gif(out_dir_anim: Path,
         fig = plt.figure(figsize=(10, 8))
         ax = plt.axes(projection=proj)
         ax.set_extent([LON_W, LON_E, LAT_S, LAT_N], crs=proj)
-        ax.coastlines(resolution="10m", color="gray")
-        ax.add_feature(cfeature.BORDERS, linestyle=":", edgecolor="gray", alpha=0.7)
-        ax.gridlines(draw_labels=False, color="gray", alpha=0.6, linestyle="-")
+        ax.add_feature(cfeature.COASTLINE.with_scale('50m'), edgecolor='black', linewidth=0.8)
+        ax.set_xticks([]); ax.set_yticks([])
 
         # 圧力偏差の塗りつぶし（低=青, 高=赤）
         try:
@@ -850,13 +846,12 @@ def build_msl_tracking_frames_and_gif(out_dir_anim: Path,
             cf = ax.contourf(lon_sub, lat_sub, anom, levels=ANOM_LEVELS, cmap=ANOM_CMAP,
                              extend="both", alpha=ANOM_ALPHA, transform=proj)
             cb = fig.colorbar(cf, orientation="horizontal", aspect=65, shrink=0.75, pad=0.05, extendrect=True)
-            cb.set_label("MSLP anomaly (hPa)", size="large")
+            cb.set_label("Sea Level Pressure Anomaly (hPa)", size="large")
         except Exception:
             pass
 
         try:
-            cs = ax.contour(lon_sub, lat_sub, slp_sub, levels=MSLP_LEVELS, colors="black", linewidths=0.8, transform=proj)
-            ax.clabel(cs, fmt="%4.0f", fontsize=8)
+            cs = ax.contour(lon_sub, lat_sub, anom, levels=ANOM_LEVELS, colors="k", linewidths=0.3, transform=proj)
         except Exception:
             pass
 
@@ -903,8 +898,8 @@ def main():
     parser.add_argument("--do-gif", action="store_true", help="最長トラックの GIF も作成する")
     # スイープ実行オプション（ユーザ法/CLの r, sigma を複数試行）
     parser.add_argument(
-        "--sweep-auto", type=int, default=0,
-        help="ユーザ法/CLパラメータの既定セットを上位N件自動生成して試行（0で無効, 推奨: 10）"
+        "--sweep-auto", type=int, default=10,
+        help="ユーザ法/CLパラメータの既定セットを上位N件自動生成して試行（0で無効, 既定: 10）"
     )
     parser.add_argument(
         "--sweep-pairs", type=str, default=None,
@@ -982,16 +977,29 @@ def main():
 
     def _default_easy_pairs(n: int, include_baseline: bool = True) -> List[Tuple[int, float]]:
         cand: List[Tuple[int, float]] = []
+        # ベースライン（現在値）
         if include_baseline:
-            cand.append((USER_RADIUS, USER_SIGMA))
-        # マイルドに増やす（推奨開始点）
-        for r in [4, 3]:
-            for s in [1.5, 1.2, 1.0]:
-                cand.append((r, s))
-        # 積極的に増やす（ノイズ許容）
-        for r in [2, 1]:
+            cand.append((USER_RADIUS, USER_SIGMA))  # 例: (6, 2.0)
+
+        # まず「検出数をマイルドに増やす」推奨セット（例示どおりを優先）
+        # 例: [6,2.0], [4,2.0], [6,1.0], [4,1.0], ...
+        cand.extend([
+            (4, 2.0),
+            (6, 1.5),
+            (6, 1.2),
+            (6, 1.0),
+            (4, 1.5),
+            (4, 1.2),
+            (4, 1.0),
+            (3, 1.2),
+            (3, 1.0),
+        ])
+
+        # 次に「積極的に増やす（ノイズ許容）」セット
+        for r in [3, 2, 1]:
             for s in [0.8, 0.6, 0.4]:
                 cand.append((r, s))
+
         # 重複排除＋上位n件
         uniq: List[Tuple[int, float]] = []
         seen = set()
@@ -1042,17 +1050,18 @@ def main():
                 slp_pa = ds["msl"].isel(valid_time=ti).values
                 slp_hpa = to_hpa(slp_pa)
                 slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+                slp_anom_sub = slp_sub - np.nanmean(slp_sub)
 
-                mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
-                mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+                mask_user_low = detect_centers_user(slp_anom_sub, radius=used_r, sigma=used_s)
+                mask_user_high = detect_centers_user_high(slp_anom_sub, radius=used_r, sigma=used_s)
                 low_n = int(np.count_nonzero(mask_user_low))
                 high_n = int(np.count_nonzero(mask_user_high))
                 det_stats["times"].append(pd.to_datetime(times[ti]))
                 det_stats["low_counts"].append(low_n)
                 det_stats["high_counts"].append(high_n)
 
-                mask_storm_low = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
-                mask_storm_high = detect_centers_storm_high(slp_sub, nsize=args.storm_nsize)
+                mask_storm_low = detect_centers_storm(slp_anom_sub, nsize=args.storm_nsize)
+                mask_storm_high = detect_centers_storm_high(slp_anom_sub, nsize=args.storm_nsize)
 
                 tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
 
@@ -1064,15 +1073,15 @@ def main():
                 title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
                 title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
 
-                cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
-                _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+                cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_anom_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+                _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_anom_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
 
                 try:
                     if cf1 is not None:
                         fig.subplots_adjust(bottom=0.16)
                         cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
                         cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
-                        cb.set_label("MSLP anomaly (hPa)")
+                        cb.set_label("Sea Level Pressure Anomaly (hPa)")
                 except Exception:
                     pass
 
@@ -1247,17 +1256,18 @@ def main():
             slp_pa = ds["msl"].isel(valid_time=ti).values
             slp_hpa = to_hpa(slp_pa)
             slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+            slp_anom_sub = slp_sub - np.nanmean(slp_sub)
 
-            mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
-            mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+            mask_user_low = detect_centers_user(slp_anom_sub, radius=used_r, sigma=used_s)
+            mask_user_high = detect_centers_user_high(slp_anom_sub, radius=used_r, sigma=used_s)
             low_n = int(np.count_nonzero(mask_user_low))
             high_n = int(np.count_nonzero(mask_user_high))
             det_stats["times"].append(pd.to_datetime(times[ti]))
             det_stats["low_counts"].append(low_n)
             det_stats["high_counts"].append(high_n)
 
-            mask_storm_low = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
-            mask_storm_high = detect_centers_storm_high(slp_sub, nsize=args.storm_nsize)
+            mask_storm_low = detect_centers_storm(slp_anom_sub, nsize=args.storm_nsize)
+            mask_storm_high = detect_centers_storm_high(slp_anom_sub, nsize=args.storm_nsize)
 
             tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
 
@@ -1269,14 +1279,14 @@ def main():
             title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
             title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
 
-            cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
-            _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+            cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_anom_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+            _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_anom_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
 
             try:
                 if cf1 is not None:
                     cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
                     cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
-                    cb.set_label("MSLP anomaly (hPa)")
+                    cb.set_label("Sea Level Pressure Anomaly (hPa)")
             except Exception:
                 pass
 
