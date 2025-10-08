@@ -116,9 +116,7 @@ pkill -f "main_v8.py"
 - 指定 GPU だけを止めたい場合はコマンドラインを絞り込む:
 
 ```bash
-pkill -f "main_v8.py.*--gpu 0"
-# または明示 device 指定で動かしているなら
-pkill -f "main_v8.py.*--device cuda:0"
+pkill -f "low_surface_locate.py"
 ```
 
 - 個別に PID を kill（安全策）:

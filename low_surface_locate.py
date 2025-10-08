@@ -38,7 +38,7 @@
 - 依存: xarray, numpy, scipy, shapely, matplotlib, cartopy, pandas, tqdm, Pillow
 
 実行例:
-  nohup python low_surface_locate.py --years 1980 1990 --do-gif > low_surface_locate.out 2>&1 &
+  nohup python low_surface_locate.py --workers 24 > low_surface_locate.out 2>&1 &
 
 """
 
@@ -63,6 +63,8 @@ from scipy.ndimage import gaussian_filter, minimum_filter, maximum_filter
 from shapely.geometry import Point
 from PIL import Image
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 
 # =========================
@@ -107,18 +109,141 @@ GIF_EVERY = None
 
 
 # =========================
+# 並列実行ユーティリティ
+# =========================
+
+_DS_WORKER = None
+_DS_PATH = None
+
+
+def _worker_init(nc_path_str: str):
+    """
+    各プロセスで NetCDF を遅延オープンして共有する初期化関数
+    """
+    global _DS_WORKER, _DS_PATH
+    _DS_PATH = nc_path_str
+    _DS_WORKER = open_dataset_lazy(Path(_DS_PATH))
+
+
+def _get_ds_worker() -> xr.Dataset:
+    """
+    ワーカープロセス内で Dataset を取得（未初期化ならオープン）
+    """
+    global _DS_WORKER, _DS_PATH
+    if _DS_WORKER is None:
+        if _DS_PATH is None:
+            raise RuntimeError("Worker dataset path is not initialized.")
+        _DS_WORKER = open_dataset_lazy(Path(_DS_PATH))
+    return _DS_WORKER
+
+
+def _worker_minima(ti: int,
+                   method: str,
+                   user_radius: int,
+                   user_sigma: float,
+                   storm_nsize: int) -> Tuple[int, List[Tuple[float, float, float]]]:
+    """
+    1時刻の minima を計算して返す
+    """
+    ds = _get_ds_worker()
+    ds_lats = ds["latitude"].values
+    ds_lons = ds["longitude"].values
+
+    slp_pa = ds["msl"].isel(valid_time=ti).values
+    slp_hpa = to_hpa(slp_pa)
+    slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+
+    if method == "user":
+        mask = detect_centers_user(slp_sub, radius=user_radius, sigma=user_sigma)
+    else:
+        mask = detect_centers_storm(slp_sub, nsize=storm_nsize)
+
+    ys, xs = np.where(mask)
+    items: List[Tuple[float, float, float]] = []
+    for y, x in zip(ys, xs):
+        lon_v = float(lon_sub[x])
+        lat_v = float(lat_sub[y])
+        pres_v = float(slp_sub[y, x])
+        if LON_W <= lon_v <= LON_E and LAT_S <= lat_v <= LAT_N:
+            items.append((lon_v, lat_v, pres_v))
+    return ti, items
+
+def _worker_plot_compare(ti: int,
+                         used_r: int,
+                         used_s: float,
+                         storm_nsize: int,
+                         out_png_path_str: str,
+                         title1: str,
+                         title2: str) -> Tuple[int, int, int]:
+    """
+    1時刻ぶんの比較図（ユーザ法 vs storm法）を生成し保存。
+    戻り値: (ti, low_count_user, high_count_user)
+    """
+    ds = _get_ds_worker()
+    ds_lats = ds["latitude"].values
+    ds_lons = ds["longitude"].values
+
+    slp_pa = ds["msl"].isel(valid_time=ti).values
+    slp_hpa = to_hpa(slp_pa)
+    slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+
+    # ユーザ法
+    mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
+    mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+    low_n = int(np.count_nonzero(mask_user_low))
+    high_n = int(np.count_nonzero(mask_user_high))
+
+    # storm 法
+    mask_storm_low = detect_centers_storm(slp_sub, nsize=storm_nsize)
+    mask_storm_high = detect_centers_storm_high(slp_sub, nsize=storm_nsize)
+
+    proj = ccrs.PlateCarree()
+    fig = plt.figure(figsize=(18, 8))
+    ax1 = plt.subplot(1, 2, 1, projection=proj)
+    ax2 = plt.subplot(1, 2, 2, projection=proj)
+
+    cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+    _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+
+    try:
+        if cf1 is not None:
+            fig.subplots_adjust(bottom=0.16)
+            cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
+            cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
+            cb.set_label("MSLP anomaly (hPa)")
+    except Exception:
+        pass
+
+    out_png_path = Path(out_png_path_str)
+    out_png_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    return ti, low_n, high_n
+
+
+# =========================
 # ユーティリティ
 # =========================
 
-def ensure_dirs() -> Dict[str, Path]:
+def ensure_dirs(base_root: Optional[Path] = None, tag: Optional[str] = None) -> Dict[str, Path]:
+    """
+    出力ディレクトリを作成して返す。
+    - base_root: ルート（未指定は RESULT_ROOT）
+    - tag: スイープ時などのサブタグ（例: 'sweep/user_R4_S1p2'）
+    """
+    root = base_root if base_root is not None else RESULT_ROOT
+    if tag:
+        root = root / "sweep" / tag
+
     out = {
-        "root": RESULT_ROOT,
-        "algo_user": RESULT_ROOT / "algo_user" / "png",
-        "algo_storm": RESULT_ROOT / "algo_storm" / "png",
-        "compare": RESULT_ROOT / "compare" / "png",
-        "tracking": RESULT_ROOT / "tracking",
-        "anim": RESULT_ROOT / "anim",
-        "txt": RESULT_ROOT / "txt",
+        "root": root,
+        "algo_user": root / "algo_user" / "png",
+        "algo_storm": root / "algo_storm" / "png",
+        "compare": root / "compare" / "png",
+        "tracking": root / "tracking",
+        "anim": root / "anim",
+        "txt": root / "txt",
     }
     for p in out.values():
         p.mkdir(parents=True, exist_ok=True)
@@ -453,6 +578,18 @@ def detect_centers_storm(slp_hpa_2d: np.ndarray, nsize: int = STORM_NSIZE) -> np
     return local_min
 
 
+def detect_centers_storm_high(slp_hpa_2d: np.ndarray, nsize: int = STORM_NSIZE) -> np.ndarray:
+    """
+    storm_tracking 実装（高気圧）: 平滑なし → maximum_filter(size=nsize) と一致するセルを抽出（等号判定）
+    戻り値: bool mask (True=高気圧中心)
+    """
+    data = slp_hpa_2d.astype(np.float32)
+    data_filled = np.where(np.isnan(data), -np.inf, data)
+    data_ext = maximum_filter(data_filled, size=nsize, mode="nearest")
+    local_max = data_filled == data_ext
+    return local_max
+
+
 # =========================
 # storm_tracking 追跡
 # =========================
@@ -472,7 +609,9 @@ def build_minima_list_for_all_times(ds: xr.Dataset,
                                     user_sigma: float = USER_SIGMA,
                                     storm_nsize: int = STORM_NSIZE,
                                     indices: Optional[np.ndarray] = None,
-                                    extent_clip: bool = True) -> List[List[Tuple[float, float, float]]]:
+                                    extent_clip: bool = True,
+                                    ds_path: Optional[Path] = None,
+                                    n_workers: int = 1) -> List[List[Tuple[float, float, float]]]:
     """
     指定インデックス列（indices）が与えられた時刻について、minima の一覧を作る。
     戻り値: minima_per_t[k] = [(lon, lat, pres_hPa), ...] （k は indices の走査順に対応）
@@ -492,6 +631,26 @@ def build_minima_list_for_all_times(ds: xr.Dataset,
         indices = np.arange(len(times))
 
     minima_per_t: List[List[Tuple[float, float, float]]] = []
+    # 並列実行（プロセス）パス: ds_path と n_workers が与えられた場合はワーカーで各時刻を処理
+    if (n_workers is not None) and (n_workers > 1) and (ds_path is not None):
+        if indices is None:
+            indices = np.arange(len(times))
+        idx_list = list(indices)
+        results_map: Dict[int, List[Tuple[float, float, float]]] = {}
+        with ProcessPoolExecutor(max_workers=int(n_workers), initializer=_worker_init, initargs=(str(ds_path),)) as ex:
+            futures = [
+                ex.submit(
+                    _worker_minima,
+                    int(ti), str(method),
+                    int(user_radius), float(user_sigma), int(storm_nsize)
+                )
+                for ti in idx_list
+            ]
+            for f in tqdm(as_completed(futures), total=len(futures), desc=f"Detect minima ({method}) [parallel]", unit="t"):
+                ti_ret, items = f.result()
+                results_map[int(ti_ret)] = items
+        minima_per_t = [results_map.get(int(ti), []) for ti in idx_list]
+        return minima_per_t
 
     for ti in tqdm(indices, desc=f"Detect minima ({method})", unit="t"):
         # 有効時刻のスライス → Pa → hPa
@@ -731,6 +890,7 @@ def main():
     parser.add_argument("--user-radius", type=int, default=USER_RADIUS, help="ユーザ法: 近傍半径 r")
     parser.add_argument("--user-sigma", type=float, default=USER_SIGMA, help="ユーザ法: ガウシアン σ")
     parser.add_argument("--storm-nsize", type=int, default=STORM_NSIZE, help="storm 法: minimum_filter のサイズ")
+    parser.add_argument("--workers", type=int, default=None, help="並列プロセス数（省略時は自動）。1で直列。")
     # CL（ユーザ法）ハイパーパラメータ（SOM側と整合する名称で上書き可）
     parser.add_argument("--cl-radius", type=int, default=None, help="CL/user法: 近傍半径 r の上書き（未指定で --user-radius を使用）")
     parser.add_argument("--cl-sigma", type=float, default=None, help="CL/user法: ガウシアン σ の上書き（未指定で --user-sigma を使用）")
@@ -741,6 +901,15 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="最大時刻数（None で全時刻）")
     parser.add_argument("--skip", type=int, default=1, help="時間の間引き（例: 24 → 1日毎に）")
     parser.add_argument("--do-gif", action="store_true", help="最長トラックの GIF も作成する")
+    # スイープ実行オプション（ユーザ法/CLの r, sigma を複数試行）
+    parser.add_argument(
+        "--sweep-auto", type=int, default=0,
+        help="ユーザ法/CLパラメータの既定セットを上位N件自動生成して試行（0で無効, 推奨: 10）"
+    )
+    parser.add_argument(
+        "--sweep-pairs", type=str, default=None,
+        help="ユーザ法/CLパラメータの手動指定。'r:s; r:s; ...' 形式（例: '6:2.0;4:2.0;6:1.0;4:1.0'）"
+    )
     args = parser.parse_args()
 
     out_dirs = ensure_dirs()
@@ -780,57 +949,340 @@ def main():
     sel_times = times[sel_idx]
     dt_hours_sel = compute_dt_hours(sel_times)
 
+    # ワーカープロセス数の決定（省略時は自動、上限抑制）
+    if getattr(args, "workers", None) is None:
+        try:
+            cpu = multiprocessing.cpu_count() or 1
+        except Exception:
+            cpu = 1
+        args.workers = max(1, min(24, int(cpu)))
+    else:
+        args.workers = max(1, int(args.workers))
+
+    # ---- パラメータスイープ（オプション） ----
+    def _sanitize_tag(r: int, s: float) -> str:
+        return f"user_R{int(r)}_S{str(float(s)).replace('.', 'p').replace('-', 'm')}"
+
+    def _parse_sweep_pairs(spec: Optional[str]) -> List[Tuple[int, float]]:
+        pairs: List[Tuple[int, float]] = []
+        if spec is None:
+            return pairs
+        for item in spec.split(";"):
+            it = item.strip()
+            if not it:
+                continue
+            try:
+                r_str, s_str = [x.strip() for x in it.split(":")]
+                r = int(float(r_str))
+                s = float(s_str)
+                pairs.append((r, s))
+            except Exception:
+                print(f"[WARN] 無視されたペア: '{it}'（形式は r:s;...）")
+        return pairs
+
+    def _default_easy_pairs(n: int, include_baseline: bool = True) -> List[Tuple[int, float]]:
+        cand: List[Tuple[int, float]] = []
+        if include_baseline:
+            cand.append((USER_RADIUS, USER_SIGMA))
+        # マイルドに増やす（推奨開始点）
+        for r in [4, 3]:
+            for s in [1.5, 1.2, 1.0]:
+                cand.append((r, s))
+        # 積極的に増やす（ノイズ許容）
+        for r in [2, 1]:
+            for s in [0.8, 0.6, 0.4]:
+                cand.append((r, s))
+        # 重複排除＋上位n件
+        uniq: List[Tuple[int, float]] = []
+        seen = set()
+        for r, s in cand:
+            key = (int(r), float(round(s, 2)))
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append((int(r), float(round(s, 2))))
+        return uniq[:max(0, int(n))]
+
+    def _run_single(used_r: int, used_s: float, tag: str) -> Dict[str, float]:
+        out_dirs_local = ensure_dirs(tag=tag)
+
+        # 低圧中心検出（ユーザ法 vs storm法）を並列表示で保存
+        det_stats = {"times": [], "low_counts": [], "high_counts": []}
+        idx_list = list(sel_idx)
+        tstr_map = {int(ti): pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H") for ti in idx_list}
+        results_map: Dict[int, Tuple[int, int]] = {}
+
+        if args.workers and args.workers > 1:
+            with ProcessPoolExecutor(max_workers=int(args.workers), initializer=_worker_init, initargs=(str(input_path),)) as ex:
+                futures = []
+                for ti in idx_list:
+                    tstr = tstr_map[int(ti)]
+                    out_png = out_dirs_local["compare"] / f"compare_{tstr}.png"
+                    title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
+                    title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
+                    futures.append(
+                        ex.submit(
+                            _worker_plot_compare,
+                            int(ti), int(used_r), float(used_s),
+                            int(args.storm_nsize), str(out_png), title1, title2
+                        )
+                    )
+                for f in tqdm(as_completed(futures), total=len(futures), desc=f"Plot (user vs storm) [{tag}] [parallel]", unit="t"):
+                    ti_ret, low_n, high_n = f.result()
+                    results_map[int(ti_ret)] = (int(low_n), int(high_n))
+            # 結果を時刻順に格納
+            for ti in idx_list:
+                det_stats["times"].append(pd.to_datetime(times[ti]))
+                low_n, high_n = results_map.get(int(ti), (0, 0))
+                det_stats["low_counts"].append(int(low_n))
+                det_stats["high_counts"].append(int(high_n))
+        else:
+            # 直列処理
+            for ti in tqdm(idx_list, desc=f"Plot (user vs storm) [{tag}]", unit="t"):
+                slp_pa = ds["msl"].isel(valid_time=ti).values
+                slp_hpa = to_hpa(slp_pa)
+                slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+
+                mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
+                mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+                low_n = int(np.count_nonzero(mask_user_low))
+                high_n = int(np.count_nonzero(mask_user_high))
+                det_stats["times"].append(pd.to_datetime(times[ti]))
+                det_stats["low_counts"].append(low_n)
+                det_stats["high_counts"].append(high_n)
+
+                mask_storm_low = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
+                mask_storm_high = detect_centers_storm_high(slp_sub, nsize=args.storm_nsize)
+
+                tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
+
+                proj = ccrs.PlateCarree()
+                fig = plt.figure(figsize=(18, 8))
+                ax1 = plt.subplot(1, 2, 1, projection=proj)
+                ax2 = plt.subplot(1, 2, 2, projection=proj)
+
+                title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
+                title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
+
+                cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+                _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+
+                try:
+                    if cf1 is not None:
+                        fig.subplots_adjust(bottom=0.16)
+                        cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
+                        cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
+                        cb.set_label("MSLP anomaly (hPa)")
+                except Exception:
+                    pass
+
+                out_png = out_dirs_local["compare"] / f"compare_{tstr}.png"
+                fig.savefig(out_png, dpi=180, bbox_inches="tight")
+                plt.close(fig)
+
+        # ユーザ法 検出統計
+        try:
+            total_steps = len(det_stats["times"])
+            larr = np.array(det_stats["low_counts"], dtype=int) if total_steps > 0 else np.array([], dtype=int)
+            harr = np.array(det_stats["high_counts"], dtype=int) if total_steps > 0 else np.array([], dtype=int)
+            n_low_pos = int((larr > 0).sum()) if total_steps > 0 else 0
+            n_high_pos = int((harr > 0).sum()) if total_steps > 0 else 0
+            n_both_pos = int(((larr > 0) & (harr > 0)).sum()) if total_steps > 0 else 0
+            n_none = int(((larr == 0) & (harr == 0)).sum()) if total_steps > 0 else 0
+            avg_low = float(larr.mean()) if total_steps > 0 else float("nan")
+            avg_high = float(harr.mean()) if total_steps > 0 else float("nan")
+
+            if len(sel_times) > 0:
+                date1 = pd.to_datetime(sel_times[0]).strftime("%Y-%m-%dT%H")
+                dateN = pd.to_datetime(sel_times[-1]).strftime("%Y-%m-%dT%H")
+            else:
+                date1, dateN = "NA", "NA"
+
+            df_counts = pd.DataFrame({
+                "time": [pd.to_datetime(t).strftime("%Y-%m-%dT%H") for t in det_stats["times"]],
+                "low_count": det_stats["low_counts"],
+                "high_count": det_stats["high_counts"],
+            })
+            out_counts_csv = out_dirs_local["txt"] / f"user_detect_counts_{date1}_{dateN}.csv"
+            df_counts.to_csv(out_counts_csv, index=False, encoding="utf-8-sig")
+
+            out_summary_txt = out_dirs_local["txt"] / f"user_detect_summary_{date1}_{dateN}.txt"
+            with out_summary_txt.open("w", encoding="utf-8") as fsum:
+                fsum.write(f"Detection summary (User method) for [{date1} .. {dateN}]\n")
+                fsum.write(f"Total timesteps: {total_steps}\n")
+                fsum.write(f"Low detected (>=1): {n_low_pos}  ({(n_low_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+                fsum.write(f"High detected(>=1): {n_high_pos}  ({(n_high_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+                fsum.write(f"Both detected     : {n_both_pos}  ({(n_both_pos/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+                fsum.write(f"None detected     : {n_none}  ({(n_none/total_steps*100.0 if total_steps>0 else 0):.2f}%)\n")
+                fsum.write(f"Avg # of lows per timestep : {avg_low:.3f}\n")
+                fsum.write(f"Avg # of highs per timestep: {avg_high:.3f}\n")
+
+            print(f"[STATS:{tag}] Steps={total_steps}, Low>=1={n_low_pos}, High>=1={n_high_pos}, Both={n_both_pos}, None={n_none}")
+            print(f"[STATS:{tag}] Avg lows/t={avg_low:.3f}, Avg highs/t={avg_high:.3f}")
+            print(f"[STATS:{tag}] -> CSV: {out_counts_csv}")
+            print(f"[STATS:{tag}] -> Summary: {out_summary_txt}")
+        except Exception as e:
+            print(f"[WARN:{tag}] Failed to build detection statistics: {e}")
+            total_steps = 0; n_low_pos = n_high_pos = n_both_pos = n_none = 0; avg_low = avg_high = float("nan")
+            out_counts_csv = out_dirs_local["txt"] / "NA.csv"
+            out_summary_txt = out_dirs_local["txt"] / "NA.txt"
+
+        # storm_tracking 互換の minima → トラック → 図
+        minima_per_t = build_minima_list_for_all_times(
+            ds=ds, times=sel_times, lats=ds_lats, lons=ds_lons,
+            method="storm", storm_nsize=args.storm_nsize,
+            user_radius=used_r, user_sigma=used_s,
+            indices=sel_idx, extent_clip=True,
+            ds_path=input_path, n_workers=args.workers
+        )
+        date1 = pd.to_datetime(sel_times[0]).strftime("%Y-%m-%dT%H") if len(sel_times) > 0 else "NA"
+        dateN = pd.to_datetime(sel_times[-1]).strftime("%Y-%m-%dT%H") if len(sel_times) > 0 else "NA"
+        out_min_txt = out_dirs_local["txt"] / f"era5_minimums_{date1}_{dateN}.txt"
+        save_minima_txt(out_min_txt, sel_times, minima_per_t)
+
+        buffer_deg = default_buffer_radius_deg(dt_hours_sel)
+        tracks = track_from_initial_time(minima_per_t, sel_times, dt_hours_sel, buffer_deg=buffer_deg)
+        out_trk_txt = out_dirs_local["txt"] / f"era5_tracks_{date1}.txt"
+        save_tracks_txt(out_trk_txt, tracks)
+
+        plot_tracks_map(out_dirs_local["tracking"] / f"tracks_{date1}.png", tracks,
+                        title=f"Tracks of all systems detected at {date1} (buffer={buffer_deg:.1f}°)")
+
+        long_tracks = [tr for tr in tracks if len(tr) >= MIN_TRACK_LEN]
+        if len(long_tracks) > 0:
+            plot_tracks_map(out_dirs_local["tracking"] / f"tracks_len_ge_{MIN_TRACK_LEN}_{date1}.png",
+                            long_tracks,
+                            title=f"Tracks (len ≥ {MIN_TRACK_LEN}) detected at {date1}")
+
+        if args.do_gif and len(tracks) > 0:
+            longest = max(tracks, key=lambda tr: len(tr))
+            anim_dir = out_dirs_local["anim"]
+            png_dir = anim_dir / "frames_longest"
+            build_msl_tracking_frames_and_gif(anim_dir, png_dir, ds_lons, ds_lats, ds, longest, every=GIF_EVERY)
+
+        print(f"[DONE:{tag}] All products saved under: {str(out_dirs_local['root'])}")
+
+        return {
+            "tag": tag,
+            "total_steps": total_steps,
+            "low_pos": n_low_pos,
+            "high_pos": n_high_pos,
+            "both_pos": n_both_pos,
+            "none": n_none,
+            "avg_low": avg_low,
+            "avg_high": avg_high,
+            "counts_csv": str(out_counts_csv),
+            "summary_txt": str(out_summary_txt),
+        }
+
+    # スイープの解決
+    sweep_pairs: List[Tuple[int, float]] = []
+    if args.sweep_pairs:
+        sweep_pairs.extend(_parse_sweep_pairs(args.sweep_pairs))
+    if args.sweep_auto and args.sweep_auto > 0:
+        sweep_pairs.extend(_default_easy_pairs(args.sweep_auto))
+    # 重複除去（順序維持）
+    _uniq: List[Tuple[int, float]] = []
+    _seen = set()
+    for r, s in sweep_pairs:
+        key = (int(r), float(s))
+        if key in _seen:
+            continue
+        _seen.add(key)
+        _uniq.append((int(r), float(s)))
+    sweep_pairs = _uniq
+
+    if len(sweep_pairs) > 0:
+        summaries = []
+        for (r, s) in sweep_pairs:
+            tag = _sanitize_tag(r, s)
+            summaries.append(_run_single(int(r), float(s), tag))
+        sum_dir = (RESULT_ROOT / "sweep" / "summary")
+        sum_dir.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(summaries)
+        out_summary_csv_all = sum_dir / "user_sweep_summary.csv"
+        df.to_csv(out_summary_csv_all, index=False, encoding="utf-8-sig")
+        print(f"[DONE] Sweep summary: {out_summary_csv_all}")
+        return
+
     # =============
     # 低圧中心検出（ユーザ法 vs storm法）を並列表示で保存
     # =============
     # 統計カウンタ（ユーザ法: 低/高の検出数を各時刻でカウント）
     det_stats = {"times": [], "low_counts": [], "high_counts": []}
-    for ti in tqdm(sel_idx, desc="Plot (user vs storm)", unit="t"):
-        slp_pa = ds["msl"].isel(valid_time=ti).values
-        slp_hpa = to_hpa(slp_pa)
-        slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
+    idx_list = list(sel_idx)
+    # CLパラメータ（ユーザ法）適用（上書きがあれば優先）
+    used_r = args.cl_radius if args.cl_radius is not None else args.user_radius
+    used_s = args.cl_sigma if args.cl_sigma is not None else args.user_sigma
+    tstr_map = {int(ti): pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H") for ti in idx_list}
+    results_map: Dict[int, Tuple[int, int]] = {}
 
-        # CLパラメータ（ユーザ法）適用（上書きがあれば優先）
-        used_r = args.cl_radius if args.cl_radius is not None else args.user_radius
-        used_s = args.cl_sigma if args.cl_sigma is not None else args.user_sigma
-        # ユーザ法: 低/高の両方を検出
-        mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
-        mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
-        # 統計: 各時刻の検出数を記録
-        low_n = int(np.count_nonzero(mask_user_low))
-        high_n = int(np.count_nonzero(mask_user_high))
-        det_stats["times"].append(pd.to_datetime(times[ti]))
-        det_stats["low_counts"].append(low_n)
-        det_stats["high_counts"].append(high_n)
-        # storm 法（従来通り: 低のみ）
-        mask_storm = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
+    if args.workers and args.workers > 1:
+        with ProcessPoolExecutor(max_workers=int(args.workers), initializer=_worker_init, initargs=(str(input_path),)) as ex:
+            futures = []
+            for ti in idx_list:
+                tstr = tstr_map[int(ti)]
+                out_png = out_dirs["compare"] / f"compare_{tstr}.png"
+                title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
+                title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
+                futures.append(
+                    ex.submit(
+                        _worker_plot_compare,
+                        int(ti), int(used_r), float(used_s),
+                        int(args.storm_nsize), str(out_png), title1, title2
+                    )
+                )
+            for f in tqdm(as_completed(futures), total=len(futures), desc="Plot (user vs storm) [parallel]", unit="t"):
+                ti_ret, low_n, high_n = f.result()
+                results_map[int(ti_ret)] = (int(low_n), int(high_n))
+        # 結果を時刻順に格納
+        for ti in idx_list:
+            det_stats["times"].append(pd.to_datetime(times[ti]))
+            low_n, high_n = results_map.get(int(ti), (0, 0))
+            det_stats["low_counts"].append(int(low_n))
+            det_stats["high_counts"].append(int(high_n))
+    else:
+        # 直列処理
+        for ti in tqdm(idx_list, desc="Plot (user vs storm)", unit="t"):
+            slp_pa = ds["msl"].isel(valid_time=ti).values
+            slp_hpa = to_hpa(slp_pa)
+            slp_sub, lat_sub, lon_sub = subset_domain(slp_hpa, ds_lats, ds_lons, LAT_S, LAT_N, LON_W, LON_E)
 
-        tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
+            mask_user_low = detect_centers_user(slp_sub, radius=used_r, sigma=used_s)
+            mask_user_high = detect_centers_user_high(slp_sub, radius=used_r, sigma=used_s)
+            low_n = int(np.count_nonzero(mask_user_low))
+            high_n = int(np.count_nonzero(mask_user_high))
+            det_stats["times"].append(pd.to_datetime(times[ti]))
+            det_stats["low_counts"].append(low_n)
+            det_stats["high_counts"].append(high_n)
 
-        # 2枚を横連結した1枚の画像として保存
-        proj = ccrs.PlateCarree()
-        fig = plt.figure(figsize=(18, 8))
-        ax1 = plt.subplot(1, 2, 1, projection=proj)
-        ax2 = plt.subplot(1, 2, 2, projection=proj)
+            mask_storm_low = detect_centers_storm(slp_sub, nsize=args.storm_nsize)
+            mask_storm_high = detect_centers_storm_high(slp_sub, nsize=args.storm_nsize)
 
-        title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
-        title2 = f"[Storm] Minima centers {tstr} (nsize={args.storm_nsize})"
+            tstr = pd.to_datetime(times[ti]).strftime("%Y-%m-%dT%H")
 
-        cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
-        _cf2 = draw_msl_panel(ax2, lon_sub, lat_sub, slp_sub, mask_storm, title2, add_colorbar=False)
+            proj = ccrs.PlateCarree()
+            fig = plt.figure(figsize=(18, 8))
+            ax1 = plt.subplot(1, 2, 1, projection=proj)
+            ax2 = plt.subplot(1, 2, 2, projection=proj)
 
-        # 共有カラーバー（下部）
-        try:
-            if cf1 is not None:
-                cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
-                cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
-                cb.set_label("MSLP anomaly (hPa)")
-        except Exception:
-            pass
+            title1 = f"[User] Low(blue) & High(red) centers {tstr} (R={used_r}, sigma={used_s})"
+            title2 = f"[Storm] Low(blue) & High(red) centers {tstr} (nsize={args.storm_nsize})"
 
-        out_png = out_dirs["compare"] / f"compare_{tstr}.png"
-        fig.savefig(out_png, dpi=180, bbox_inches="tight")
-        plt.close(fig)
+            cf1 = draw_msl_panel_dual(ax1, lon_sub, lat_sub, slp_sub, mask_user_low, mask_user_high, title1, add_colorbar=False)
+            _cf2 = draw_msl_panel_dual(ax2, lon_sub, lat_sub, slp_sub, mask_storm_low, mask_storm_high, title2, add_colorbar=False)
+
+            try:
+                if cf1 is not None:
+                    cax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
+                    cb = fig.colorbar(cf1, cax=cax, orientation="horizontal", extend="both")
+                    cb.set_label("MSLP anomaly (hPa)")
+            except Exception:
+                pass
+
+            out_png = out_dirs["compare"] / f"compare_{tstr}.png"
+            fig.savefig(out_png, dpi=180, bbox_inches="tight")
+            plt.close(fig)
 
     # =============
     # ユーザ法 検出統計（1991-01-01〜2000-12-31の要件に適合する既定範囲で集計）
@@ -894,7 +1346,8 @@ def main():
         ds=ds, times=sel_times, lats=ds_lats, lons=ds_lons,
         method="storm", storm_nsize=args.storm_nsize,
         user_radius=args.user_radius, user_sigma=args.user_sigma,
-        indices=sel_idx, extent_clip=True
+        indices=sel_idx, extent_clip=True,
+        ds_path=input_path, n_workers=args.workers
     )
     date1 = pd.to_datetime(sel_times[0]).strftime("%Y-%m-%dT%H") if len(sel_times) > 0 else "NA"
     dateN = pd.to_datetime(sel_times[-1]).strftime("%Y-%m-%dT%H") if len(sel_times) > 0 else "NA"
