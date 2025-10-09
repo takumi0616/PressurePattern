@@ -52,7 +52,7 @@ NUM_ITER = 1000
 BATCH_SIZE = 128
 NODES_CHUNK = 16  # VRAM16GB:4, VRAM24GB:16
 LOG_INTERVAL = 10
-SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
+SOM_EVAL_SEGMENTS = 100  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
 SSIM_WINDOW = 5
 
