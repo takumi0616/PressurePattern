@@ -26,7 +26,19 @@ import cartopy.feature as cfeature
 from matplotlib.colors import Normalize
 
 # 3type版 SOM（Euclidean/SSIM/S1対応, batchSOM）
-from PressurePattern.minisom_v8 import MiniSom as MultiDistMiniSom
+# 実行場所に依存せず動くように、パッケージ/ローカル双方のimportに対応
+try:
+    from PressurePattern.minisom_v8 import MiniSom as MultiDistMiniSom  # パッケージ実行（例: python -m PressurePattern.main_v8）
+except ModuleNotFoundError:
+    try:
+        # スクリプト実行（例: /app/src/PressurePattern で python main_v8.py）
+        from minisom_v8 import MiniSom as MultiDistMiniSom
+    except ModuleNotFoundError:
+        # さらに安全策: 実ファイルのディレクトリ/親ディレクトリをパスに追加して再試行
+        import sys as _sys, os as _os
+        _sys.path.append(_os.path.dirname(__file__))                 # /app/src/PressurePattern
+        _sys.path.append(_os.path.dirname(_os.path.dirname(__file__)))  # /app/src
+        from minisom_v8 import MiniSom as MultiDistMiniSom
 
 
 # =====================================================
