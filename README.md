@@ -83,7 +83,7 @@ nohup python main_v8.py --gpu 1 --seed 2 > seed2.out 2>&1 &
 - notify-run を使う（通知が欲しい場合）
 
 ```bash
-notify-run gpu02 -- nohup python main_v8.py --gpu 0 --seed 1 > seed1.out 2>&1 &
+notify-run via-tml2 -- nohup python main_v8.py --gpu 0 --seed 1 > seed1.out 2>&1 &
 notify-run gpu02 -- nohup python main_v8.py --gpu 1 --seed 20 > seed20.out 2>&1 &
 ```
 
