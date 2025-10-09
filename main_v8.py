@@ -288,6 +288,17 @@ def load_and_prepare_data_unified(filepath: str,
 # 評価ユーティリティ（s1_clustering.pyから必要部分を移植）
 # =====================================================
 def _normalize_to_base_candidate(label_str: Optional[str]) -> Optional[str]:
+    """
+    概要:
+      ラベル文字列を評価用の正規化候補へ整形する補助関数（大文字化・全角半角統一・不要文字除去）。
+    引数:
+      - label_str (Optional[str]): 元のラベル文字列。None 可。
+    処理の詳細:
+      - Unicode正規化(NFKC)→大文字化→前後空白除去→全角/異体記号の +/− を半角 +/− に統一。
+      - 英数字以外を除去し、空文字になった場合は None を返す。
+    戻り値:
+      - Optional[str]: 正規化後の候補文字列。空になれば None。
+    """
     import unicodedata, re
     if label_str is None:
         return None
@@ -300,6 +311,18 @@ def _normalize_to_base_candidate(label_str: Optional[str]) -> Optional[str]:
 
 
 def basic_label_or_none(label_str: Optional[str], base_labels: List[str]) -> Optional[str]:
+    """
+    概要:
+      与えられたラベルから基本ラベル（base_labels 内の要素）のみを抽出する。
+    引数:
+      - label_str (Optional[str]): 元ラベル。複合・移行を含む可能性あり。
+      - base_labels (List[str]): 許容する基本ラベル一覧（例: ['1','2A',...])。
+    処理の詳細:
+      - _normalize_to_base_candidate で正規化。
+      - 完全一致を優先。次に '2A+' → '2A' のように、接頭一致かつ残りが英数字を含まない場合を許容。
+    戻り値:
+      - Optional[str]: 見つかった基本ラベル。該当なしなら None。
+    """
     import re
     cand = _normalize_to_base_candidate(label_str)
     if cand is None:
@@ -319,6 +342,18 @@ def basic_label_or_none(label_str: Optional[str], base_labels: List[str]) -> Opt
 
 
 def extract_base_components(raw_label: Optional[str], base_labels: List[str]) -> List[str]:
+    """
+    概要:
+      複合/移行ラベルから基本ラベルの構成要素のみを抽出して列挙する。
+    引数:
+      - raw_label (Optional[str]): 元ラベル。'2A+3B' などの複合・移行を含む可能性あり。
+      - base_labels (List[str]): 抽出対象の基本ラベル集合。
+    処理の詳細:
+      - NFKC 正規化と大文字化、＋/− の表記ゆれ統一。
+      - 英数字以外で分割してトークン化し、base_labels に含まれるものを重複なく順序保存で収集。
+    戻り値:
+      - List[str]: 取り出した基本ラベルのリスト（順序は出現順、重複除去）。
+    """
     import unicodedata, re
     if raw_label is None:
         return []
@@ -333,6 +368,17 @@ def extract_base_components(raw_label: Optional[str], base_labels: List[str]) ->
 
 
 def primary_base_label(raw_label: Optional[str], base_labels: List[str]) -> Optional[str]:
+    """
+    概要:
+      ラベルから抽出された基本ラベル群のうち、先頭（代表）を返す簡易ユーティリティ。
+    引数:
+      - raw_label (Optional[str]): 元ラベル。
+      - base_labels (List[str]): 抽出対象の基本ラベル集合。
+    処理の詳細:
+      - extract_base_components を用いて基本ラベルの並びを取得し、先頭要素を返す。
+    戻り値:
+      - Optional[str]: 代表基本ラベル。見つからなければ None。
+    """
     parts = extract_base_components(raw_label, base_labels)
     return parts[0] if parts else None
 
@@ -449,6 +495,18 @@ def evaluate_clusters_only_base(clusters: List[List[int]],
 
 
 def plot_iteration_metrics(history: Dict[str, List[float]], save_path: str) -> None:
+    """
+    概要:
+      学習のイテレーション履歴（QEや再現率など複数指標）を2列レイアウトでまとめて可視化し保存する。
+    引数:
+      - history (Dict[str, List[float]]): 'iteration' キーと、可視化する任意の指標名→値列の辞書。
+      - save_path (str): 出力PNGパス。
+    処理の詳細:
+      - 'iteration' を横軸として、他の全キーを縦軸にしてサブプロット化。
+      - グリッド・軸ラベル・タイトルを付与し、余白調整後に画像保存。
+    戻り値:
+      - なし（画像ファイルを保存）。
+    """
     iters = history.get('iteration', [])
     metrics_names = [k for k in history.keys() if k != 'iteration']
     n = len(metrics_names)
@@ -493,6 +551,17 @@ def plot_iteration_metrics_single(history: Dict[str, List[float]], out_dir: str,
 
 
 def save_metrics_history_to_csv(history: Dict[str, List[float]], out_csv: str) -> None:
+    """
+    概要:
+      イテレーション履歴の辞書をCSVへ保存する。
+    引数:
+      - history (Dict[str, List[float]]): 'iteration' を含む指標→値列の辞書（各列長は同一想定）。
+      - out_csv (str): 出力CSVパス。
+    処理の詳細:
+      - pandas.DataFrame へ変換し、index=False でCSVへ書き出し。
+    戻り値:
+      - なし（副作用としてCSVを作成）。
+    """
     df = pd.DataFrame(history)
     df.to_csv(out_csv, index=False)
 
@@ -1096,7 +1165,17 @@ def _grad_ssim_dir_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _gssim_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    G-SSIM（勾配強度・方向の重み付き類似 S を max(|∇|)で加重平均）に対する距離 D = 1 - S。
+    概要:
+      G-SSIM（Gradient-SSIM）に基づく対参照距離 D = 1 - S を計算する（グレースケール想定）。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - x/y方向の一次差分から勾配ベクトル (gx,gy) と参照側 (grx,gry) を算出。
+      - 勾配方向類似 Sdir = 0.5*(1+cosθ) と勾配強度類似 Smag = 2|∇X||∇R|/(|∇X|^2+|∇R|^2+eps) を掛け合わせ S を作る。
+      - per-pixel 重み w = max(|∇X|,|∇R|) で加重平均し、類似度 S∈[0,1] を得て D=1-S を返す。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離ベクトル（0=完全一致、1=不一致）。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1123,11 +1202,17 @@ def _gssim_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _curv_ssim_weighted_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Curvature structural dissimilarity Dcurv = 1 - weighted SSIM(ΔX, Δref)
-    - Laplacian kernel 3x3 (5-point)
-    - SSIM with 5x5 window, C=0 (denominator epsilon guarded)
-    - Weighted by w2 = max(|ΔX|, |Δref|) per-pixel
-    Returns: (B,)
+    概要:
+      ラプラシアン（Δ）で強調した曲率構造に対し、重み付きSSIMの不一致度 Dcurv = 1 - Scurv を計算する。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - 3×3ラプラシアンで ΔX, ΔR を得る（出力は (H-2,W-2)）。
+      - 5×5移動平均で局所平均・分散・共分散を推定し、C=0 のSSIMを算出。
+      - 重み w2 = max(|ΔX|,|ΔR|) により空間加重平均した Scurv を得て Dcurv=1-Scurv を返す。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離（概ね [0,1]）。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1166,8 +1251,16 @@ def _curv_ssim_weighted_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Ten
 
 def _s1norm_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Dimensionless S1-like distance in [0,1]: D = 0.5 * r
-      r = (sum|∂X-∂ref|) / (sum max(|∂X|,|∂ref|) + eps) for x and y directions combined.
+    概要:
+      無次元化S1類似距離を [0,1] で返す。D = 0.5 * r（x,y両方向の勾配を結合）。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - x/y 方向一次差分を用い、r = Σ|∂X-∂R| / Σmax(|∂X|,|∂R|) を算出。
+      - 値域を [0,1] に収めるため 0.5 を掛ける（完全一致=0、完全不一致に近い=1）。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離。
     """
     eps = 1e-12
     dXdx = Xb[:, :, 1:] - Xb[:, :, :-1]
@@ -1183,8 +1276,16 @@ def _s1norm_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _moment_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Moment-based distance in [0,1]: D_mom = 0.5 * (d_pos + d_neg)
-    using normalized coordinate grid [0,1] for both axes, diagonal length sqrt(2).
+    概要:
+      符号別（正/負）の重心位置の差に基づくモーメント距離 D_mom を [0,1] で返す。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照2D場 (H,W)。
+    処理の詳細:
+      - 正側 Ap=max(X,0) と負側 An=max(-X,0) に分解し、それぞれの重心 (cx,cy) を座標正規化格子([0,1]^2)上で算出。
+      - 参照側も同様に (cx_r,cy_r) を計算し、正側・負側の重心距離を対角長 √2 で正規化し平均（0.5*(dpos+dneg)）。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離（0=重心一致、1=最大乖離）。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1233,10 +1334,16 @@ def _moment_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _gsmd_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    GSMD distance to reference: sqrt((Dg^2 + Ds^2 + Dm^2)/3)
-      - Dg = G-SSIM distance (0..1)
-      - Ds = dimensionless S1-like distance (0..1)
-      - Dm = moment centroid distance (0..1)
+    概要:
+      GSMD（Gradient/Shape/Momentの合成距離）: sqrt((Dg^2 + Ds^2 + Dm^2)/3) を計算。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照 (H,W)。
+    処理の詳細:
+      - Dg = G-SSIM距離（方向×強度の構造差）、Ds = 無次元S1距離、Dm = 重心モーメント距離。
+      - 3成分の二乗平均平方根（RMS）で合成し、[0,1] のスコアを返す。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離。
     """
     Dg = _gssim_dist_to_ref(Xb, ref)
     Ds = _s1norm_dist_to_ref(Xb, ref)
@@ -1245,11 +1352,16 @@ def _gsmd_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _curv_struct_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Curvature structural dissimilarity d_C in [0,1] (S3D component):
-      - Laplacian magnitude ratio Smag = 2|ΔX||ΔR|/(|ΔX|^2+|ΔR|^2+eps)
-      - Sign agreement Ssign = (1 + sign(ΔX)*sign(ΔR))/2
-      - Weighted by w = max(|ΔX|, |ΔR|)
-      - d_C = 1 - weighted_mean(Smag * Ssign)
+    概要:
+      曲率構造（ラプラシアンの大きさ比と符号一致）に基づく不一致度 d_C∈[0,1] を計算。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照 (H,W)。
+    処理の詳細:
+      - Smag = 2|ΔX||ΔR|/(|ΔX|^2+|ΔR|^2+eps)、Ssign = (1 + sign(ΔX)·sign(ΔR))/2 を計算。
+      - 重み w = max(|ΔX|,|ΔR|) で加重平均した S = ⟨Smag·Ssign⟩ を得て、d_C = 1 - S。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1274,8 +1386,16 @@ def _curv_struct_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tenso
 
 def _curv_s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Curvature S1-like ratio on Laplacian fields: sum|ΔX-ΔR| / sum max(|ΔX|,|ΔR|).
-    Returns (B,) roughly in [0,2]; for CFSD we row-normalize to [0,1].
+    概要:
+      ラプラシアン場上でのS1様比距離 D = Σ|ΔX-ΔR| / Σmax(|ΔX|,|ΔR|) を計算（[0,2]目安）。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照 (H,W)。
+    処理の詳細:
+      - 3×3ラプラシアンで ΔX,ΔR を得て、画素毎の差分の絶対値総和を正規化総和で割る。
+      - 合成距離（CFSD等）で使用時は行方向 min–max 正規化して [0,1] に収める。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1291,9 +1411,16 @@ def _curv_s1_dist_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 def _kappa_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
-    Kappa curvature distance to reference in [0,1]:
-      κ(Z) = div(∇Z/|∇Z|) computed on inner grid via centered differences.
-      D_k = 0.5 * sum|κ(X)-κ(R)| / sum max(|κ(X)|, |κ(R)|)
+    概要:
+      Kappa 曲率距離 D_k∈[0,1] を対参照で計算する。
+    引数:
+      - Xb (torch.Tensor): 入力バッチ (B,H,W)。
+      - ref (torch.Tensor): 参照 (H,W)。
+    処理の詳細:
+      - κ(Z)=div(∇Z/|∇Z|) を中心差分で内側グリッド上に算出。
+      - D_k = 0.5 * Σ|κ(X)-κ(R)| / Σmax(|κ(X)|,|κ(R)|) を返す（スケールに不変な曲率差）。
+    戻り値:
+      - torch.Tensor: 形状 (B,) の距離。
     """
     eps = 1e-12
     B, H, W = Xb.shape
@@ -1385,158 +1512,11 @@ def _spot_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     Dn = _emd_side(An, Wn)
     return 0.5 * (Dp + Dn)
 
-def _cl_gaussian_kernel1d(sigma: float, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    if sigma <= 0:
-        k = torch.tensor([1.0], device=device, dtype=dtype)
-        return k / k.sum()
-    r = max(1, int(math.ceil(3.0 * float(sigma))))
-    xs = torch.arange(-r, r + 1, device=device, dtype=dtype)
-    k = torch.exp(-(xs * xs) / (2.0 * (sigma ** 2)))
-    return k / (k.sum() + 1e-12)
 
-def _cl_gaussian_blur2d(Z: torch.Tensor, sigma: float) -> torch.Tensor:
-    # Z: (B,H,W) or (H,W). Accept both; internally handle batch if needed.
-    if Z.dim() == 2:
-        Z = Z.unsqueeze(0)
-    B, H, W = Z.shape
-    device, dtype = Z.device, Z.dtype
-    k1 = _cl_gaussian_kernel1d(sigma, dtype, device)
-    k1c = k1.view(1, 1, 1, -1)
-    k1r = k1.view(1, 1, -1, 1)
-    X = Z.unsqueeze(1)  # (B,1,H,W)
-    pad_h = (k1.shape[0] // 2)
-    Xh = F.pad(X, (pad_h, pad_h, 0, 0), mode='reflect')
-    Xh = F.conv2d(Xh, k1c)
-    pad_v = (k1.shape[0] // 2)
-    Xv = F.pad(Xh, (0, 0, pad_v, pad_v), mode='reflect')
-    Xs = F.conv2d(Xv, k1r)
-    return Xs.squeeze(1)  # (B,H,W)
 
-def _cl_unique_extrema_mask(S: torch.Tensor, k: int, mode: str) -> torch.Tensor:
-    """
-    S: (H,W), k odd window, mode: 'min'|'max'
-    Strict unique local minima/maxima via pooling and uniqueness check; exclude r-border.
-    """
-    assert k >= 1 and (k % 2 == 1)
-    r = k // 2
-    H, W = S.shape
-    Z1 = S.view(1, 1, H, W)
-    if mode == 'min':
-        pooled = -F.max_pool2d(-Z1, kernel_size=k, stride=1, padding=r)
-        eq = (Z1 == pooled)
-    else:
-        pooled = F.max_pool2d(Z1, kernel_size=k, stride=1, padding=r)
-        eq = (Z1 == pooled)
-    cnt = F.avg_pool2d(eq.float(), kernel_size=k, stride=1, padding=r) * float(k * k)
-    unique = (eq & (cnt == 1.0)).squeeze(0).squeeze(0)
-    if H > 2 * r and W > 2 * r:
-        unique[:r, :] = False
-        unique[-r:, :] = False
-        unique[:, :r] = False
-        unique[:, -r:] = False
-    else:
-        unique[:, :] = False
-    return unique
 
-def _cl_extract_features_single_main(Z: torch.Tensor, radius: int, sigma: float, topk: int) -> Tuple[torch.Tensor, ...]:
-    """
-    Z: (H,W) anomaly [hPa] with per-sample spatial-mean removed.
-    Returns:
-      (lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang)
-      positions normalized to [0,1], vlen in [0,sqrt(2)], vang in [-pi,pi].
-    """
-    eps = torch.tensor(1e-12, device=Z.device, dtype=Z.dtype)
-    H, W = Z.shape
-    # Smooth (Gaussian, separable)
-    S = _cl_gaussian_blur2d(Z, sigma).squeeze(0)
-    k = 2 * int(radius) + 1
-    if k % 2 == 0:
-        k += 1
-    # strict minima/maxima masks
-    min_mask = _cl_unique_extrema_mask(S, k=k, mode='min')
-    max_mask = _cl_unique_extrema_mask(S, k=k, mode='max')
-    # strength maps from anomaly (mean-removed)
-    lows_val = (-Z).clamp(min=0.0)
-    highs_val = (Z).clamp(min=0.0)
 
-    def _centroid(mask: torch.Tensor, wmap: torch.Tensor, K: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        ys, xs = torch.nonzero(mask, as_tuple=True)
-        if ys.numel() == 0:
-            return (torch.tensor(0.5, device=Z.device, dtype=Z.dtype),
-                    torch.tensor(0.5, device=Z.device, dtype=Z.dtype),
-                    torch.tensor(0.0, device=Z.device, dtype=Z.dtype))
-        ws = wmap[ys, xs]
-        if ws.numel() == 0 or float(ws.sum().item()) <= 0.0:
-            idx = torch.argmin(S) if wmap.data_ptr() == lows_val.data_ptr() else torch.argmax(S)
-            y = (idx // W).to(torch.long); x = (idx % W).to(torch.long)
-            cx = x.to(Z.dtype) / max(1.0, (W - 1)); cy = y.to(Z.dtype) / max(1.0, (H - 1))
-            return cx, cy, torch.tensor(0.0, device=Z.device, dtype=Z.dtype)
-        K_eff = int(min(K, ws.numel()))
-        vals, order = torch.topk(ws, k=K_eff, largest=True, sorted=False)
-        xs_sel = xs[order]; ys_sel = ys[order]; w = vals; wsum = w.sum()
-        cx = ((xs_sel.to(Z.dtype) / max(1.0, (W - 1))) * w).sum() / (wsum + eps)
-        cy = ((ys_sel.to(Z.dtype) / max(1.0, (H - 1))) * w).sum() / (wsum + eps)
-        return cx, cy, wsum
 
-    lcx, lcy, lsum = _centroid(min_mask, lows_val, topk)
-    hcx, hcy, hsum = _centroid(max_mask, highs_val, topk)
-    vx = hcx - lcx; vy = hcy - lcy
-    vlen = torch.sqrt(vx * vx + vy * vy + eps)
-    vang = torch.atan2(vy, vx)
-    return lcx, lcy, lsum, hcx, hcy, hsum, vlen, vang
-
-def _cl_pairwise_distance_main(feat_b: Tuple[torch.Tensor, ...],
-                               feat_r: Tuple[torch.Tensor, ...]) -> torch.Tensor:
-    """
-    Batch features (B,8) vs ref features (8,) -> (B,) in [0,1]
-    """
-    eps = 1e-12
-    (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b) = feat_b
-    (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r) = feat_r
-
-    d_l_pos = torch.sqrt((lcx_b - lcx_r) ** 2 + (lcy_b - lcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
-    d_h_pos = torch.sqrt((hcx_b - hcx_r) ** 2 + (hcy_b - hcy_r) ** 2 + 1e-12) / math.sqrt(2.0)
-
-    denom_l = torch.clamp(torch.maximum(lsum_b, lsum_r), min=eps)
-    denom_h = torch.clamp(torch.maximum(hsum_b, hsum_r), min=eps)
-    d_l_str = torch.where((lsum_b <= eps) & (lsum_r <= eps), torch.zeros_like(lsum_b), torch.abs(lsum_b - lsum_r) / denom_l)
-    d_h_str = torch.where((hsum_b <= eps) & (hsum_r <= eps), torch.zeros_like(hsum_b), torch.abs(hsum_b - hsum_r) / denom_h)
-
-    def _angle_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        d = torch.abs(a - b)
-        d = torch.remainder(d, 2.0 * math.pi)
-        d = torch.where(d > math.pi, 2.0 * math.pi - d, d)
-        return d / math.pi
-
-    d_ang = _angle_diff(vang_b, vang_r)
-    d_ang = torch.where((vlen_b <= 1e-6) | (vlen_r <= 1e-6), torch.zeros_like(d_ang), d_ang)
-    d_mag = torch.abs(vlen_b - vlen_r) / math.sqrt(2.0)
-    D = torch.sqrt((d_l_pos * d_l_pos + d_h_pos * d_h_pos + d_l_str * d_l_str + d_h_str * d_h_str + d_ang * d_ang + d_mag * d_mag) / 6.0 + 1e-12)
-    return D.clamp(0.0, 1.0)
-
-def _cl_to_ref(Xb: torch.Tensor, ref: torch.Tensor, radius: int = 6, sigma: float = 2.0, topk: int = 5) -> torch.Tensor:
-    """
-    CL distance (user method) vs single reference, on anomaly fields (mean removed) in [hPa].
-    Xb: (B,H,W), ref: (H,W) -> (B,) in [0,1]
-    """
-    B, H, W = Xb.shape
-    # ref features
-    lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r = _cl_extract_features_single_main(ref, radius, sigma, topk)
-    # batch features
-    lcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    lcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    lsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    hcx_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    hcy_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    hsum_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    vlen_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    vang_b = torch.empty((B,), device=Xb.device, dtype=Xb.dtype)
-    for i in range(B):
-        lcx_b[i], lcy_b[i], lsum_b[i], hcx_b[i], hcy_b[i], hsum_b[i], vlen_b[i], vang_b[i] = \
-            _cl_extract_features_single_main(Xb[i], radius, sigma, topk)
-    feat_b = (lcx_b, lcy_b, lsum_b, hcx_b, hcy_b, hsum_b, vlen_b, vang_b)
-    feat_r = (lcx_r, lcy_r, lsum_r, hcx_r, hcy_r, hsum_r, vlen_r, vang_r)
-    return _cl_pairwise_distance_main(feat_b, feat_r)
 
 def _gvd_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     """
@@ -1702,6 +1682,115 @@ def _s1gcurv_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return torch.sqrt((D1n * D1n + Dg * Dg + Dcurv * Dcurv) / 3.0)
 
 
+def _msssim_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    """
+    Multi-scale SSIM distance to reference (PyTorch, grayscale).
+    D = 1 - Π_s (SSIM_s)^{w_s}, s in {1,2,4} using adaptive avg pooling, SSIM window=5, C=0 proxy
+    Returns (B,)
+    """
+    device = Xb.device; dtype = Xb.dtype
+    scales = [1, 2, 4]
+    w = torch.tensor([0.5, 0.3, 0.2], device=device, dtype=dtype)
+    w = w / w.sum()
+    sims = []
+    for s in scales:
+        if s == 1:
+            Xs = Xb
+            Rs = ref
+        else:
+            h2 = max(2, Xb.shape[-2] // s)
+            w2 = max(2, Xb.shape[-1] // s)
+            Xs = F.adaptive_avg_pool2d(Xb.unsqueeze(1), (h2, w2)).squeeze(1)
+            Rs = F.adaptive_avg_pool2d(ref.view(1, 1, *ref.shape), (h2, w2)).squeeze(0).squeeze(0)
+        ds = _ssim5_dist_to_ref(Xs, Rs)     # (B,)
+        sims.append((1.0 - ds).clamp(0.0, 1.0))
+    sim_prod = torch.ones_like(sims[0])
+    for i in range(len(scales)):
+        sim_prod = sim_prod * (sims[i] ** w[i])
+    return 1.0 - sim_prod
+
+def _haarpsi_to_ref(Xb: torch.Tensor, ref: torch.Tensor, C: float = 30.0, alpha: float = 4.2) -> torch.Tensor:
+    """
+    HaarPSI distance to reference (grayscale, Haar wavelets)
+    - HS^(k) = l_alpha( 0.5 * (S(|g1^(k)*X|,|g1^(k)*R|) + S(|g2^(k)*X|,|g2^(k)*R|)) )
+    - W^(k)  = max(|g3^(k)*X|, |g3^(k)*R|)
+    - HaarPSI = { l_alpha^{-1}( Σ_k Σ HS^(k)·W^(k) / Σ_k Σ W^(k) ) }^2
+    Distance D=1-HaarPSI. k=1 horizontal (g⊗h), k=2 vertical (h⊗g); scales j=1,2(HF), j=3(LF)
+    Returns (B,)
+    """
+    device, dtype = Xb.device, Xb.dtype
+    B, H, W = Xb.shape
+
+    def _upsample1d(v: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros((v.numel() * 2 - 1,), device=device, dtype=dtype)
+        out[::2] = v
+        return out
+
+    def _conv1d_coeff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        na, nb = a.numel(), b.numel()
+        out = torch.zeros((na + nb - 1,), device=device, dtype=dtype)
+        for i in range(na):
+            out[i:i + nb] += a[i] * b
+        return out
+
+    def _haar_1d(j: int):
+        h1 = torch.tensor([1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
+        g1 = torch.tensor([-1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
+        if j == 1:
+            return h1, g1
+        h, g = h1.clone(), g1.clone()
+        for _ in range(2, j + 1):
+            h_up = _upsample1d(h)
+            g_up = _upsample1d(g)
+            h = _conv1d_coeff(h1, h_up)
+            g = _conv1d_coeff(h1, g_up)
+        return h, g
+
+    def _k2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.ger(a, b).view(1, 1, a.numel(), b.numel())
+
+    h1, g1 = _haar_1d(1); h2, g2 = _haar_1d(2); h3, g3 = _haar_1d(3)
+    k1_g1 = _k2d(g1, h1); k2_g1 = _k2d(h1, g1)
+    k1_g2 = _k2d(g2, h2); k2_g2 = _k2d(h2, g2)
+    k1_g3 = _k2d(g3, h3); k2_g3 = _k2d(h3, g3)
+
+    def _conv_same(img: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        kh, kw = k.shape[-2], k.shape[-1]
+        pl = kw // 2; pr = kw - 1 - pl
+        pt = kh // 2; pb = kh - 1 - pt
+        return F.conv2d(F.pad(img, (pl, pr, pt, pb), mode='reflect'), k)
+
+    def _S(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return (2.0 * a * b + C) / (a * a + b * b + C)
+
+    def _logistic(x: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp(-alpha * x))
+
+    def _inv_logistic(y: torch.Tensor) -> torch.Tensor:
+        y = torch.clamp(y, 1e-6, 1.0 - 1e-6)
+        return torch.log(y / (1.0 - y)) / alpha
+
+    X = Xb.unsqueeze(1)
+    R = ref.view(1, 1, H, W)
+
+    A11 = _conv_same(X, k1_g1).abs(); A12 = _conv_same(X, k1_g2).abs()
+    R11 = _conv_same(R, k1_g1).abs(); R12 = _conv_same(R, k1_g2).abs()
+    HS1 = _logistic(0.5 * (_S(A11, R11) + _S(A12, R12)))
+    Wb1 = _conv_same(X, k1_g3).abs(); Wr1 = _conv_same(R, k1_g3).abs()
+    W1 = torch.maximum(Wb1, Wr1)
+
+    A21 = _conv_same(X, k2_g1).abs(); A22 = _conv_same(X, k2_g2).abs()
+    R21 = _conv_same(R, k2_g1).abs(); R22 = _conv_same(R, k2_g2).abs()
+    HS2 = _logistic(0.5 * (_S(A21, R21) + _S(A22, R22)))
+    Wb2 = _conv_same(X, k2_g3).abs(); Wr2 = _conv_same(R, k2_g3).abs()
+    W2 = torch.maximum(Wb2, Wr2)
+
+    num = (HS1 * W1).flatten(1).sum(dim=1) + (HS2 * W2).flatten(1).sum(dim=1)
+    den = W1.flatten(1).sum(dim=1) + W2.flatten(1).sum(dim=1) + 1e-12
+    avg = num / den
+    sim = torch.clamp(_inv_logistic(avg) ** 2, 0.0, 1.0)
+    return 1.0 - sim
+
 def compute_node_true_medoids(
     method_name: str,
     data_flat: np.ndarray,
@@ -1714,7 +1803,7 @@ def compute_node_true_medoids(
     """
     各ノードについて「総距離最小（true medoid）」のサンプルを選ぶ。
     - 各ノードの割当集合 Ic の中で、候補 i∈Ic について cost(i) = Σ_{j∈Ic} d(X_j, X_i) を計算し最小の i を選ぶ。
-    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k' | 'cl'
+    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k'
     - 戻りの距離は、選ばれたメドイドに対する平均距離（sum/|Ic|）。
     """
     H, W = field_shape
@@ -1883,8 +1972,10 @@ def compute_node_true_medoids(
             elif method_name == 'spot':
                 # SPOT: sliced Wasserstein-1 (正負平均)
                 D = pairwise_by_ref(lambda Xb, ref: _spot_to_ref(Xb, ref), Xcand)
-            elif method_name == 'cl':
-                D = pairwise_by_ref(lambda Xb, ref: _cl_to_ref(Xb, ref), Xcand)
+            elif method_name == 'msssim':
+                D = pairwise_by_ref(lambda Xb, ref: _msssim_to_ref(Xb, ref), Xcand)
+            elif method_name == 'haarpsi':
+                D = pairwise_by_ref(lambda Xb, ref: _haarpsi_to_ref(Xb, ref), Xcand)
             elif method_name == 'gvd':
                 # GVD: 二階微分不変量
                 D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
@@ -2438,13 +2529,6 @@ def run_one_method_learning(method_name, activation_distance, data_all, labels_a
         area_weight=area_w_map
     )
     som.random_weights_init(data_all)
-    # CL距離の既定パラメータ（ユーザ法相当）
-    try:
-        som.cl_radius = 6
-        som.cl_sigma = 2.0
-        som.cl_topk = 5
-    except Exception:
-        pass
     # 永続キャッシュディレクトリ（RESULT_DIR/data）をMiniSomに渡す
     try:
         cache_dir = os.path.join(RESULT_DIR, 'data')
@@ -2885,7 +2969,7 @@ def main():
     処理の詳細:
       - デバイス解決と再現性設定、ログ初期化。
       - 学習/検証期間のデータを読み込み、hPa偏差へ変換。
-      - 指定の距離手法（例: cl）でSOM学習し、True Medoidや各種図表・CSVを保存。
+      - 指定の距離手法でSOM学習し、True Medoidや各種図表・CSVを保存。
       - 学習代表（基本ラベル）を用いた検証評価と可視化を実施。
       - 各手法の再現率ブロックを抜粋した集約ログを生成。
       - キャッシュディレクトリ（RESULT_DIR/data）も初期化。
@@ -2976,12 +3060,13 @@ def main():
         print(f"GPU: {torch.cuda.get_device_name(idx)} (index={idx})")
 
     methods = [
-        # ('euclidean', 'euclidean'),
-        # ('ssim5',     'ssim5'),
-        # ('s1',        's1'),
-        # ('kappa',     'kappa'),
-        # ('s1k',       's1k'),
-        ('cl',       'cl'),
+        ('euclidean', 'euclidean'),
+        ('ssim5',     'ssim5'),
+        ('s1',        's1'),
+        ('kappa',     'kappa'),
+        ('s1k',       's1k'),
+        ('msssim',   'msssim'),
+        ('haarpsi',  'haarpsi'),
     ]
     for mname, adist in methods:
         # 学習
