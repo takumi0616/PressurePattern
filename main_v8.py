@@ -50,7 +50,7 @@ SEED = 1
 SOM_X, SOM_Y = 10, 10
 NUM_ITER = 1000
 BATCH_SIZE = 128
-NODES_CHUNK = 128 # VRAM16GB:2, VRAM24GB:4
+NODES_CHUNK = 16  # VRAM16GB:4, VRAM24GB:16
 LOG_INTERVAL = 10
 SOM_EVAL_SEGMENTS = 10  # NUM_ITER をこの個数の区間に分割して評価（区切り数）
 # SSIMの窓サイズ（奇数のみ）。デフォルトは5。minisom側のSSIM系距離で使用される。
@@ -66,7 +66,7 @@ VALID_START = '1998-01-01'
 VALID_END   = '2000-12-31'
 
 # 出力先（v8）
-RESULT_DIR   = './results_v8_iter1000_batch128_seed1'
+RESULT_DIR   = './results_v8_iter100_batch128_seed1'
 LEARNING_ROOT = os.path.join(RESULT_DIR, 'learning_result')
 VERIF_ROOT    = os.path.join(RESULT_DIR, 'verification_results')
 
@@ -1791,6 +1791,108 @@ def _haarpsi_to_ref(Xb: torch.Tensor, ref: torch.Tensor, C: float = 30.0, alpha:
     sim = torch.clamp(_inv_logistic(avg) ** 2, 0.0, 1.0)
     return 1.0 - sim
 
+def _pls_to_ref(Xb: torch.Tensor, ref: torch.Tensor, tau_factor: float = 0.5) -> torch.Tensor:
+    """
+    PLS（ラプラシアン符号ハミング）対参照距離。D = mismatch/(either_nonzero) ∈ [0,1]
+    """
+    device, dtype = Xb.device, Xb.dtype
+    B, H, W = Xb.shape
+    lap = torch.tensor([[0.0, 1.0, 0.0],
+                        [1.0,-4.0, 1.0],
+                        [0.0, 1.0, 0.0]], device=device, dtype=dtype).view(1,1,3,3)
+    LA = F.conv2d(Xb.unsqueeze(1), lap, padding=0)            # (B,1,H-2,W-2)
+    LR = F.conv2d(ref.view(1,1,H,W), lap, padding=0)          # (1,1,H-2,W-2)
+    absLR = LR.abs().flatten()
+    tau = tau_factor * (absLR.median() if absLR.numel() > 0 else torch.tensor(0.0, device=device, dtype=dtype))
+    SA = torch.sign(LA); SW = torch.sign(LR)
+    SA = torch.where(LA.abs() < tau, torch.zeros_like(SA), SA)
+    SW = torch.where(LR.abs() < tau, torch.zeros_like(SW), SW)
+    both_nz = (SA != 0) & (SW != 0)
+    either_nz = (SA != 0) | (SW != 0)
+    mism = (SA != SW) & both_nz
+    mism_b = mism.flatten(1).sum(dim=1).to(dtype)
+    either_b = either_nz.flatten(1).sum(dim=1).to(dtype)
+    return mism_b / (either_b + 1e-12)
+
+def _crp_to_ref(Xb: torch.Tensor, ref: torch.Tensor, bins: int = 16, alpha: float = 0.3) -> torch.Tensor:
+    """
+    CRP（中心+半径プロファイル）対参照距離。D = α·d_center + (1-α)·d_profile ∈ [0,1]
+    """
+    device, dtype = Xb.device, Xb.dtype
+    B, H, W = Xb.shape
+    # 参照中心（低気圧想定: 最小値）
+    idx_min = torch.argmin(ref.view(-1))
+    cy = (idx_min // W).to(dtype)
+    cx = (idx_min % W).to(dtype)
+    # サンプル側中心
+    idx_x = torch.argmin(Xb.view(B, -1), dim=1)
+    yx = (idx_x // W).to(dtype)
+    xx = (idx_x % W).to(dtype)
+    Lnorm = (float(H*H + W*W)) ** 0.5
+    d_center = torch.sqrt((yx - cy)**2 + (xx - cx)**2) / Lnorm
+    # 半径マップ（参照中心基準）→ リング平均
+    ys = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
+    xs = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
+    rmap = torch.sqrt((ys - cy)**2 + (xs - cx)**2).reshape(-1)  # (HW,)
+    rmax = rmap.max() + 1e-6
+    edges = torch.linspace(0.0, rmax, bins + 1, device=device, dtype=dtype)
+    ridx = (torch.bucketize(rmap, edges) - 1).clamp_(0, bins - 1).to(torch.long)
+    one = torch.ones_like(ridx, dtype=dtype)
+    # 参照プロファイル
+    PW_sum = torch.zeros((bins,), device=device, dtype=dtype)
+    PW_cnt = torch.zeros((bins,), device=device, dtype=dtype)
+    PW_sum.scatter_add_(0, ridx, ref.view(-1))
+    PW_cnt.scatter_add_(0, ridx, one)
+    PW = PW_sum / (PW_cnt + 1e-12)
+    # バッチ側プロファイル
+    PX_sum = torch.zeros((B, bins), device=device, dtype=dtype)
+    PX_cnt = torch.zeros((B, bins), device=device, dtype=dtype)
+    idx_b = ridx.view(1, -1).expand(B, -1)
+    PX_sum.scatter_add_(1, idx_b, Xb.view(B, -1))
+    PX_cnt.scatter_add_(1, idx_b, torch.ones((B, H * W), device=device, dtype=dtype))
+    PX = PX_sum / (PX_cnt + 1e-12)
+    num = (PX - PW.view(1, -1)).abs().sum(dim=1)
+    den = torch.maximum(PX.abs(), PW.view(1, -1).abs()).sum(dim=1)
+    d_profile = num / (den + 1e-12)
+    return torch.clamp(alpha * d_center + (1.0 - alpha) * d_profile, 0.0, 1.0)
+
+def _cacl_to_ref(Xb: torch.Tensor, ref: torch.Tensor, p0_hpa: float = 20.0) -> torch.Tensor:
+    """
+    CACL（低高中心ライン）対参照距離。向きθ・長さL・ピーク強度aの差のRMS ∈ [0,1]
+    """
+    device, dtype = Xb.device, Xb.dtype
+    B, H, W = Xb.shape
+    # 参照の min/max
+    ref_flat = ref.view(-1)
+    i_min_r = torch.argmin(ref_flat); i_max_r = torch.argmax(ref_flat)
+    yr = (i_min_r // W).to(dtype); xr = (i_min_r % W).to(dtype)
+    Yr = (i_max_r // W).to(dtype); Xr = (i_max_r % W).to(dtype)
+    denom_y = max(1, H - 1); denom_x = max(1, W - 1)
+    umin_r = torch.stack([yr / denom_y, xr / denom_x])
+    umax_r = torch.stack([Yr / denom_y, Xr / denom_x])
+    v_r = umax_r - umin_r
+    L_r = torch.sqrt((v_r * v_r).sum()) / (2.0 ** 0.5)
+    theta_r = torch.atan2(v_r[0], v_r[1])
+    # サンプル側
+    Xf = Xb.view(B, -1)
+    i_min = torch.argmin(Xf, dim=1); i_max = torch.argmax(Xf, dim=1)
+    y_min = (i_min // W).to(dtype); x_min = (i_min % W).to(dtype)
+    y_max = (i_max // W).to(dtype); x_max = (i_max % W).to(dtype)
+    umin = torch.stack([y_min / denom_y, x_min / denom_x], dim=1)  # (B,2)
+    umax = torch.stack([y_max / denom_y, x_max / denom_x], dim=1)  # (B,2)
+    v = umax - umin
+    L = torch.sqrt((v * v).sum(dim=1)) / (2.0 ** 0.5)
+    theta = torch.atan2(v[:, 0], v[:, 1])
+    # 成分距離
+    dth = (theta - theta_r).abs()
+    dth = torch.minimum(dth, math.pi - dth) / (math.pi / 2.0)
+    dL = (L - L_r).abs()
+    xmax = torch.amax(Xb, dim=(1, 2)); xmin = torch.amin(Xb, dim=(1, 2))
+    aX = torch.clamp((xmax - xmin) / max(1e-6, p0_hpa), 0.0, 1.0)
+    aR = torch.clamp((ref.max() - ref.min()) / max(1e-6, p0_hpa), 0.0, 1.0)
+    da = (aX - aR).abs()
+    return torch.sqrt((dth * dth + dL * dL + da * da) / 3.0)
+
 def compute_node_true_medoids(
     method_name: str,
     data_flat: np.ndarray,
@@ -1991,6 +2093,15 @@ def compute_node_true_medoids(
             elif method_name == 's1gcurv':
                 # S1 + G-SSIM + curvature S1 (scaled)
                 D = pairwise_by_ref(lambda Xb, ref: _s1gcurv_to_ref(Xb, ref), Xcand)
+            elif method_name == 'pls':
+                # PLS: Laplacian Sign Hamming
+                D = pairwise_by_ref(lambda Xb, ref: _pls_to_ref(Xb, ref), Xcand)
+            elif method_name == 'crp':
+                # CRP: Cyclone Radial Profile
+                D = pairwise_by_ref(lambda Xb, ref: _crp_to_ref(Xb, ref), Xcand)
+            elif method_name == 'cacl':
+                # CACL: Cyclone–Anticyclone Center-Line
+                D = pairwise_by_ref(lambda Xb, ref: _cacl_to_ref(Xb, ref), Xcand)
             else:
                 raise ValueError(f'Unknown method_name: {method_name}')
 
@@ -3067,6 +3178,9 @@ def main():
         ('s1k',       's1k'),
         ('msssim',   'msssim'),
         ('haarpsi',  'haarpsi'),
+        ('pls',      'pls'),
+        ('crp',      'crp'),
+        ('cacl',     'cacl'),
     ]
     for mname, adist in methods:
         # 学習

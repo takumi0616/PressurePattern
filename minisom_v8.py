@@ -110,8 +110,8 @@ class MiniSom:
 
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim', 'haarpsi'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","msssim","haarpsi"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim', 'haarpsi', 'pls', 'crp', 'cacl'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","msssim","haarpsi","pls","crp","cacl"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -588,6 +588,12 @@ class MiniSom:
             return self._msssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'haarpsi':
             return self._haarpsi_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'pls':
+            return self._pls_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'crp':
+            return self._crp_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'cacl':
+            return self._cacl_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -636,6 +642,57 @@ class MiniSom:
             end = min(start + nodes_chunk, self.m)
             for k in range(start, end):
                 out[:, k] = self._haarpsi_to_ref(Xb, self.weights[k])
+        return out
+
+    @torch.no_grad()
+    def _pls_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, tau_factor: float = 0.5) -> Tensor:
+        """
+        概要:
+          PLS: Laplacian Sign Hamming 距離。凹凸（ラプラシアン符号）配置の一致度を用いた距離。
+        戻り: (B,m) in [0,1]
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        B = Xb.shape[0]
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            for k in range(start, end):
+                out[:, k] = self._pls_to_ref(Xb, self.weights[k], tau_factor=tau_factor)
+        return out
+
+    @torch.no_grad()
+    def _crp_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, bins: int = 16, alpha: float = 0.3) -> Tensor:
+        """
+        概要:
+          CRP: Cyclone Radial Profile 距離。中心位置と半径方向プロファイルの一致で定義。
+        戻り: (B,m) in [0,1]
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        B = Xb.shape[0]
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            for k in range(start, end):
+                out[:, k] = self._crp_to_ref(Xb, self.weights[k], bins=bins, alpha=alpha)
+        return out
+
+    @torch.no_grad()
+    def _cacl_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, p0_hpa: float = 20.0) -> Tensor:
+        """
+        概要:
+          CACL: Cyclone–Anticyclone Center-Line 距離。低高中心の並び・長さ・強度の違い。
+        戻り: (B,m) in [0,1]
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        B = Xb.shape[0]
+        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
+        for start in range(0, self.m, nodes_chunk):
+            end = min(start + nodes_chunk, self.m)
+            for k in range(start, end):
+                out[:, k] = self._cacl_to_ref(Xb, self.weights[k], p0_hpa=p0_hpa)
         return out
 
     @torch.no_grad()
@@ -933,6 +990,132 @@ class MiniSom:
         return 1.0 - sim
 
     @torch.no_grad()
+    def _pls_to_ref(self, Xb: Tensor, ref: Tensor, tau_factor: float = 0.5) -> Tensor:
+        """
+        概要:
+          PLS（ラプラシアン符号ハミング）対参照距離。D = mismatch/(either_nonzero)
+        戻り: (B,) in [0,1]
+        """
+        device, dtype = Xb.device, Xb.dtype
+        B, H, W = Xb.shape
+        lap = torch.tensor([[0.0, 1.0, 0.0],
+                            [1.0,-4.0, 1.0],
+                            [0.0, 1.0, 0.0]], device=device, dtype=dtype).view(1,1,3,3)
+        LA = F.conv2d(Xb.unsqueeze(1), lap, padding=0)            # (B,1,H-2,W-2)
+        LR = F.conv2d(ref.view(1,1,H,W), lap, padding=0)          # (1,1,H-2,W-2)
+        absLR = LR.abs().flatten()
+        tau = tau_factor * (absLR.median() if absLR.numel() > 0 else torch.tensor(0.0, device=device, dtype=dtype))
+        SA = torch.sign(LA)
+        SW = torch.sign(LR)
+        SA = torch.where(LA.abs() < tau, torch.zeros_like(SA), SA)
+        SW = torch.where(LR.abs() < tau, torch.zeros_like(SW), SW)
+        both_nz = (SA != 0) & (SW != 0)
+        either_nz = (SA != 0) | (SW != 0)
+        mism = (SA != SW) & both_nz
+        mism_b = mism.flatten(1).sum(dim=1).to(dtype)
+        either_b = either_nz.flatten(1).sum(dim=1).to(dtype)
+        return mism_b / (either_b + 1e-12)
+
+    @torch.no_grad()
+    def _crp_to_ref(self, Xb: Tensor, ref: Tensor, bins: int = 16, alpha: float = 0.3) -> Tensor:
+        """
+        概要:
+          CRP（中心+半径プロファイル）対参照距離。D = α·d_center + (1-α)·d_profile
+        戻り: (B,) in [0,1]
+        """
+        device, dtype = Xb.device, Xb.dtype
+        B, H, W = Xb.shape
+        # 参照中心（低気圧の仮定で最小値）
+        idx_min = torch.argmin(ref.view(-1))
+        cy = (idx_min // W).to(dtype)
+        cx = (idx_min % W).to(dtype)
+        # サンプル側中心
+        idx_x = torch.argmin(Xb.view(B, -1), dim=1)
+        yx = (idx_x // W).to(dtype)
+        xx = (idx_x % W).to(dtype)
+        Lnorm = (float(H*H + W*W)) ** 0.5
+        d_center = torch.sqrt((yx - cy)**2 + (xx - cx)**2) / Lnorm
+
+        # 半径ビン（参照中心基準）
+        ys = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
+        xs = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
+        rmap = torch.sqrt((ys - cy)**2 + (xs - cx)**2).reshape(-1)  # (HW,)
+        rmax = rmap.max() + 1e-6
+        edges = torch.linspace(0.0, rmax, bins + 1, device=device, dtype=dtype)
+        ridx = (torch.bucketize(rmap, edges) - 1).clamp_(0, bins - 1).to(torch.long)  # (HW,)
+        one = torch.ones_like(ridx, dtype=dtype)
+
+        # 参照プロファイル
+        PW_sum = torch.zeros((bins,), device=device, dtype=dtype)
+        PW_cnt = torch.zeros((bins,), device=device, dtype=dtype)
+        PW_sum.scatter_add_(0, ridx, ref.view(-1))
+        PW_cnt.scatter_add_(0, ridx, one)
+        PW = PW_sum / (PW_cnt + 1e-12)  # (bins,)
+
+        # バッチ側プロファイル
+        PX_sum = torch.zeros((B, bins), device=device, dtype=dtype)
+        PX_cnt = torch.zeros((B, bins), device=device, dtype=dtype)
+        idx_b = ridx.view(1, -1).expand(B, -1)
+        PX_sum.scatter_add_(1, idx_b, Xb.view(B, -1))
+        PX_cnt.scatter_add_(1, idx_b, torch.ones((B, H * W), device=device, dtype=dtype))
+        PX = PX_sum / (PX_cnt + 1e-12)  # (B,bins)
+
+        num = (PX - PW.view(1, -1)).abs().sum(dim=1)
+        den = torch.maximum(PX.abs(), PW.view(1, -1).abs()).sum(dim=1)
+        d_profile = num / (den + 1e-12)
+
+        return torch.clamp(alpha * d_center + (1.0 - alpha) * d_profile, 0.0, 1.0)
+
+    @torch.no_grad()
+    def _cacl_to_ref(self, Xb: Tensor, ref: Tensor, p0_hpa: float = 20.0) -> Tensor:
+        """
+        概要:
+          CACL（低高中心ライン）対参照距離。向きθ・長さL・ピーク強度aの差のRMS。
+        戻り: (B,) in [0,1]
+        """
+        device, dtype = Xb.device, Xb.dtype
+        B, H, W = Xb.shape
+        # 参照の min/max
+        ref_flat = ref.view(-1)
+        i_min_r = torch.argmin(ref_flat)
+        i_max_r = torch.argmax(ref_flat)
+        yr = (i_min_r // W).to(dtype); xr = (i_min_r % W).to(dtype)
+        Yr = (i_max_r // W).to(dtype); Xr = (i_max_r % W).to(dtype)
+        # 正規化座標 [0,1]
+        denom_y = max(1, H - 1); denom_x = max(1, W - 1)
+        umin_r = torch.stack([yr / denom_y, xr / denom_x])  # (2,)
+        umax_r = torch.stack([Yr / denom_y, Xr / denom_x])  # (2,)
+        v_r = umax_r - umin_r
+        L_r = torch.sqrt((v_r * v_r).sum()) / (2.0 ** 0.5)  # [0,1]
+        theta_r = torch.atan2(v_r[0], v_r[1])               # y,x の順で atan2
+
+        # サンプル側
+        Xf = Xb.view(B, -1)
+        i_min = torch.argmin(Xf, dim=1)
+        i_max = torch.argmax(Xf, dim=1)
+        y_min = (i_min // W).to(dtype); x_min = (i_min % W).to(dtype)
+        y_max = (i_max // W).to(dtype); x_max = (i_max % W).to(dtype)
+        umin = torch.stack([y_min / denom_y, x_min / denom_x], dim=1)  # (B,2)
+        umax = torch.stack([y_max / denom_y, x_max / denom_x], dim=1)  # (B,2)
+        v = umax - umin                                                # (B,2)
+        L = torch.sqrt((v * v).sum(dim=1)) / (2.0 ** 0.5)              # (B,)
+        theta = torch.atan2(v[:, 0], v[:, 1])                          # (B,)
+
+        # 成分距離
+        dth = (theta - theta_r).abs()
+        dth = torch.minimum(dth, math.pi - dth) / (math.pi / 2.0)
+        dL = (L - L_r).abs()
+
+        # ピーク強度（hPa基準）
+        xmax = torch.amax(Xb, dim=(1, 2))
+        xmin = torch.amin(Xb, dim=(1, 2))
+        aX = torch.clamp((xmax - xmin) / max(1e-6, p0_hpa), 0.0, 1.0)
+        aR = torch.clamp((ref.max() - ref.min()) / max(1e-6, p0_hpa), 0.0, 1.0)
+        da = (aX - aR).abs()
+
+        return torch.sqrt((dth * dth + dL * dL + da * da) / 3.0)
+
+    @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         現在のactivation_distanceに対応した「Xb vs 単一参照ref」の距離ベクトル(B,)
@@ -951,6 +1134,12 @@ class MiniSom:
             return self._msssim_to_ref(Xb, ref)
         elif self.activation_distance == 'haarpsi':
             return self._haarpsi_to_ref(Xb, ref)
+        elif self.activation_distance == 'pls':
+            return self._pls_to_ref(Xb, ref)
+        elif self.activation_distance == 'crp':
+            return self._crp_to_ref(Xb, ref)
+        elif self.activation_distance == 'cacl':
+            return self._cacl_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
