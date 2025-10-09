@@ -1,0 +1,12 @@
+src/PressurePattern/main_v7.py
+src/PressurePattern/main_v8.py
+src/PressurePattern/minisom_v7.py
+src/PressurePattern/minisom_v8.py
+src/PressurePattern/trash/minisom_v5.py
+
+まずは上記のプログラムを確認してBMU、距離指標について現状の状態を見てください
+しっかり確認して特徴や概要、詳細なアルゴリズムを理解してください
+
+現状、S1という距離指標があるのですが、これは既存手法です
+私はこれを超える手法を開発して提案するのが研究になります
+2つの海面更生気圧データ（161×161、55, 115, 15, 155  # [North, West, South, East]という広い範囲、日本広域）においける気圧配置の分類を細かく詳細まで見て、綺麗に分けることのできる距離指標を探しています

@@ -41,8 +41,6 @@ nc/era5_msl/
 
 *.nc
 
-*.txt
-
 *.png
 
 *.csv
@@ -54,10 +52,3 @@ nc/era5_msl/
 *.pt
 
 *.out
-
-*.md
-
-*.pdf 
-
-!SOM-MPPCA/document/*.txt
-!SOM-MPPCA/document/*.pdf
