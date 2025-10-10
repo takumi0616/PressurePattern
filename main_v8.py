@@ -1880,22 +1880,38 @@ def compute_node_true_medoids(
                 # Kappa curvature 距離（[0,1]）
                 D = pairwise_by_ref(lambda Xb, ref: _kappa_to_ref(Xb, ref), Xcand)
             elif method_name == 's1k':
-                # S1 と Kappa（行方向min–max正規化後のRMS合成）
+                # S1~[0,200]→200で割って[0,1]、κ[0,1] とRMS合成（理論値域）
                 D1 = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)      # (C,C)
                 Dk = pairwise_by_ref(lambda Xb, ref: _kappa_to_ref(Xb, ref), Xcand)        # (C,C)
-                eps = 1e-12
-                d1_min = D1.min(dim=1, keepdim=True).values
-                d1_max = D1.max(dim=1, keepdim=True).values
-                dk_min = Dk.min(dim=1, keepdim=True).values
-                dk_max = Dk.max(dim=1, keepdim=True).values
-                D1n = (D1 - d1_min) / (d1_max - d1_min + eps)
-                Dkn = (Dk - dk_min) / (dk_max - dk_min + eps)
-                D = torch.sqrt((D1n * D1n + Dkn * Dkn) / 2.0)
+                D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
+                D = torch.sqrt((D1n * D1n + Dk * Dk) / 2.0)
             elif method_name == 'spot':
                 # SPOT: sliced Wasserstein-1 (正負平均)
                 D = pairwise_by_ref(lambda Xb, ref: _spot_to_ref(Xb, ref), Xcand)
             elif method_name == 'msssim':
                 D = pairwise_by_ref(lambda Xb, ref: _msssim_to_ref(Xb, ref), Xcand)
+            elif method_name == 'msssim_kappa':
+                # 理論値域で正規化（MSSSIM[0,1], κ[0,1]）→RMS合成
+                Dms = pairwise_by_ref(lambda Xb, ref: _msssim_to_ref(Xb, ref), Xcand)
+                Dk  = pairwise_by_ref(lambda Xb, ref: _kappa_to_ref(Xb, ref), Xcand)
+                D   = torch.sqrt((Dms * Dms + Dk * Dk) / 2.0)
+            elif method_name == 'ssim5_kappa':
+                # 理論値域で正規化（SSIM5[0,1], κ[0,1]）→RMS合成
+                Ds5 = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+                Dk  = pairwise_by_ref(lambda Xb, ref: _kappa_to_ref(Xb, ref), Xcand)
+                D   = torch.sqrt((Ds5 * Ds5 + Dk * Dk) / 2.0)
+            elif method_name == 'msssim_s1':
+                # MSSSIM[0,1], S1~[0,200]→S1を200で割って[0,1]にしてRMS合成
+                Dms = pairwise_by_ref(lambda Xb, ref: _msssim_to_ref(Xb, ref), Xcand)
+                D1  = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
+                D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
+                D   = torch.sqrt((Dms * Dms + D1n * D1n) / 2.0)
+            elif method_name == 'ssim5_s1':
+                # SSIM5[0,1], S1~[0,200]→S1を200で割って[0,1]にしてRMS合成
+                Ds5 = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+                D1  = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
+                D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
+                D   = torch.sqrt((Ds5 * Ds5 + D1n * D1n) / 2.0)
             elif method_name == 'gvd':
                 # GVD: 二階微分不変量
                 D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
