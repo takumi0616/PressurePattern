@@ -2986,6 +2986,10 @@ def main():
         ('kappa',     'kappa'),
         ('s1k',       's1k'),
         ('msssim',    'msssim'),
+        ('msssim_kappa', 'msssim_kappa'),
+        ('ssim5_kappa', 'ssim5_kappa'),
+        ('msssim_s1', 'msssim_s1'),
+        ('ssim5_s1', 'ssim5_s1'),
     ]
     for mname, adist in methods:
         # 学習

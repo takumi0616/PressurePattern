@@ -109,8 +109,10 @@ class MiniSom:
 
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","msssim"')
+        allowed_distances = ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim',
+                            'msssim_kappa', 'ssim5_kappa', 'msssim_s1', 'ssim5_s1')
+        if activation_distance not in allowed_distances:
+            raise ValueError(f'activation_distance must be one of {allowed_distances}')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -483,7 +485,7 @@ class MiniSom:
     def _s1k_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
         """
         概要:
-          S1 と κ（Kappa 曲率）距離を“理論値域”で正規化した後、RMSで合成した距離を返す。
+          S1 と κ（Kappa 曲率）距離を"理論値域"で正規化した後、RMSで合成した距離を返す。
         引数:
           - Xb (Tensor): 入力バッチ (B,H,W)。
           - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
@@ -502,6 +504,88 @@ class MiniSom:
         d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
         dkn = torch.clamp(dk, min=0.0, max=1.0)
         return torch.sqrt((d1n * d1n + dkn * dkn) / 2.0)
+
+    @torch.no_grad()
+    def _msssim_kappa_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          マルチスケールSSIMとκ（Kappa 曲率）距離を"理論値域"で正規化した後、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - _msssim_distance_batch（値域[0,1]）と _kappa_distance_batch（[0,1]）を計算。
+          - 両方とも[0,1]範囲なので、そのままRMS合成: sqrt((MSSSIM^2 + κ^2)/2) を返す。
+        戻り値:
+          - Tensor: 形状 (B,m) の合成距離。
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        dms = self._msssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # [0,1]
+        dk = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)    # [0,1]
+        return torch.sqrt((dms * dms + dk * dk) / 2.0)
+
+    @torch.no_grad()
+    def _ssim5_kappa_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          SSIM5とκ（Kappa 曲率）距離を"理論値域"で正規化した後、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - _ssim5_distance_batch（値域[0,1]）と _kappa_distance_batch（[0,1]）を計算。
+          - 両方とも[0,1]範囲なので、そのままRMS合成: sqrt((SSIM5^2 + κ^2)/2) を返す。
+        戻り値:
+          - Tensor: 形状 (B,m) の合成距離。
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        ds5 = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)  # [0,1]
+        dk = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)   # [0,1]
+        return torch.sqrt((ds5 * ds5 + dk * dk) / 2.0)
+
+    @torch.no_grad()
+    def _msssim_s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          マルチスケールSSIMとS1距離を"理論値域"で正規化した後、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - _msssim_distance_batch（値域[0,1]）と _s1_distance_batch（値域おおむね[0,200]）を計算。
+          - S1を200で割って[0,1]へ正規化し、RMS合成: sqrt((MSSSIM^2 + S1n^2)/2) を返す。
+        戻り値:
+          - Tensor: 形状 (B,m) の合成距離。
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        dms = self._msssim_distance_batch(Xb, nodes_chunk=nodes_chunk)  # [0,1]
+        d1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)       # ~[0,200]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((dms * dms + d1n * d1n) / 2.0)
+
+    @torch.no_grad()
+    def _ssim5_s1_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          SSIM5とS1距離を"理論値域"で正規化した後、RMSで合成した距離を返す。
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
+        処理の詳細:
+          - _ssim5_distance_batch（値域[0,1]）と _s1_distance_batch（値域おおむね[0,200]）を計算。
+          - S1を200で割って[0,1]へ正規化し、RMS合成: sqrt((SSIM5^2 + S1n^2)/2) を返す。
+        戻り値:
+          - Tensor: 形状 (B,m) の合成距離。
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        ds5 = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)  # [0,1]
+        d1 = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)      # ~[0,200]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((ds5 * ds5 + d1n * d1n) / 2.0)
 
 
 
@@ -569,7 +653,7 @@ class MiniSom:
           - Xb (Tensor): 入力バッチ (B,H,W)。
           - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
         処理の詳細:
-          - 's1'/'euclidean'/'ssim5'/'kappa'/'s1k'/'msssim' の各実装を呼び分ける。
+          - 's1'/'euclidean'/'ssim5'/'kappa'/'s1k'/'msssim'/'msssim_kappa'/'ssim5_kappa'/'msssim_s1'/'ssim5_s1' の各実装を呼び分ける。
         戻り値:
           - Tensor: 形状 (B,m) の距離。
         """
@@ -585,6 +669,14 @@ class MiniSom:
             return self._s1k_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'msssim':
             return self._msssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'msssim_kappa':
+            return self._msssim_kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'ssim5_kappa':
+            return self._ssim5_kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'msssim_s1':
+            return self._msssim_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'ssim5_s1':
+            return self._ssim5_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -801,6 +893,36 @@ class MiniSom:
 
 
     @torch.no_grad()
+    def _msssim_kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """対参照のMSSSIM+κ RMS合成距離"""
+        dms = self._msssim_to_ref(Xb, ref)   # [0,1]
+        dk = self._kappa_to_ref(Xb, ref)     # [0,1]
+        return torch.sqrt((dms * dms + dk * dk) / 2.0)
+
+    @torch.no_grad()
+    def _ssim5_kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """対参照のSSIM5+κ RMS合成距離"""
+        ds5 = self._ssim5_to_ref(Xb, ref)    # [0,1]
+        dk = self._kappa_to_ref(Xb, ref)     # [0,1]
+        return torch.sqrt((ds5 * ds5 + dk * dk) / 2.0)
+
+    @torch.no_grad()
+    def _msssim_s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """対参照のMSSSIM+S1 RMS合成距離"""
+        dms = self._msssim_to_ref(Xb, ref)   # [0,1]
+        d1 = self._s1_to_ref(Xb, ref)        # ~[0,200]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((dms * dms + d1n * d1n) / 2.0)
+
+    @torch.no_grad()
+    def _ssim5_s1_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """対参照のSSIM5+S1 RMS合成距離"""
+        ds5 = self._ssim5_to_ref(Xb, ref)    # [0,1]
+        d1 = self._s1_to_ref(Xb, ref)        # ~[0,200]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((ds5 * ds5 + d1n * d1n) / 2.0)
+
+    @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         現在のactivation_distanceに対応した「Xb vs 単一参照ref」の距離ベクトル(B,)
@@ -817,6 +939,14 @@ class MiniSom:
             return self._s1k_to_ref(Xb, ref)
         elif self.activation_distance == 'msssim':
             return self._msssim_to_ref(Xb, ref)
+        elif self.activation_distance == 'msssim_kappa':
+            return self._msssim_kappa_to_ref(Xb, ref)
+        elif self.activation_distance == 'ssim5_kappa':
+            return self._ssim5_kappa_to_ref(Xb, ref)
+        elif self.activation_distance == 'msssim_s1':
+            return self._msssim_s1_to_ref(Xb, ref)
+        elif self.activation_distance == 'ssim5_s1':
+            return self._ssim5_s1_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
