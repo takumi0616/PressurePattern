@@ -1709,189 +1709,9 @@ def _msssim_to_ref(Xb: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         sim_prod = sim_prod * (sims[i] ** w[i])
     return 1.0 - sim_prod
 
-def _haarpsi_to_ref(Xb: torch.Tensor, ref: torch.Tensor, C: float = 30.0, alpha: float = 4.2) -> torch.Tensor:
-    """
-    HaarPSI distance to reference (grayscale, Haar wavelets)
-    - HS^(k) = l_alpha( 0.5 * (S(|g1^(k)*X|,|g1^(k)*R|) + S(|g2^(k)*X|,|g2^(k)*R|)) )
-    - W^(k)  = max(|g3^(k)*X|, |g3^(k)*R|)
-    - HaarPSI = { l_alpha^{-1}( Σ_k Σ HS^(k)·W^(k) / Σ_k Σ W^(k) ) }^2
-    Distance D=1-HaarPSI. k=1 horizontal (g⊗h), k=2 vertical (h⊗g); scales j=1,2(HF), j=3(LF)
-    Returns (B,)
-    """
-    device, dtype = Xb.device, Xb.dtype
-    B, H, W = Xb.shape
 
-    def _upsample1d(v: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros((v.numel() * 2 - 1,), device=device, dtype=dtype)
-        out[::2] = v
-        return out
 
-    def _conv1d_coeff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        na, nb = a.numel(), b.numel()
-        out = torch.zeros((na + nb - 1,), device=device, dtype=dtype)
-        for i in range(na):
-            out[i:i + nb] += a[i] * b
-        return out
 
-    def _haar_1d(j: int):
-        h1 = torch.tensor([1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
-        g1 = torch.tensor([-1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
-        if j == 1:
-            return h1, g1
-        h, g = h1.clone(), g1.clone()
-        for _ in range(2, j + 1):
-            h_up = _upsample1d(h)
-            g_up = _upsample1d(g)
-            h = _conv1d_coeff(h1, h_up)
-            g = _conv1d_coeff(h1, g_up)
-        return h, g
-
-    def _k2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return torch.ger(a, b).view(1, 1, a.numel(), b.numel())
-
-    h1, g1 = _haar_1d(1); h2, g2 = _haar_1d(2); h3, g3 = _haar_1d(3)
-    k1_g1 = _k2d(g1, h1); k2_g1 = _k2d(h1, g1)
-    k1_g2 = _k2d(g2, h2); k2_g2 = _k2d(h2, g2)
-    k1_g3 = _k2d(g3, h3); k2_g3 = _k2d(h3, g3)
-
-    def _conv_same(img: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        kh, kw = k.shape[-2], k.shape[-1]
-        pl = kw // 2; pr = kw - 1 - pl
-        pt = kh // 2; pb = kh - 1 - pt
-        return F.conv2d(F.pad(img, (pl, pr, pt, pb), mode='reflect'), k)
-
-    def _S(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return (2.0 * a * b + C) / (a * a + b * b + C)
-
-    def _logistic(x: torch.Tensor) -> torch.Tensor:
-        return 1.0 / (1.0 + torch.exp(-alpha * x))
-
-    def _inv_logistic(y: torch.Tensor) -> torch.Tensor:
-        y = torch.clamp(y, 1e-6, 1.0 - 1e-6)
-        return torch.log(y / (1.0 - y)) / alpha
-
-    X = Xb.unsqueeze(1)
-    R = ref.view(1, 1, H, W)
-
-    A11 = _conv_same(X, k1_g1).abs(); A12 = _conv_same(X, k1_g2).abs()
-    R11 = _conv_same(R, k1_g1).abs(); R12 = _conv_same(R, k1_g2).abs()
-    HS1 = _logistic(0.5 * (_S(A11, R11) + _S(A12, R12)))
-    Wb1 = _conv_same(X, k1_g3).abs(); Wr1 = _conv_same(R, k1_g3).abs()
-    W1 = torch.maximum(Wb1, Wr1)
-
-    A21 = _conv_same(X, k2_g1).abs(); A22 = _conv_same(X, k2_g2).abs()
-    R21 = _conv_same(R, k2_g1).abs(); R22 = _conv_same(R, k2_g2).abs()
-    HS2 = _logistic(0.5 * (_S(A21, R21) + _S(A22, R22)))
-    Wb2 = _conv_same(X, k2_g3).abs(); Wr2 = _conv_same(R, k2_g3).abs()
-    W2 = torch.maximum(Wb2, Wr2)
-
-    num = (HS1 * W1).flatten(1).sum(dim=1) + (HS2 * W2).flatten(1).sum(dim=1)
-    den = W1.flatten(1).sum(dim=1) + W2.flatten(1).sum(dim=1) + 1e-12
-    avg = num / den
-    sim = torch.clamp(_inv_logistic(avg) ** 2, 0.0, 1.0)
-    return 1.0 - sim
-
-def _pls_to_ref(Xb: torch.Tensor, ref: torch.Tensor, tau_factor: float = 0.5) -> torch.Tensor:
-    """
-    PLS（ラプラシアン符号ハミング）対参照距離。D = mismatch/(either_nonzero) ∈ [0,1]
-    """
-    device, dtype = Xb.device, Xb.dtype
-    B, H, W = Xb.shape
-    lap = torch.tensor([[0.0, 1.0, 0.0],
-                        [1.0,-4.0, 1.0],
-                        [0.0, 1.0, 0.0]], device=device, dtype=dtype).view(1,1,3,3)
-    LA = F.conv2d(Xb.unsqueeze(1), lap, padding=0)            # (B,1,H-2,W-2)
-    LR = F.conv2d(ref.view(1,1,H,W), lap, padding=0)          # (1,1,H-2,W-2)
-    absLR = LR.abs().flatten()
-    tau = tau_factor * (absLR.median() if absLR.numel() > 0 else torch.tensor(0.0, device=device, dtype=dtype))
-    SA = torch.sign(LA); SW = torch.sign(LR)
-    SA = torch.where(LA.abs() < tau, torch.zeros_like(SA), SA)
-    SW = torch.where(LR.abs() < tau, torch.zeros_like(SW), SW)
-    both_nz = (SA != 0) & (SW != 0)
-    either_nz = (SA != 0) | (SW != 0)
-    mism = (SA != SW) & both_nz
-    mism_b = mism.flatten(1).sum(dim=1).to(dtype)
-    either_b = either_nz.flatten(1).sum(dim=1).to(dtype)
-    return mism_b / (either_b + 1e-12)
-
-def _crp_to_ref(Xb: torch.Tensor, ref: torch.Tensor, bins: int = 16, alpha: float = 0.3) -> torch.Tensor:
-    """
-    CRP（中心+半径プロファイル）対参照距離。D = α·d_center + (1-α)·d_profile ∈ [0,1]
-    """
-    device, dtype = Xb.device, Xb.dtype
-    B, H, W = Xb.shape
-    # 参照中心（低気圧想定: 最小値）
-    idx_min = torch.argmin(ref.view(-1))
-    cy = (idx_min // W).to(dtype)
-    cx = (idx_min % W).to(dtype)
-    # サンプル側中心
-    idx_x = torch.argmin(Xb.view(B, -1), dim=1)
-    yx = (idx_x // W).to(dtype)
-    xx = (idx_x % W).to(dtype)
-    Lnorm = (float(H*H + W*W)) ** 0.5
-    d_center = torch.sqrt((yx - cy)**2 + (xx - cx)**2) / Lnorm
-    # 半径マップ（参照中心基準）→ リング平均
-    ys = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
-    xs = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
-    rmap = torch.sqrt((ys - cy)**2 + (xs - cx)**2).reshape(-1)  # (HW,)
-    rmax = rmap.max() + 1e-6
-    edges = torch.linspace(0.0, rmax, bins + 1, device=device, dtype=dtype)
-    ridx = (torch.bucketize(rmap, edges) - 1).clamp_(0, bins - 1).to(torch.long)
-    one = torch.ones_like(ridx, dtype=dtype)
-    # 参照プロファイル
-    PW_sum = torch.zeros((bins,), device=device, dtype=dtype)
-    PW_cnt = torch.zeros((bins,), device=device, dtype=dtype)
-    PW_sum.scatter_add_(0, ridx, ref.view(-1))
-    PW_cnt.scatter_add_(0, ridx, one)
-    PW = PW_sum / (PW_cnt + 1e-12)
-    # バッチ側プロファイル
-    PX_sum = torch.zeros((B, bins), device=device, dtype=dtype)
-    PX_cnt = torch.zeros((B, bins), device=device, dtype=dtype)
-    idx_b = ridx.view(1, -1).expand(B, -1)
-    PX_sum.scatter_add_(1, idx_b, Xb.view(B, -1))
-    PX_cnt.scatter_add_(1, idx_b, torch.ones((B, H * W), device=device, dtype=dtype))
-    PX = PX_sum / (PX_cnt + 1e-12)
-    num = (PX - PW.view(1, -1)).abs().sum(dim=1)
-    den = torch.maximum(PX.abs(), PW.view(1, -1).abs()).sum(dim=1)
-    d_profile = num / (den + 1e-12)
-    return torch.clamp(alpha * d_center + (1.0 - alpha) * d_profile, 0.0, 1.0)
-
-def _cacl_to_ref(Xb: torch.Tensor, ref: torch.Tensor, p0_hpa: float = 20.0) -> torch.Tensor:
-    """
-    CACL（低高中心ライン）対参照距離。向きθ・長さL・ピーク強度aの差のRMS ∈ [0,1]
-    """
-    device, dtype = Xb.device, Xb.dtype
-    B, H, W = Xb.shape
-    # 参照の min/max
-    ref_flat = ref.view(-1)
-    i_min_r = torch.argmin(ref_flat); i_max_r = torch.argmax(ref_flat)
-    yr = (i_min_r // W).to(dtype); xr = (i_min_r % W).to(dtype)
-    Yr = (i_max_r // W).to(dtype); Xr = (i_max_r % W).to(dtype)
-    denom_y = max(1, H - 1); denom_x = max(1, W - 1)
-    umin_r = torch.stack([yr / denom_y, xr / denom_x])
-    umax_r = torch.stack([Yr / denom_y, Xr / denom_x])
-    v_r = umax_r - umin_r
-    L_r = torch.sqrt((v_r * v_r).sum()) / (2.0 ** 0.5)
-    theta_r = torch.atan2(v_r[0], v_r[1])
-    # サンプル側
-    Xf = Xb.view(B, -1)
-    i_min = torch.argmin(Xf, dim=1); i_max = torch.argmax(Xf, dim=1)
-    y_min = (i_min // W).to(dtype); x_min = (i_min % W).to(dtype)
-    y_max = (i_max // W).to(dtype); x_max = (i_max % W).to(dtype)
-    umin = torch.stack([y_min / denom_y, x_min / denom_x], dim=1)  # (B,2)
-    umax = torch.stack([y_max / denom_y, x_max / denom_x], dim=1)  # (B,2)
-    v = umax - umin
-    L = torch.sqrt((v * v).sum(dim=1)) / (2.0 ** 0.5)
-    theta = torch.atan2(v[:, 0], v[:, 1])
-    # 成分距離
-    dth = (theta - theta_r).abs()
-    dth = torch.minimum(dth, math.pi - dth) / (math.pi / 2.0)
-    dL = (L - L_r).abs()
-    xmax = torch.amax(Xb, dim=(1, 2)); xmin = torch.amin(Xb, dim=(1, 2))
-    aX = torch.clamp((xmax - xmin) / max(1e-6, p0_hpa), 0.0, 1.0)
-    aR = torch.clamp((ref.max() - ref.min()) / max(1e-6, p0_hpa), 0.0, 1.0)
-    da = (aX - aR).abs()
-    return torch.sqrt((dth * dth + dL * dL + da * da) / 3.0)
 
 def compute_node_true_medoids(
     method_name: str,
@@ -2076,8 +1896,6 @@ def compute_node_true_medoids(
                 D = pairwise_by_ref(lambda Xb, ref: _spot_to_ref(Xb, ref), Xcand)
             elif method_name == 'msssim':
                 D = pairwise_by_ref(lambda Xb, ref: _msssim_to_ref(Xb, ref), Xcand)
-            elif method_name == 'haarpsi':
-                D = pairwise_by_ref(lambda Xb, ref: _haarpsi_to_ref(Xb, ref), Xcand)
             elif method_name == 'gvd':
                 # GVD: 二階微分不変量
                 D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
@@ -2093,15 +1911,6 @@ def compute_node_true_medoids(
             elif method_name == 's1gcurv':
                 # S1 + G-SSIM + curvature S1 (scaled)
                 D = pairwise_by_ref(lambda Xb, ref: _s1gcurv_to_ref(Xb, ref), Xcand)
-            elif method_name == 'pls':
-                # PLS: Laplacian Sign Hamming
-                D = pairwise_by_ref(lambda Xb, ref: _pls_to_ref(Xb, ref), Xcand)
-            elif method_name == 'crp':
-                # CRP: Cyclone Radial Profile
-                D = pairwise_by_ref(lambda Xb, ref: _crp_to_ref(Xb, ref), Xcand)
-            elif method_name == 'cacl':
-                # CACL: Cyclone–Anticyclone Center-Line
-                D = pairwise_by_ref(lambda Xb, ref: _cacl_to_ref(Xb, ref), Xcand)
             else:
                 raise ValueError(f'Unknown method_name: {method_name}')
 
@@ -3176,11 +2985,7 @@ def main():
         ('s1',        's1'),
         ('kappa',     'kappa'),
         ('s1k',       's1k'),
-        ('msssim',   'msssim'),
-        ('haarpsi',  'haarpsi'),
-        ('pls',      'pls'),
-        ('crp',      'crp'),
-        ('cacl',     'cacl'),
+        ('msssim',    'msssim'),
     ]
     for mname, adist in methods:
         # 学習

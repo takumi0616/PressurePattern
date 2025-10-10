@@ -54,7 +54,6 @@ class MiniSom:
           'kappa'    （κ 曲率距離：0.5 * Σ|κ(X)-κ(W)| / Σmax(|κ(X)|,|κ(W)|)）
           's1k'      （S1 と κ の RMS 合成；S1 と κ を行方向 min–max 正規化後に RMS）
           'msssim'   （マルチスケールSSIM: D=1-Π_s SSIM_s^{w_s}）
-          'haarpsi'  （HaarPSI 指標に基づく距離: D=1-HaarPSI）
       - 学習は「ミニバッチ版バッチSOM」：BMU→近傍重み→分子/分母累積→一括更新
       - 全ての重い計算はGPU実行
       - σ（近傍幅）は学習全体で一方向に減衰させる（セグメント学習でも継続）
@@ -110,8 +109,8 @@ class MiniSom:
 
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
-        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim', 'haarpsi', 'pls', 'crp', 'cacl'):
-            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","msssim","haarpsi","pls","crp","cacl"')
+        if activation_distance not in ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim'):
+            raise ValueError('activation_distance must be one of "s1","euclidean","ssim5","kappa","s1k","msssim"')
         self.activation_distance = activation_distance
 
         # 画像形状
@@ -570,7 +569,7 @@ class MiniSom:
           - Xb (Tensor): 入力バッチ (B,H,W)。
           - nodes_chunk (Optional[int]): ノード分割処理のチャンク。
         処理の詳細:
-          - 's1'/'euclidean'/'ssim5'/'kappa'/'s1k'/'msssim'/'haarpsi' の各実装を呼び分ける。
+          - 's1'/'euclidean'/'ssim5'/'kappa'/'s1k'/'msssim' の各実装を呼び分ける。
         戻り値:
           - Tensor: 形状 (B,m) の距離。
         """
@@ -586,14 +585,6 @@ class MiniSom:
             return self._s1k_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'msssim':
             return self._msssim_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'haarpsi':
-            return self._haarpsi_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'pls':
-            return self._pls_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'crp':
-            return self._crp_distance_batch(Xb, nodes_chunk=nodes_chunk)
-        elif self.activation_distance == 'cacl':
-            return self._cacl_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -621,79 +612,9 @@ class MiniSom:
                 out[:, k] = self._msssim_to_ref(Xb, self.weights[k])
         return out
 
-    @torch.no_grad()
-    def _haarpsi_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
-        """
-        概要:
-          HaarPSIに基づく距離をバッチ対全ノードで計算する（チャンク分割で逐次）。
-        引数:
-          - Xb (Tensor): 入力バッチ (B,H,W)。
-          - nodes_chunk (Optional[int]): ノード側の分割サイズ。
-        処理の詳細:
-          - ノードをチャンクに分け、各ノード重みを参照として _haarpsi_to_ref を呼び出し (B,) 距離を列に格納。
-        戻り値:
-          - Tensor: 形状 (B,m) の距離行列。
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        B = Xb.shape[0]
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            for k in range(start, end):
-                out[:, k] = self._haarpsi_to_ref(Xb, self.weights[k])
-        return out
 
-    @torch.no_grad()
-    def _pls_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, tau_factor: float = 0.5) -> Tensor:
-        """
-        概要:
-          PLS: Laplacian Sign Hamming 距離。凹凸（ラプラシアン符号）配置の一致度を用いた距離。
-        戻り: (B,m) in [0,1]
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        B = Xb.shape[0]
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            for k in range(start, end):
-                out[:, k] = self._pls_to_ref(Xb, self.weights[k], tau_factor=tau_factor)
-        return out
 
-    @torch.no_grad()
-    def _crp_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, bins: int = 16, alpha: float = 0.3) -> Tensor:
-        """
-        概要:
-          CRP: Cyclone Radial Profile 距離。中心位置と半径方向プロファイルの一致で定義。
-        戻り: (B,m) in [0,1]
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        B = Xb.shape[0]
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            for k in range(start, end):
-                out[:, k] = self._crp_to_ref(Xb, self.weights[k], bins=bins, alpha=alpha)
-        return out
 
-    @torch.no_grad()
-    def _cacl_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None, p0_hpa: float = 20.0) -> Tensor:
-        """
-        概要:
-          CACL: Cyclone–Anticyclone Center-Line 距離。低高中心の並び・長さ・強度の違い。
-        戻り: (B,m) in [0,1]
-        """
-        if nodes_chunk is None:
-            nodes_chunk = self.nodes_chunk
-        B = Xb.shape[0]
-        out = torch.empty((B, self.m), device=Xb.device, dtype=self.dtype)
-        for start in range(0, self.m, nodes_chunk):
-            end = min(start + nodes_chunk, self.m)
-            for k in range(start, end):
-                out[:, k] = self._cacl_to_ref(Xb, self.weights[k], p0_hpa=p0_hpa)
-        return out
 
     @torch.no_grad()
     def bmu_indices(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
@@ -875,245 +796,9 @@ class MiniSom:
             sim_prod = sim_prod * (sims[i] ** w[i])
         return 1.0 - sim_prod
 
-    @torch.no_grad()
-    def _haarpsi_to_ref(self, Xb: Tensor, ref: Tensor, C: float = 30.0, alpha: float = 4.2) -> Tensor:
-        """
-        概要:
-          HaarPSI（Haar waveletベースの知覚品質指標）に基づく対参照距離 D=1-HaarPSI を計算する。
-        引数:
-          - Xb (Tensor): 入力バッチ (B,H,W)。
-          - ref (Tensor): 参照2D場 (H,W)。
-          - C (float): 安定化定数（類似度Sの分母保護に使用）。
-          - alpha (float): ロジスティック写像の鋭さパラメータ。
-        処理の詳細:
-          - Haarウェーブレットの高周波(HF: j=1,2)・低周波(LF: j=3)フィルタを2方向（水平/垂直）で構成。
-          - 各方向・スケールで強度類似 S(|g*X|,|g*R|) をロジスティック変換し HS を得る。
-          - 重みは W = max(|g3*X|,|g3*R|) を用い、加重平均した HS を逆ロジスティック・二乗でHaarPSIへ。
-          - 最終的に D = 1 - HaarPSI を距離とする。
-        戻り値:
-          - Tensor: 形状 (B,) の距離ベクトル（[0,1] にクリップ）。
-        """
-        device, dtype = Xb.device, Xb.dtype
-        B, H, W = Xb.shape
 
-        # helper: 1D upsample by factor 2-1 zeros
-        def _upsample1d(v: torch.Tensor) -> torch.Tensor:
-            out = torch.zeros((v.numel() * 2 - 1,), device=device, dtype=dtype)
-            out[::2] = v
-            return out
 
-        # helper: 1D convolution (full) to combine small kernels (manual poly-conv)
-        def _conv1d_coeff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            na, nb = a.numel(), b.numel()
-            out = torch.zeros((na + nb - 1,), device=device, dtype=dtype)
-            for i in range(na):
-                out[i:i + nb] += a[i] * b
-            return out
 
-        # build Haar 1D filters (h_j, g_j)
-        def _haar_1d(j: int):
-            h1 = torch.tensor([1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
-            g1 = torch.tensor([-1.0, 1.0], device=device, dtype=dtype) / math.sqrt(2.0)
-            if j == 1:
-                return h1, g1
-            h, g = h1.clone(), g1.clone()
-            for _ in range(2, j + 1):
-                h_up = _upsample1d(h)
-                g_up = _upsample1d(g)
-                h = _conv1d_coeff(h1, h_up)
-                g = _conv1d_coeff(h1, g_up)
-            return h, g
-
-        # make 2D Haar wavelet kernels for j=1,2 (HF) and j=3 (LF for weights)
-        def _kernels_2d():
-            h1, g1 = _haar_1d(1); h2, g2 = _haar_1d(2); h3, g3 = _haar_1d(3)
-            def _k2d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-                k = torch.ger(a, b).view(1, 1, a.numel(), b.numel())
-                return k
-            # orientation k=1: horizontal edges => g ⊗ h; k=2: vertical edges => h ⊗ g
-            k1_g1 = _k2d(g1, h1); k2_g1 = _k2d(h1, g1)
-            k1_g2 = _k2d(g2, h2); k2_g2 = _k2d(h2, g2)
-            k1_g3 = _k2d(g3, h3); k2_g3 = _k2d(h3, g3)
-            return (k1_g1, k1_g2, k1_g3), (k2_g1, k2_g2, k2_g3)
-
-        (k1_g1, k1_g2, k1_g3), (k2_g1, k2_g2, k2_g3) = _kernels_2d()
-
-        # conv2d with SAME reflect padding
-        def _conv_same(img: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-            kh, kw = k.shape[-2], k.shape[-1]
-            pl = kw // 2; pr = kw - 1 - pl
-            pt = kh // 2; pb = kh - 1 - pt
-            return F.conv2d(F.pad(img, (pl, pr, pt, pb), mode='reflect'), k)
-
-        # S and logistic
-        def _S(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            return (2.0 * a * b + C) / (a * a + b * b + C)
-
-        def _logistic(x: torch.Tensor) -> torch.Tensor:
-            return 1.0 / (1.0 + torch.exp(-alpha * x))
-
-        def _inv_logistic(y: torch.Tensor) -> torch.Tensor:
-            y = torch.clamp(y, 1e-6, 1.0 - 1e-6)
-            return torch.log(y / (1.0 - y)) / alpha
-
-        X = Xb.unsqueeze(1)                    # (B,1,H,W)
-        R = ref.view(1, 1, H, W)               # (1,1,H,W)
-
-        # Orientation k=1
-        A11 = _conv_same(X, k1_g1).abs()       # (B,1,H,W)
-        A12 = _conv_same(X, k1_g2).abs()
-        R11 = _conv_same(R, k1_g1).abs()       # (1,1,H,W)
-        R12 = _conv_same(R, k1_g2).abs()
-        HS1 = _logistic(0.5 * (_S(A11, R11) + _S(A12, R12)))
-
-        Wb1 = _conv_same(X, k1_g3).abs()
-        Wr1 = _conv_same(R, k1_g3).abs()
-        W1 = torch.maximum(Wb1, Wr1)
-
-        # Orientation k=2
-        A21 = _conv_same(X, k2_g1).abs()
-        A22 = _conv_same(X, k2_g2).abs()
-        R21 = _conv_same(R, k2_g1).abs()
-        R22 = _conv_same(R, k2_g2).abs()
-        HS2 = _logistic(0.5 * (_S(A21, R21) + _S(A22, R22)))
-
-        Wb2 = _conv_same(X, k2_g3).abs()
-        Wr2 = _conv_same(R, k2_g3).abs()
-        W2 = torch.maximum(Wb2, Wr2)
-
-        # Weighted pooling across orientations
-        num = (HS1 * W1).flatten(1).sum(dim=1) + (HS2 * W2).flatten(1).sum(dim=1)   # (B,)
-        den = W1.flatten(1).sum(dim=1) + W2.flatten(1).sum(dim=1) + 1e-12          # (B,)
-        avg = num / den
-        inv = _inv_logistic(avg)
-        sim = torch.clamp(inv * inv, 0.0, 1.0)                                      # (B,)
-        return 1.0 - sim
-
-    @torch.no_grad()
-    def _pls_to_ref(self, Xb: Tensor, ref: Tensor, tau_factor: float = 0.5) -> Tensor:
-        """
-        概要:
-          PLS（ラプラシアン符号ハミング）対参照距離。D = mismatch/(either_nonzero)
-        戻り: (B,) in [0,1]
-        """
-        device, dtype = Xb.device, Xb.dtype
-        B, H, W = Xb.shape
-        lap = torch.tensor([[0.0, 1.0, 0.0],
-                            [1.0,-4.0, 1.0],
-                            [0.0, 1.0, 0.0]], device=device, dtype=dtype).view(1,1,3,3)
-        LA = F.conv2d(Xb.unsqueeze(1), lap, padding=0)            # (B,1,H-2,W-2)
-        LR = F.conv2d(ref.view(1,1,H,W), lap, padding=0)          # (1,1,H-2,W-2)
-        absLR = LR.abs().flatten()
-        tau = tau_factor * (absLR.median() if absLR.numel() > 0 else torch.tensor(0.0, device=device, dtype=dtype))
-        SA = torch.sign(LA)
-        SW = torch.sign(LR)
-        SA = torch.where(LA.abs() < tau, torch.zeros_like(SA), SA)
-        SW = torch.where(LR.abs() < tau, torch.zeros_like(SW), SW)
-        both_nz = (SA != 0) & (SW != 0)
-        either_nz = (SA != 0) | (SW != 0)
-        mism = (SA != SW) & both_nz
-        mism_b = mism.flatten(1).sum(dim=1).to(dtype)
-        either_b = either_nz.flatten(1).sum(dim=1).to(dtype)
-        return mism_b / (either_b + 1e-12)
-
-    @torch.no_grad()
-    def _crp_to_ref(self, Xb: Tensor, ref: Tensor, bins: int = 16, alpha: float = 0.3) -> Tensor:
-        """
-        概要:
-          CRP（中心+半径プロファイル）対参照距離。D = α·d_center + (1-α)·d_profile
-        戻り: (B,) in [0,1]
-        """
-        device, dtype = Xb.device, Xb.dtype
-        B, H, W = Xb.shape
-        # 参照中心（低気圧の仮定で最小値）
-        idx_min = torch.argmin(ref.view(-1))
-        cy = (idx_min // W).to(dtype)
-        cx = (idx_min % W).to(dtype)
-        # サンプル側中心
-        idx_x = torch.argmin(Xb.view(B, -1), dim=1)
-        yx = (idx_x // W).to(dtype)
-        xx = (idx_x % W).to(dtype)
-        Lnorm = (float(H*H + W*W)) ** 0.5
-        d_center = torch.sqrt((yx - cy)**2 + (xx - cx)**2) / Lnorm
-
-        # 半径ビン（参照中心基準）
-        ys = torch.arange(H, device=device, dtype=dtype).view(H, 1).expand(H, W)
-        xs = torch.arange(W, device=device, dtype=dtype).view(1, W).expand(H, W)
-        rmap = torch.sqrt((ys - cy)**2 + (xs - cx)**2).reshape(-1)  # (HW,)
-        rmax = rmap.max() + 1e-6
-        edges = torch.linspace(0.0, rmax, bins + 1, device=device, dtype=dtype)
-        ridx = (torch.bucketize(rmap, edges) - 1).clamp_(0, bins - 1).to(torch.long)  # (HW,)
-        one = torch.ones_like(ridx, dtype=dtype)
-
-        # 参照プロファイル
-        PW_sum = torch.zeros((bins,), device=device, dtype=dtype)
-        PW_cnt = torch.zeros((bins,), device=device, dtype=dtype)
-        PW_sum.scatter_add_(0, ridx, ref.view(-1))
-        PW_cnt.scatter_add_(0, ridx, one)
-        PW = PW_sum / (PW_cnt + 1e-12)  # (bins,)
-
-        # バッチ側プロファイル
-        PX_sum = torch.zeros((B, bins), device=device, dtype=dtype)
-        PX_cnt = torch.zeros((B, bins), device=device, dtype=dtype)
-        idx_b = ridx.view(1, -1).expand(B, -1)
-        PX_sum.scatter_add_(1, idx_b, Xb.view(B, -1))
-        PX_cnt.scatter_add_(1, idx_b, torch.ones((B, H * W), device=device, dtype=dtype))
-        PX = PX_sum / (PX_cnt + 1e-12)  # (B,bins)
-
-        num = (PX - PW.view(1, -1)).abs().sum(dim=1)
-        den = torch.maximum(PX.abs(), PW.view(1, -1).abs()).sum(dim=1)
-        d_profile = num / (den + 1e-12)
-
-        return torch.clamp(alpha * d_center + (1.0 - alpha) * d_profile, 0.0, 1.0)
-
-    @torch.no_grad()
-    def _cacl_to_ref(self, Xb: Tensor, ref: Tensor, p0_hpa: float = 20.0) -> Tensor:
-        """
-        概要:
-          CACL（低高中心ライン）対参照距離。向きθ・長さL・ピーク強度aの差のRMS。
-        戻り: (B,) in [0,1]
-        """
-        device, dtype = Xb.device, Xb.dtype
-        B, H, W = Xb.shape
-        # 参照の min/max
-        ref_flat = ref.view(-1)
-        i_min_r = torch.argmin(ref_flat)
-        i_max_r = torch.argmax(ref_flat)
-        yr = (i_min_r // W).to(dtype); xr = (i_min_r % W).to(dtype)
-        Yr = (i_max_r // W).to(dtype); Xr = (i_max_r % W).to(dtype)
-        # 正規化座標 [0,1]
-        denom_y = max(1, H - 1); denom_x = max(1, W - 1)
-        umin_r = torch.stack([yr / denom_y, xr / denom_x])  # (2,)
-        umax_r = torch.stack([Yr / denom_y, Xr / denom_x])  # (2,)
-        v_r = umax_r - umin_r
-        L_r = torch.sqrt((v_r * v_r).sum()) / (2.0 ** 0.5)  # [0,1]
-        theta_r = torch.atan2(v_r[0], v_r[1])               # y,x の順で atan2
-
-        # サンプル側
-        Xf = Xb.view(B, -1)
-        i_min = torch.argmin(Xf, dim=1)
-        i_max = torch.argmax(Xf, dim=1)
-        y_min = (i_min // W).to(dtype); x_min = (i_min % W).to(dtype)
-        y_max = (i_max // W).to(dtype); x_max = (i_max % W).to(dtype)
-        umin = torch.stack([y_min / denom_y, x_min / denom_x], dim=1)  # (B,2)
-        umax = torch.stack([y_max / denom_y, x_max / denom_x], dim=1)  # (B,2)
-        v = umax - umin                                                # (B,2)
-        L = torch.sqrt((v * v).sum(dim=1)) / (2.0 ** 0.5)              # (B,)
-        theta = torch.atan2(v[:, 0], v[:, 1])                          # (B,)
-
-        # 成分距離
-        dth = (theta - theta_r).abs()
-        dth = torch.minimum(dth, math.pi - dth) / (math.pi / 2.0)
-        dL = (L - L_r).abs()
-
-        # ピーク強度（hPa基準）
-        xmax = torch.amax(Xb, dim=(1, 2))
-        xmin = torch.amin(Xb, dim=(1, 2))
-        aX = torch.clamp((xmax - xmin) / max(1e-6, p0_hpa), 0.0, 1.0)
-        aR = torch.clamp((ref.max() - ref.min()) / max(1e-6, p0_hpa), 0.0, 1.0)
-        da = (aX - aR).abs()
-
-        return torch.sqrt((dth * dth + dL * dL + da * da) / 3.0)
 
     @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
@@ -1132,14 +817,6 @@ class MiniSom:
             return self._s1k_to_ref(Xb, ref)
         elif self.activation_distance == 'msssim':
             return self._msssim_to_ref(Xb, ref)
-        elif self.activation_distance == 'haarpsi':
-            return self._haarpsi_to_ref(Xb, ref)
-        elif self.activation_distance == 'pls':
-            return self._pls_to_ref(Xb, ref)
-        elif self.activation_distance == 'crp':
-            return self._crp_to_ref(Xb, ref)
-        elif self.activation_distance == 'cacl':
-            return self._cacl_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 
