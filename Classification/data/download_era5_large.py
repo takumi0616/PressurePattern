@@ -11,8 +11,8 @@ from tqdm import tqdm
 OUTPUT_DIR = "./nc/era5_msl_large"
 
 # --- ダウンロードしたい年リスト ---
-# 1991年から2000年まで
-YEARS_TO_DOWNLOAD = [str(year) for year in range(1991, 2001)]
+# 1940年から2024年まで（2025年はまだデータが完全ではないため除外推奨）
+YEARS_TO_DOWNLOAD = [str(year) for year in range(1940, 2025)] 
 
 # --- CDS APIリクエストの基本設定 ---
 # 年以外の共通パラメータをここで定義
