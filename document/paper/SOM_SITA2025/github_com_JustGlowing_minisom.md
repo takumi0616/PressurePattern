@@ -13,19 +13,20 @@
   - ベクトル化を重視したコーディングスタイル
   - 研究用途で手軽に使えること
 - 更新情報は X（旧 Twitter）に投稿されます（原文準拠）。
-- Google Colab でのクイックスタートが可能（「Open in Colab」リンクあり。PDFではリンク先URLは表示されず）。
+- Google Colab でのクイックスタートが可能（「Open in Colab」リンクあり。PDF ではリンク先 URL は表示されず）。
 
-リポジトリの主なファイル・変更履歴（抜粋、PDFに記載のとおり）:
+リポジトリの主なファイル・変更履歴（抜粋、PDF に記載のとおり）:
+
 - `.github/workflows` 最 新 Python バージョン追加
 - `examples` 基本的な使用法の更新
 - `.gitignore` 量子化誤差テスト修正、共通コード抽出
 - `LICENSE` 追加
-- `Readme.md` 400件超引用の更新
+- `Readme.md` 400 件超引用の更新
 - `minisom.py` 丸め誤差問題への対処、ドキュメント更新
 - `setup.cfg` 説明ファイルのダッシュ区切りを削除
 - `setup.py` リリース準備
 
-ダウンロード数: 1M（100万）  
+ダウンロード数: 1M（100 万）  
 Python package（バッジ相当）: passing（合格）
 
 ---
@@ -39,11 +40,13 @@ MiniSom の紹介
 インストール
 
 - pip を用いる場合:
+
 ```
 pip install minisom
 ```
 
 - ソースからインストール:
+
 ```
 git clone https://github.com/JustGlowing/minisom.git
 python setup.py install
@@ -56,9 +59,11 @@ python setup.py install
 使い方（How to use it）
 
 データの用意:
+
 - 各行が 1 観測に対応する NumPy 行列、または「リストのリスト」形式で構いません（原文の例）。
 
 例データ（原文の値をそのまま掲示; 一部は PDF で折返しあり）:
+
 ```
 data = [[ 0.80,  0.55,  0.22,  0.03],
         [ 0.82,  0.50,  0.23,  0.03],
@@ -70,6 +75,7 @@ data = [[ 0.80,  0.55,  0.22,  0.03],
 ```
 
 SOM の初期化と学習:
+
 ```
 from minisom import MiniSom
 
@@ -78,11 +84,13 @@ som.train(data, 100)  # 100 イテレーションで学習
 ```
 
 BMU（勝者ニューロン）の取得:
+
 ```
 som.winner(data[0])
 ```
 
 モデルの保存と再読み込み（pickle）:
+
 ```
 import pickle
 som = MiniSom(7, 7, 4)
@@ -100,9 +108,10 @@ with open('som.p', 'rb') as infile:
 
 例（Examples）
 
-MiniSom に実装されている機能の概要は、以下の examples で参照できます（GitHub の `examples` ディレクトリ、URL は PDFでは「https://github.com/JustGlowing/minisom/」と記載）。
+MiniSom に実装されている機能の概要は、以下の examples で参照できます（GitHub の `examples` ディレクトリ、URL は PDF では「https://github.com/JustGlowing/minisom/」と記載）。
 
 例として挙げられている可視化（原文に記載の見出し、画像は PDF 化の都合で非表示）:
+
 - Seeds map
 - Class assignment
 - Handwritten digits mapping
@@ -111,6 +120,7 @@ MiniSom に実装されている機能の概要は、以下の examples で参�
 - Outliers detection
 
 関連チュートリアル・資料（原文に列挙、PDF で数箇所切断・一部言語注記あり）:
+
 - Self Organizing Maps on the Glowing Python
 - How to solve the Travelling Salesman Problem from the book "Optimization Algorithms: AI techniques for design, plann..."（末尾欠落）
 - Lecture notes from the Machine Learning course at the University of Lisbon
@@ -122,29 +132,35 @@ MiniSom に実装されている機能の概要は、以下の examples で参�
 - Video tutorial: Self Organizing Maps Hyperparameter tuning by SuperDataScience Machine Learning
 
 引用（Citations）
+
 - MiniSom は 400 回以上引用（原文記載）。引用リストはリポジトリで参照可能。
 
 ---
 
 貢献ガイドライン（Guidelines to contribute）
 
-1) Pull Request（PR）の説明で、実装/修正点を明確に記載。速度向上に関する PR の場合、再現可能なベンチマークを提示。  
-2) 貢献内容を要約した「分かりやすいタイトル」を付ける。  
-3) コードのユニットテストを作成し、既存テストも最新化。`pytest` の使用例:
+1. Pull Request（PR）の説明で、実装/修正点を明確に記載。速度向上に関する PR の場合、再現可能なベンチマークを提示。
+2. 貢献内容を要約した「分かりやすいタイトル」を付ける。
+3. コードのユニットテストを作成し、既存テストも最新化。`pytest` の使用例:
+
 ```
 pytest minisom.py
 ```
-4) スタイルチェックに `pycodestyle` を用いる:
+
+4. スタイルチェックに `pycodestyle` を用いる:
+
 ```
 pycodestyle minisom.py
 ```
-5) コードは適切にコメント・ドキュメント化。公開メソッド（public method）は既存同様にドキュメントを付与。
+
+5. コードは適切にコメント・ドキュメント化。公開メソッド（public method）は既存同様にドキュメントを付与。
 
 ---
 
 引用方法（How to cite MiniSom）
 
-原文 BibTeX（PDFに記載のとおり）:
+原文 BibTeX（PDF に記載のとおり）:
+
 ```
 @misc{vettigliminisom,
   title={MiniSom: minimalistic and NumPy-based implementation of the Self Organizing Map},
