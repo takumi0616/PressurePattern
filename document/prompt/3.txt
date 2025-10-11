@@ -1,0 +1,7 @@
+src/PressurePattern/document/paper/classification/1904.10709v1.pdf
+
+上記の論文をそれぞれ読んでください
+おんなじ名前でmdファイルで論文の内容を詳細に解説した日本語のファイルを同じディレクトリ上に作成しているのですが、一部のmdファイルが論文の途中までしか記載できていないです
+完全に作成して欲しいです
+内容は削ったりせずに正確に日本語訳したものをmdファイルにしてください
+その後、情報をsrc/PressurePattern/document/paper/classification/README.mdの## 論文一覧に追加してください
