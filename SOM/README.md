@@ -210,8 +210,8 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v8_iter1000_batch128_seed{1,2}_*' \
-  /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu01
+  'gpu01:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v8_iter1000_batch128_seed{1,2,3,4,5,6,7,8,9,10}_*' \
+  /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/SOM/result_gpu01
 ```
 
 - gpu02 → mac
