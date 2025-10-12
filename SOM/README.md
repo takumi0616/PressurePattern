@@ -113,6 +113,10 @@ ps aux | grep main_v8.py | grep -v grep
 pkill -f "main_v8.py"
 ```
 
+```bash
+nohup python search_results_v8.py > search_results_v8.txt 2>&1 &
+```
+
 - 指定 GPU だけを止めたい場合はコマンドラインを絞り込む:
 
 ```bash

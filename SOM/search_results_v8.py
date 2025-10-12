@@ -31,26 +31,26 @@
 使い方（例）:
   # デフォルトでは src/PressurePattern/ 直下にある以下3つが存在すれば自動探索します:
   #   results_v6_iter100, results_v6_iter1000, results_v6_iter10000
-  python src/PressurePattern/search_results_v7.py
+  python src/PressurePattern/search_results_v8.py
 
   # 任意のディレクトリを複数指定して横断集計
-  python src/PressurePattern/search_results_v7.py --roots \
+  python src/PressurePattern/search_results_v8.py --roots \
     src/PressurePattern/results_v6_iter100 \
     src/PressurePattern/results_v6_iter1000 \
     src/PressurePattern/results_v6_iter10000
 
   # 従来どおり単一ルートで集計（後方互換）
-  python src/PressurePattern/search_results_v7.py --root src/PressurePattern/results_v6_iter100
+  python src/PressurePattern/search_results_v8.py --root src/PressurePattern/results_v6_iter100
 
   # 推奨手法の算出を表示（検証Basic重視、Combo/安定性/Nodewiseも加味）
   # すべて表示したい場合は --topk 0 を指定
-  python src/PressurePattern/search_results_v7.py --recommend --topk 0
+  python src/PressurePattern/search_results_v8.py --recommend --topk 0
 
   # 横断ピボット表（Verification Basic の平均）の CSV を出力
-  python src/PressurePattern/search_results_v7.py --csv-out summary_ver_basic.csv
+  python src/PressurePattern/search_results_v8.py --csv-out summary_ver_basic.csv
 
   # NetCDF の基本ラベル分布をレポート（1991-01-01〜2000-12-31）
-  python src/PressurePattern/search_results_v7.py --nc-report --nc-file src/PressurePattern/prmsl_era5_all_data_seasonal_large.nc --nc-start 1991-01-01 --nc-end 2000-12-31
+  python src/PressurePattern/search_results_v8.py --nc-report --nc-file src/PressurePattern/prmsl_era5_all_data_seasonal_large.nc --nc-start 1991-01-01 --nc-end 2000-12-31
 
 オプション:
   --roots       複数の results ディレクトリを指定（最優先）
@@ -1447,7 +1447,7 @@ def report_nc_labels(nc_path: str, start_date: str, end_date: str, basic_labels:
     """
     指定 NetCDF から期間 [start_date, end_date] を xarray で直接 .sel して抽出し、
     変数 'label' の基本ラベル出現分布を集計して表示する。
-    main_v7.py の load_and_prepare_data_unified と同等の座標検出・期間フィルタ方式に合わせる。
+    main_v8.py の load_and_prepare_data_unified と同等の座標検出・期間フィルタ方式に合わせる。
     """
     print("==== NetCDF ラベル分布レポート ====")
     print(f"ファイル: {nc_path}")
@@ -1457,7 +1457,7 @@ def report_nc_labels(nc_path: str, start_date: str, end_date: str, basic_labels:
         print("")
         return
 
-    # ラベル正規化: main_v7.py の basic_label_or_none に準拠（簡約版を内蔵）
+    # ラベル正規化: main_v8.py の basic_label_or_none に準拠（簡約版を内蔵）
     def _normalize_to_base_candidate(label_str: Optional[str]) -> Optional[str]:
         import unicodedata, re as _re
         if label_str is None:
@@ -1800,7 +1800,7 @@ def main():
     parser = argparse.ArgumentParser(description="複数 results_* ディレクトリのログから手法別の各種統計（学習/検証）を算出（横断・総合評価対応）")
     # 既定では src/PressurePattern/ 配下の results_v6_iter100/1000/10000 を自動探索（存在するものだけ）
     default_dir = os.path.dirname(os.path.abspath(__file__))
-    default_root_single = os.path.join(default_dir, "results_v7_iter1000_128")
+    default_root_single = os.path.join(default_dir, "results_v8_iter1000_128")
 
     parser.add_argument(
         "--root",
@@ -1834,7 +1834,7 @@ def main():
     )
     args = parser.parse_args()
     # 常に固定ファイルへ tee 出力を有効化（どこで実行しても同じパスに保存）
-    setup_global_tee_logging("/Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v7.log")
+    setup_global_tee_logging("/Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v8.log")
 
 
     # root 決定（--root 優先、無ければ既定ディレクトリ）
@@ -1874,7 +1874,7 @@ def main():
     print(" - 6A/6B/6C の Correct/Recall は「各ラベルの再現率（代表ノード群ベース）」の値を使用。")
     print(" - 本スクリプトは単一の results ディレクトリのみ評価し、複数 iter の横断集計は削除済み。")
     print(" - 実行完了時に ERA5 NetCDF（1991-01-01〜2000-12-31）のラベル分布レポートを末尾に自動追記します。")
-    print(" - すべての出力は /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v7.log にも Tee 保存されます。")
+    print(" - すべての出力は /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/search_results_v8.log にも Tee 保存されます。")
 
 
 if __name__ == "__main__":
