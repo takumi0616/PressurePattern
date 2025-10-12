@@ -40,10 +40,15 @@ TRAIN_YEARS = list(range(1991, 1998))  # 1991–1997
 VAL_YEARS   = list(range(1998, 2001))  # 1998–2000
 
 # 学習パラメータ
-EPOCHS = 50
+EPOCHS = 100
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
+
+# EMA/評価関連
+USE_EMA = True            # AveragedModel を使う（無効にすると常に生モデルで評価）
+EVAL_WITH_EMA = True      # 検証・最終保存はEMAを使用（Falseで生モデル）
+EMA_UPDATE_BN = True      # 各エポック後にEMAのBN統計を再推定(update_bn)
 
 # マルチラベルの閾値（0–1 の確率をラベル有無に変換するときのしきい値）
 PREDICTION_THRESHOLD = 0.5

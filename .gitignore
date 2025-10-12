@@ -53,3 +53,5 @@ nc/era5_msl/
 *.out
 
 *.pid
+
+*.ckpt

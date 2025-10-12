@@ -44,6 +44,30 @@ from torch import amp
 
 from sklearn.metrics import average_precision_score, classification_report
 
+# 追加インポート（学習レシピ/可視化）
+import math
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import LambdaLR
+try:
+    from torch.optim.swa_utils import AveragedModel, update_bn
+except Exception:
+    AveragedModel = None
+    update_bn = None
+
+# 詳細ログと計時のためのユーティリティ
+import time
+import logging
+from contextlib import contextmanager
+
+logger = logging.getLogger("main_v1")
+_START_TIME = time.perf_counter()
+def _elapsed() -> float:
+    return time.perf_counter() - _START_TIME
+def logi(msg: str) -> None:
+    logger.info(f"[+{_elapsed():.2f}s] {msg}")
+
 # 相対インポート（モジュール実行）と、スクリプト実行の両対応
 try:
     from .CNN import build_cnn, compute_pos_weights
@@ -72,6 +96,9 @@ try:
         # TENSORBOARD_LOGS_DIR,  # 未使用
         BASE_LABELS,
         VAR_CANDIDATES,
+        USE_EMA,
+        EVAL_WITH_EMA,
+        EMA_UPDATE_BN,
     )
 except Exception:
     import os as _os, sys as _sys
@@ -105,6 +132,9 @@ except Exception:
         # TENSORBOARD_LOGS_DIR,  # 未使用
         BASE_LABELS,
         VAR_CANDIDATES,
+        USE_EMA,
+        EVAL_WITH_EMA,
+        EMA_UPDATE_BN,
     )
 
 _LABEL_TOKEN_PATTERN = re.compile(r"[+\-]")  # '+' または '-' で分割
@@ -291,8 +321,12 @@ def _save_json(obj: dict, path: str):
 
 
 def main():
-    print("===== main_v1 (PyTorch): 気圧配置CNN 学習開始 =====")
-    print(f"データ: {DATA_PATH}")
+    # ロギング初期化
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    global _START_TIME
+    _START_TIME = time.perf_counter()
+    logi("===== main_v1 (PyTorch): 気圧配置CNN 学習開始 =====")
+    logi(f"データ: {DATA_PATH}")
     set_global_seed(RANDOM_SEED)
     _ensure_output_dirs()
 
@@ -305,6 +339,7 @@ def main():
         data_path = candidate if os.path.exists(candidate) else DATA_PATH
 
     # LZ4（h5netcdf + hdf5plugin）対応でまず h5netcdf エンジンを試し、失敗時はデフォルトにフォールバック
+    t0 = time.perf_counter()
     try:
         ds = xr.open_dataset(data_path, engine="h5netcdf")
     except Exception as e1:
@@ -312,6 +347,7 @@ def main():
             ds = xr.open_dataset(data_path)
         except Exception as e2:
             raise RuntimeError(f"NetCDFの読み込みに失敗しました。h5netcdf/LZ4対応が必要です: {e1} / fallback: {e2}")
+    logi(f"NetCDF 読み込み完了: path={data_path} ({time.perf_counter()-t0:.2f}s)")
     for v in ["valid_time", "latitude", "longitude", "label"]:
         if v not in ds:
             raise KeyError(f"NetCDF に '{v}' が見つかりません。")
@@ -320,6 +356,7 @@ def main():
     selected_vars = _resolve_selected_vars(ds, SELECTED_VARIABLES, VAR_CANDIDATES)
 
     # 入力/ラベルの構築
+    t_ds = time.perf_counter()
     x_train, y_train, x_val, y_val, keep, channels = _build_dataset(
         ds,
         base_labels=BASE_LABELS,
@@ -328,18 +365,24 @@ def main():
         train_years=TRAIN_YEARS,
         val_years=VAL_YEARS,
     )
+    logi(f"データセット構築完了: train={x_train.shape[0]} val={x_val.shape[0]} in_ch={x_train.shape[-1]} HxW={x_train.shape[1]}x{x_train.shape[2]} ({time.perf_counter()-t_ds:.2f}s)")
     print(f"データ統計: {keep}")
 
     # 正規化（train 統計）
+    t_norm = time.perf_counter()
     mean, std = _compute_norm_stats(x_train)
     x_train = _apply_norm(x_train, mean, std).astype(np.float32)
     x_val = _apply_norm(x_val, mean, std).astype(np.float32)
+    logi(f"正規化適用完了: C={x_train.shape[-1]} ({time.perf_counter()-t_norm:.2f}s)")
 
     # NCHW へ変換
     x_train_t = _np_to_torchNCHW(x_train).float()
+    x_train_t = x_train_t.contiguous(memory_format=torch.channels_last)
     y_train_t = torch.from_numpy(y_train).float()
     x_val_t = _np_to_torchNCHW(x_val).float()
+    x_val_t = x_val_t.contiguous(memory_format=torch.channels_last)
     y_val_t = torch.from_numpy(y_val).float()
+    logi(f"Tensor化完了: train={tuple(x_train_t.shape)} val={tuple(x_val_t.shape)}")
 
     # DataLoader
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -350,67 +393,159 @@ def main():
     val_ds = TensorDataset(x_val_t, y_val_t)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
+    logi(f"DataLoader 準備完了: batch_size={BATCH_SIZE} train_steps/epoch={len(train_loader)} val_steps={len(val_loader)} workers={num_workers}")
 
     # モデル/最適化/損失
     in_ch = x_train_t.shape[1]
     num_classes = y_train_t.shape[1]
     model = build_cnn(in_channels=in_ch, num_classes=num_classes).to(device)
+    # channels_last によるメモリレイアウト最適化
+    try:
+        model = model.to(memory_format=torch.channels_last)
+    except Exception:
+        pass
+    # PyTorch 2.x であれば torch.compile による最適化を試行
+    if hasattr(torch, "compile"):
+        try:
+            model = torch.compile(model)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    # モデル情報ログ
+    try:
+        n_params = sum(p.numel() for p in model.parameters())
+        logi(f"モデル構築完了: params={n_params:,} in_ch={in_ch} out_classes={num_classes}")
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            mem_alloc = torch.cuda.memory_allocated() / (1024**2)
+            mem_resv = torch.cuda.memory_reserved() / (1024**2)
+            logi(f"CUDA メモリ: allocated={mem_alloc:.1f}MB reserved={mem_resv:.1f}MB")
+    except Exception:
+        pass
 
     pos_weight_tensor = None
     if USE_POSITIVE_CLASS_WEIGHTS:
         pos_w = compute_pos_weights(y_train).astype(np.float32)  # (C,)
         print("陽性クラス重み（先頭表示）:", [round(float(w), 2) for w in pos_w[:8]], "...")
         pos_weight_tensor = torch.from_numpy(pos_w).to(device)
+        logi("陽性クラス重みの計算完了")
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+
+    # AdamW: 正則化は重みのみに適用（BN/bias除外）
+    decay_params, no_decay_params = [], []
+    for n, p in model.named_parameters():
+        if (p.ndim == 1) or n.endswith(".bias") or ("bn" in n) or ("norm" in n):
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay_params, "weight_decay": WEIGHT_DECAY},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
+        lr=LEARNING_RATE,
+    )
+
     scaler = amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # 早期終了/ベスト保存
+    # 学習率スケジューラ（Warmup + Cosine）
+    warmup_epochs = max(1, int(0.1 * EPOCHS))
+    min_lr_ratio = 0.1
+    def lr_lambda(epoch: int):
+        if epoch < warmup_epochs:
+            return float(epoch + 1) / float(max(1, warmup_epochs))  # 線形ウォームアップ
+        # Cosine decay: 1.0 → min_lr_ratio
+        progress = float(epoch - warmup_epochs) / float(max(1, EPOCHS - warmup_epochs))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    # 初期LRログ
+    init_lrs = [pg["lr"] for pg in optimizer.param_groups]
+    logi(f"Optimizer/Scheduler 準備完了: AdamW lr={init_lrs} weight_decay={WEIGHT_DECAY} warmup_epochs={warmup_epochs}")
+    logi(f"EMA settings: USE_EMA={USE_EMA} EVAL_WITH_EMA={EVAL_WITH_EMA} EMA_UPDATE_BN={EMA_UPDATE_BN}")
+
+    # EMA（利用可能なら）
+    ema_model = AveragedModel(model) if (USE_EMA and (AveragedModel is not None)) else None
+
+    # ベスト保存（停止は行わず、指定エポックまで必ず学習）
     best_map = -1.0
+    best_val_loss = float("inf")
     best_epoch = -1
-    patience = 10
-    wait = 0
 
     history = {
         "train_loss": [],
         "val_loss": [],
         "val_map": [],
     }
+    # 直前エポックのチェックポイント（上書き保存・クリーンアップ用）
+    prev_epoch_ckpt_path = None
 
     VERBOSE_EVERY_N_EPOCHS = 5  # ログ出力間隔（エポック）
 
     for epoch in range(1, EPOCHS + 1):
+        t_epoch0 = time.perf_counter()
         # -------- Train --------
         model.train()
         train_loss = 0.0
-        for xb, yb in train_loader:
+        batch_times = []
+        total_batches = len(train_loader)
+        logi(f"Epoch {epoch}/{EPOCHS} start: steps={total_batches}")
+        t_train0 = time.perf_counter()
+        for batch_idx, (xb, yb) in enumerate(train_loader):
             xb = xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
+            bt0 = time.perf_counter()
             with amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(xb)
                 loss = criterion(logits, yb)
             scaler.scale(loss).backward()
+            # 勾配クリッピング（安定化）
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
+            # EMA更新
+            if ema_model is not None:
+                ema_model.update_parameters(model)
+
+            # バッチ処理時間記録・進捗ログ
+            bt = time.perf_counter() - bt0
+            batch_times.append(bt)
+            if (batch_idx + 1) % max(1, total_batches // 5) == 0:
+                logi(f"train {batch_idx+1}/{total_batches} ({(batch_idx+1)/total_batches*100:.1f}%) last_loss={loss.item():.4f} bt={bt:.2f}s")
 
             train_loss += loss.item() * xb.size(0)
 
         train_loss /= len(train_loader.dataset)
+        t_train = time.perf_counter() - t_train0
+        if batch_times:
+            logi(f"Train 終了: avg_batch_time={np.mean(batch_times):.2f}s median={np.median(batch_times):.2f}s total={t_train:.2f}s")
+        else:
+            logi(f"Train 終了: total={t_train:.2f}s")
 
         # -------- Validate --------
-        model.eval()
+        # EMAのBN統計を再推定（必要なら）
+        if (EMA_UPDATE_BN and (ema_model is not None) and ("update_bn" in globals()) and (update_bn is not None)):
+            try:
+                logi("EMAモデルのBN統計を再推定(update_bn)")
+                update_bn(train_loader, ema_model, device=device)
+            except Exception as e:
+                logi(f"update_bn に失敗（スキップ）: {e}")
+
+        eval_model = ema_model if (USE_EMA and EVAL_WITH_EMA and (ema_model is not None)) else model
+        eval_model.eval()
         val_loss = 0.0
         all_probs = []
         all_trues = []
+        t_val0 = time.perf_counter()
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True)
                 with amp.autocast("cuda", enabled=(device.type == "cuda")):
-                    logits = model(xb)
+                    logits = eval_model(xb)
                     loss = criterion(logits, yb)
                     probs = torch.sigmoid(logits)
 
@@ -439,27 +574,97 @@ def main():
         history["val_map"].append(map_macro)
 
         # 改善時 or 指定間隔でのみログ出力
-        improved = map_macro > best_map
-        if (epoch == 1) or (epoch % VERBOSE_EVERY_N_EPOCHS == 0) or (epoch == EPOCHS) or improved:
-            print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  val_mAP={map_macro:.4f}")
+        improved_map = map_macro > best_map
+        improved_loss = val_loss < best_val_loss
+        t_val = time.perf_counter() - t_val0
+        t_epoch = time.perf_counter() - t_epoch0
+        if (epoch == 1) or (epoch % VERBOSE_EVERY_N_EPOCHS == 0) or (epoch == EPOCHS) or improved_loss or improved_map:
+            logi(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_mAP={map_macro:.4f} time: train={t_train:.2f}s val={t_val:.2f}s total={t_epoch:.2f}s")
 
-        # ベスト更新
-        if improved:
+        # ベスト更新（選択基準は val_loss 最小）
+        if improved_map:
             best_map = map_macro
+        if improved_loss:
+            best_val_loss = val_loss
             best_epoch = epoch
-            wait = 0
-            torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
-        else:
-            wait += 1
+            _to_save = model
+            if USE_EMA and EVAL_WITH_EMA and (ema_model is not None):
+                _to_save = ema_model
+            torch.save(_to_save.state_dict(), BEST_WEIGHTS_PATH)
 
-        # 早期終了
-        if wait >= patience:
-            print(f"Early stopping at epoch {epoch} (best mAP={best_map:.4f} @ epoch {best_epoch})")
-            break
+        # エポックチェックポイント保存（復旧用）
+        try:
+            ckpt_path = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_epoch_{epoch:03d}.ckpt")
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "ema_state": (ema_model.state_dict() if ema_model is not None else None),
+                "optimizer_state": optimizer.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "best_map": best_map,
+                "best_epoch": best_epoch,
+                "history": history,
+                "config": {
+                    "EPOCHS": EPOCHS,
+                    "BATCH_SIZE": BATCH_SIZE,
+                    "LEARNING_RATE": LEARNING_RATE,
+                    "WEIGHT_DECAY": WEIGHT_DECAY,
+                },
+            }, ckpt_path)
+            logi(f"エポックチェックポイント保存: {ckpt_path}")
+            # 前回のチェックポイントを削除（最新のみ保持）
+            if prev_epoch_ckpt_path and prev_epoch_ckpt_path != ckpt_path:
+                try:
+                    if os.path.exists(prev_epoch_ckpt_path):
+                        os.remove(prev_epoch_ckpt_path)
+                        logi(f"前回チェックポイント削除: {prev_epoch_ckpt_path}")
+                except Exception as e:
+                    logi(f"前回チェックポイント削除失敗: {e}")
+            prev_epoch_ckpt_path = ckpt_path
+        except Exception as e:
+            logi(f"チェックポイント保存に失敗: {e}")
 
-    # 最終保存
-    torch.save(model.state_dict(), FINAL_MODEL_PATH)
+        # スケジューラ更新
+        scheduler.step()
+
+
+    # 最終保存（ベストエポックの重みを最終として採用）
+    eval_model = ema_model if (USE_EMA and EVAL_WITH_EMA and (ema_model is not None)) else model
+    try:
+        state = torch.load(BEST_WEIGHTS_PATH, map_location=device)
+        eval_model.load_state_dict(state)
+        torch.save(eval_model.state_dict(), FINAL_MODEL_PATH)
+        logi(f"最終モデルはベストエポック（val_loss最小）を採用: epoch={best_epoch} best_val_loss={best_val_loss:.4f} best_mAP={best_map:.4f}")
+    except Exception as e:
+        logi(f"ベスト重みの読込に失敗（最終を現状モデルで保存）: {e}")
+        torch.save(model.state_dict(), FINAL_MODEL_PATH)
+
+    history["best_epoch"] = best_epoch
+    history["best_val_loss"] = float(best_val_loss)
+    history["best_map"] = float(best_map)
     _save_json(history, HISTORY_JSON_PATH)
+
+    # 損失曲線の保存（./result 配下へ）
+    loss_curve_path = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_loss_curve.png")
+    try:
+        plt.figure(figsize=(6, 4))
+        epochs_range = np.arange(1, len(history["train_loss"]) + 1)
+        plt.plot(epochs_range, history["train_loss"], label="train")
+        plt.plot(epochs_range, history["val_loss"], label="val")
+        if best_epoch >= 1:
+            plt.axvline(best_epoch, color="red", linestyle="--", linewidth=1.5, label=f"best@{best_epoch}")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.title(f"Loss vs. Epochs (best val_loss epoch={best_epoch})")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(loss_curve_path, dpi=150)
+        plt.close()
+        print(f"損失曲線の保存: {loss_curve_path}")
+    except Exception as e:
+        print("損失曲線の保存に失敗:", e)
 
     # 正規化統計の保存
     norm_info = {
@@ -472,7 +677,9 @@ def main():
         "val_years": VAL_YEARS,
         "base_labels": BASE_LABELS,
         "best_val_map": best_map,
+        "best_val_loss": float(best_val_loss),
         "best_epoch": best_epoch,
+        "selection_metric": "val_loss"
     }
     _save_json(norm_info, NORM_STATS_JSON_PATH)
     print(f"モデル保存: {FINAL_MODEL_PATH}")
@@ -480,15 +687,28 @@ def main():
     print(f"学習履歴保存: {HISTORY_JSON_PATH}")
     print(f"正規化統計保存: {NORM_STATS_JSON_PATH}")
 
-    # 検証レポート（threshold で 0/1 へ）
-    y_pred = (y_prob >= PREDICTION_THRESHOLD).astype(int)
+    # ベスト重みでの検証レポート（threshold で 0/1 へ）
+    eval_model.eval()
+    all_probs_best, all_trues_best = [], []
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            with amp.autocast("cuda", enabled=(device.type == "cuda")):
+                logits = eval_model(xb)
+                probs = torch.sigmoid(logits)
+            all_probs_best.append(probs.detach().cpu().numpy())
+            all_trues_best.append(yb.detach().cpu().numpy())
+    y_prob_best = np.concatenate(all_probs_best, axis=0)
+    y_true_best = np.concatenate(all_trues_best, axis=0)
+    y_pred_best = (y_prob_best >= PREDICTION_THRESHOLD).astype(int)
     try:
         report = classification_report(
-            y_true.astype(int), y_pred.astype(int),
+            y_true_best.astype(int), y_pred_best.astype(int),
             target_names=BASE_LABELS, zero_division=0, output_dict=True
         )
         _save_json(report, VAL_REPORT_JSON_PATH)
-        print(f"検証レポート保存: {VAL_REPORT_JSON_PATH}")
+        logi(f"ベスト重みでの検証レポート保存: {VAL_REPORT_JSON_PATH}")
     except Exception as e:
         print("classification_report でエラー:", e)
 

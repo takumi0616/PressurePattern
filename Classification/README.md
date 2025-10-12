@@ -1,12 +1,14 @@
 # コマンド
+
 ```bash
-nohup python main_v1.py > main_v1.txt 2>&1 &
+nohup python main_v1.py > main_v1.log 2>&1 &
+
+notify-run via-tml2 -- nohup python main_v1.py > main_v1.log 2>&1 &
+
+pkill -f "main_v1.py"
 ```
 
-
-
 # 研究概要
-
 
 現在私は気圧配置分類の研究を行なっています
 使用するデータは以下になります
