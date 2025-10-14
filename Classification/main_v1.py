@@ -9,7 +9,7 @@ main_v1 (PyTorch): ERA5 由来の気圧配置データを用いたマルチラ�
 - 出力: ./result 配下に保存（main_v1_config.py の OUTPUT_DIR で制御）
 - ラベル: 吉野の基本 15 クラスをマルチホット化（複合/移行は和集合で 1）
 - 分割: 年単位（1991–1997: train, 1998–2000: val）
-- 前処理: README準拠（msl: Pa→hPa + 各時刻の領域平均を差し引く）
+- 前処理: msl は Pa→hPa のみ（各時刻の領域平均は差し引かない）
 - 正規化: 学習データのチャネル毎 mean/std
 - 不均衡対策: BCEWithLogitsLoss の pos_weight を自動計算（陽性クラス逆頻度、クリップ）
 - 評価: 各エポックで validation の mAP（macro 平均の average precision）を算出しベストモデルを保存
@@ -76,7 +76,7 @@ try:
         DATA_PATH,
         SELECTED_VARIABLES,
         USE_SEASONAL_AS_CHANNELS,
-        SLP_TO_HPA_AND_REMOVE_AREA_MEAN,
+        SLP_TO_HPA,
         RANDOM_SEED,
         TRAIN_YEARS,
         VAL_YEARS,
@@ -112,7 +112,7 @@ except Exception:
         DATA_PATH,
         SELECTED_VARIABLES,
         USE_SEASONAL_AS_CHANNELS,
-        SLP_TO_HPA_AND_REMOVE_AREA_MEAN,
+        SLP_TO_HPA,
         RANDOM_SEED,
         TRAIN_YEARS,
         VAL_YEARS,
@@ -167,14 +167,10 @@ def _subset_years_indices(times: pd.DatetimeIndex, years: List[int]) -> np.ndarr
 
 def _msl_preprocess(da: xr.DataArray) -> xr.DataArray:
     """
-    READMEの前処理:
-    - Pa -> hPa 変換
-    - 各時刻で空間平均（lat, lon）を差し引き
+    前処理:
+    - Pa -> hPa 変換のみ（各時刻の領域平均は差し引かない）
     """
     out = da / 100.0  # Pa → hPa
-    mean2d = out.mean(dim=("latitude", "longitude"), skipna=True)
-    # xarray は次元名に基づいて自動ブロードキャストされるため、そのまま減算する
-    out = out - mean2d
     out.attrs["units"] = "hPa"
     return out
 
@@ -210,7 +206,7 @@ def _extract_channels(
         else:
             raise ValueError(f"変数 {var} の次元が想定外です: {da.dims}")
 
-        if var == "msl" and SLP_TO_HPA_AND_REMOVE_AREA_MEAN:
+        if var == "msl" and SLP_TO_HPA:
             da = _msl_preprocess(da)
 
         arrays.append(da.values.astype(np.float32))

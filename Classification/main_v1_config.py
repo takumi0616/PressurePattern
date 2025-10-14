@@ -29,8 +29,10 @@ SELECTED_VARIABLES = ["ALL"]
 USE_SEASONAL_AS_CHANNELS = True
 
 # 前処理
-# - msl は Pa -> hPa に変換し、各時刻で領域平均（緯度×経度）を引く（README の前処理）
-SLP_TO_HPA_AND_REMOVE_AREA_MEAN = True
+# - msl は Pa -> hPa に変換（領域平均の差し引きは行わない）
+SLP_TO_HPA = True
+# 互換性のためのエイリアス（旧名）。今後は SLP_TO_HPA を使用。
+SLP_TO_HPA_AND_REMOVE_AREA_MEAN = SLP_TO_HPA
 
 # 乱数シード
 RANDOM_SEED = 42
