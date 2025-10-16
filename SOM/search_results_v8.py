@@ -1818,8 +1818,8 @@ def main():
     parser.add_argument(
         "--precision",
         type=int,
-        default=2,
-        help="小数点以下の表示桁数 (default: 2)",
+        default=3,
+        help="小数点以下の表示桁数 (default: 3)",
     )
     parser.add_argument(
         "--recommend",
