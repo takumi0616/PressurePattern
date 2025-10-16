@@ -2,13 +2,13 @@
 """
 PyTorch 版 CNN モデル定義
 
-- CIFAR10/Weather の実装方針を参考に、Conv + BN + ReLU + MaxPool + Dropout のブロックを3層
+- シンプルな CNN: Conv + ReLU + MaxPool + Dropout を3層
 - 入力は (N, C, H, W)、出力はロジット（BCEWithLogitsLoss を用いるため sigmoid はかけない）
-- H, W 依存を小さくするため AdaptiveAvgPool2d(16,16) を挿入してパラメータを安定化
+- 入力サイズ依存を小さくするため AdaptiveAvgPool2d(4,4) を使用
 - マルチラベル分類（15 ラベル想定）
 
 公開関数
-- build_cnn(in_channels, num_classes): nn.Module を返す
+- build_cnn(in_channels, num_classes): nn.Module を返す（SimpleCNN を生成）
 - compute_pos_weights(y): 学習ラベル (N, C) から陽性クラス重みベクトル (C,) を算出
 """
 from __future__ import annotations
@@ -39,18 +39,30 @@ class SimpleCNN(nn.Module):
     def __init__(self, in_channels: int, num_classes: int):
         super().__init__()
         self.features = nn.Sequential(
-            ConvBlock(in_channels, 32, p_drop=0.25),
-            ConvBlock(32, 64, p_drop=0.25),
-            ConvBlock(64, 128, p_drop=0.25),
-            # 入力サイズ(161,161)想定でも、AdaptiveAvgPool2d で固定次元へ
-            nn.AdaptiveAvgPool2d((16, 16)),
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(p=0.25),
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(p=0.25),
+
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Dropout(p=0.25),
+
+            # 入力サイズに依存せず、全結合の入力次元を固定化
+            nn.AdaptiveAvgPool2d((4, 4)),
         )
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * 16 * 16, 512),
+            nn.Linear(64 * 4 * 4, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.5),
-            nn.Linear(512, num_classes),  # ロジットを出力（BCEWithLogitsLoss を使用）
+            nn.Linear(512, num_classes),  # ロジット（BCEWithLogitsLossを使用するためsigmoidはかけない）
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -156,9 +168,9 @@ class ResNetSmall(nn.Module):
 
 def build_cnn(in_channels: int, num_classes: int) -> nn.Module:
     """
-    高性能版 CNN を生成（ResNetSmall + SE + GAP）
+    シンプルなCNNを生成（Conv-ReLU-MaxPool-Dropout x3 + Flatten-512-Dropout + 出力）
     """
-    return ResNetSmall(in_channels=in_channels, num_classes=num_classes)
+    return SimpleCNN(in_channels=in_channels, num_classes=num_classes)
 
 
 def compute_pos_weights(y: Sequence[Sequence[float] | np.ndarray]) -> np.ndarray:

@@ -48,12 +48,13 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 
 # EMA/評価関連
-USE_EMA = True            # AveragedModel を使う（無効にすると常に生モデルで評価）
-EVAL_WITH_EMA = True      # 検証・最終保存はEMAを使用（Falseで生モデル）
-EMA_UPDATE_BN = True      # 各エポック後にEMAのBN統計を再推定(update_bn)
+USE_EMA = False           # AveragedModel を使う（無効にすると常に生モデルで評価）
+EVAL_WITH_EMA = False     # 検証・最終保存はEMAを使用（Falseで生モデル）
+EMA_UPDATE_BN = False     # 各エポック後にEMAのBN統計を再推定(update_bn)
 
 # マルチラベルの閾値（0–1 の確率をラベル有無に変換するときのしきい値）
-PREDICTION_THRESHOLD = 0.5
+PREDICTION_THRESHOLD = 0.7
+
 
 # クラス不均衡対策：陽性クラス重みを有効化（BCEWithLogitsLoss の pos_weight に反映）
 USE_POSITIVE_CLASS_WEIGHTS = True
