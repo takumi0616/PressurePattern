@@ -81,6 +81,7 @@ try:
         VAL_REPORT_JSON_PATH,
         BASE_LABELS,
         VAR_CANDIDATES,
+        COARSEN_FACTOR,
     )
 except Exception:
     import os as _os, sys as _sys
@@ -112,6 +113,7 @@ except Exception:
         VAL_REPORT_JSON_PATH,
         BASE_LABELS,
         VAR_CANDIDATES,
+        COARSEN_FACTOR,
     )
 
 _LABEL_TOKEN_PATTERN = re.compile(r"[+\-]")  # '+' または '-' で分割
@@ -164,10 +166,28 @@ def _extract_channels(
     selected_vars: List[str],
     use_season: bool,
 ) -> Tuple[np.ndarray, List[str]]:
-    arrays = []
-    channel_names = []
+    """
+    NetCDF から (T,H,W,C) を構築。必要なら空間ダウンサンプリング（coarsen）を適用。
+    """
+    arrays: List[np.ndarray] = []
+    channel_names: List[str] = []
 
+    # coarsen 用の設定（boundary='trim' で端数を切り捨て）
+    factor = int(COARSEN_FACTOR) if 'COARSEN_FACTOR' in globals() else 1
+    if factor < 1:
+        factor = 1
+    lat_size = int(ds.sizes["latitude"])
+    lon_size = int(ds.sizes["longitude"])
+    if factor > 1:
+        lat_trim = (lat_size // factor) * factor
+        lon_trim = (lon_size // factor) * factor
+    else:
+        lat_trim, lon_trim = lat_size, lon_size
+
+    # 物理量チャネル
     for var in selected_vars:
+        if var not in ds:
+            continue
         da = ds[var]
         if set(["valid_time", "latitude", "longitude"]).issubset(set(da.dims)):
             da = da.transpose("valid_time", "latitude", "longitude")
@@ -177,22 +197,36 @@ def _extract_channels(
         if var == "msl" and SLP_TO_HPA:
             da = _msl_preprocess(da)
 
-        arrays.append(da.values.astype(np.float32))
+        if factor > 1:
+            da = da.isel(latitude=slice(0, lat_trim), longitude=slice(0, lon_trim))
+            da = da.coarsen(latitude=factor, longitude=factor, boundary="trim").mean()
+
+        vals = da.values.astype(np.float32)
+        # 非有限値（NaN, ±inf）を0で置換して学習の数値安定性を確保
+        vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+        arrays.append(vals)
         channel_names.append(var)
 
+    # 季節チャネル（coarsen 後の解像度に合わせてブロードキャスト）
     if use_season:
+        # 参照解像度（既に1つでも作ったチャネルから取得）
+        if arrays:
+            _, H_ref, W_ref = arrays[0].shape
+        else:
+            # フォールバック（理論上ここには来ないはず）
+            H_ref = (lat_trim // factor) if factor > 1 else lat_size
+            W_ref = (lon_trim // factor) if factor > 1 else lon_size
+
         for sname in ["f1_season", "f2_season"]:
             if sname not in ds:
                 continue
             v = ds[sname].values.astype(np.float32)  # (T,)
-            lat_len = ds.sizes["latitude"]
-            lon_len = ds.sizes["longitude"]
-            v3 = np.repeat(v[:, None, None], lat_len, axis=1)
-            v3 = np.repeat(v3, lon_len, axis=2)
+            v3 = np.repeat(v[:, None, None], H_ref, axis=1)
+            v3 = np.repeat(v3, W_ref, axis=2)
             arrays.append(v3)
             channel_names.append(sname)
 
-    x = np.stack(arrays, axis=-1)  # (T, H, W, C)
+    x = np.stack(arrays, axis=-1) if arrays else np.empty((0, 0, 0, 0), dtype=np.float32)  # (T,H,W,C)
     return x, channel_names
 
 
@@ -291,6 +325,15 @@ def main():
     set_global_seed(RANDOM_SEED)
     _ensure_output_dirs()
 
+    # スレッド数の上限を環境変数で制御（Docker内のメモリ/CPU過負荷回避）
+    for k in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"]:
+        os.environ.setdefault(k, "1")
+    try:
+        import torch as _torch_internal
+        _torch_internal.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "1")))
+    except Exception:
+        pass
+
     # データパス解決
     if os.path.isabs(DATA_PATH):
         data_path = DATA_PATH
@@ -341,7 +384,9 @@ def main():
 
     # DataLoader
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_workers = min(4, os.cpu_count() or 1)
+    # DataLoaderワーカー数を環境変数で上書き可能（既定は低めに抑える）
+    num_workers_env = os.getenv("NUM_WORKERS")
+    num_workers = int(num_workers_env) if num_workers_env is not None else min(2, os.cpu_count() or 1)
     pin_mem = device.type == "cuda"
 
     train_ds = TensorDataset(x_train_t, y_train_t)

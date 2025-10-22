@@ -28,6 +28,10 @@ SELECTED_VARIABLES = ["ALL"]
 # 季節特徴量（f1_season, f2_season）もチャネルとして使用（要求: 全て使う → True）
 USE_SEASONAL_AS_CHANNELS = True
 
+# 空間ダウンサンプリング係数（>1 で coarsen により緯度経度方向を間引き）
+# メモリ不足(OOM)の回避や高速化のために 2 以上を推奨。1 で元解像度のまま。
+COARSEN_FACTOR = 1
+
 # 前処理
 # - msl は Pa -> hPa に変換（領域平均の差し引きは行わない）
 SLP_TO_HPA = True
@@ -42,7 +46,7 @@ TRAIN_YEARS = list(range(1991, 1998))  # 1991–1997
 VAL_YEARS   = list(range(1998, 2001))  # 1998–2000
 
 # 学習パラメータ
-EPOCHS = 100
+EPOCHS = 50
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
@@ -83,7 +87,9 @@ BASE_LABELS = [
 ]
 
 # 自動選択の候補（存在チェックして採用）
+# 取得・派生する可能性のある物理量チャネル候補（NetCDF 内に存在するもののみ自動採用）
 VAR_CANDIDATES = [
+    # 既存
     "msl",
     "gh500",
     "t850",
@@ -91,6 +97,35 @@ VAR_CANDIDATES = [
     "u850", "v850",
     "r700", "r850",
     "vo850",
+    # 追加（圧力面/派生）
+    "vo500",               # 500hPa 相対渦度
+    "gh1000",              # 1000hPa ジオポテンシャル高度（m）
+    "thk_1000_500",        # 厚さ（1000-500hPa, m）
+    "grad_thk_1000_500",   # 厚さの水平勾配（m m-1）
+    "q850",                # 850hPa 比湿（kg kg-1）
+    "thetae850",           # 850hPa 相当温位（K）
+    "grad_thetae850",      # |∇θe|（K m-1）
+    "div850",              # 850hPa 発散（s-1）
+    "w500",                # 500hPa 鉛直速度（Pa s-1）
+    "w700",                # 700hPa 鉛直速度（Pa s-1）
+    "vmag500", "vmag850",  # 風速 |V|（m s-1）
+    "shear_850_500",       # ベクトル鉛直風シア |V500-V850|（m s-1）
+    "mfc850",              # 850hPa 水蒸気フラックス収束（-∇·qV, s-1）
+    # 追加（単一レベル）
+    "tcwv",                # 可降水量（kg m-2）
+    "ivt",                 # 統合水蒸気輸送量の大きさ（kg m-1 s-1）
+    "ivt_dir",             # IVT の方位（度）
+    "tcc",                 # 総雲量（0-1）
+    "tp",                  # 総降水量（m）
+    "u10", "v10",          # 10m 風（m s-1）
+    "vmag10",              # 10m 風速（m s-1）
+    "tclw", "tciw",        # 全雲液水量/氷水量
+    "tcrw", "tcsw",        # 全降水液水量/雪水量
+    "sst",                 # 海面水温（K）
+    # SLP の時間・空間派生
+    "msl_dt24",            # 24h 変化量（Pa / 24h）
+    "grad_msl",            # 水平勾配大きさ（Pa m-1）
+    "lap_msl",             # ラプラシアン近似（Pa m-2）
 ]
 
 # 以降は main_v1.py がこの設定を読み込み、学習/評価を実行します。

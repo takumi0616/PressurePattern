@@ -10,12 +10,28 @@ from tqdm import tqdm
 import hdf5plugin
 
 # ================================================================================
+# Dask/chunked DataArray 対応のユーティリティ（xarray.apply_ufunc を並列化）
+# ================================================================================
+def _da_log(x: xr.DataArray) -> xr.DataArray:
+    return xr.apply_ufunc(np.log, x, dask="parallelized", output_dtypes=[np.float64])
+
+def _da_exp(x: xr.DataArray) -> xr.DataArray:
+    return xr.apply_ufunc(np.exp, x, dask="parallelized", output_dtypes=[np.float64])
+
+def _da_arctan2(y: xr.DataArray, x: xr.DataArray) -> xr.DataArray:
+    return xr.apply_ufunc(np.arctan2, y, x, dask="parallelized", output_dtypes=[np.float64])
+
+def _da_degrees(x: xr.DataArray) -> xr.DataArray:
+    return xr.apply_ufunc(np.degrees, x, dask="parallelized", output_dtypes=[np.float64])
+
+# ================================================================================
 # 参照/パス設定（このファイルの場所基準で解決）
 # ================================================================================
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))   # .../src/PressurePattern/Classification/data
 DATA_DIR = THIS_DIR
 OUTPUT_DIR_MSL = os.path.join(DATA_DIR, "nc/era5_msl_large")
 OUTPUT_DIR_PL  = os.path.join(DATA_DIR, "nc/era5_pl_large")
+OUTPUT_DIR_SL  = os.path.join(DATA_DIR, "nc/era5_single_large")
 OUTPUT_ALL_FILE = os.path.join(DATA_DIR, "nc", "era5_all_data_pp.nc")
 
 # ラベル辞書読み込み（パッケージ/スクリプト直実行の両対応）
@@ -57,16 +73,36 @@ BASE_REQUEST_SINGLE = {
 
 # 圧力面データのタスクリスト（CDSの正式キーを使用）
 PL_TASKS = [
-    {"name": "z500",  "variables": ["geopotential"],                "levels": ["500"],       "filename_tpl": "era5_z_500_{year}.nc"},
-    {"name": "t850",  "variables": ["temperature"],                 "levels": ["850"],       "filename_tpl": "era5_t_850_{year}.nc"},
-    {"name": "uv500", "variables": ["u_component_of_wind", "v_component_of_wind"], "levels": ["500"], "filename_tpl": "era5_uv_500_{year}.nc"},
-    {"name": "uv850", "variables": ["u_component_of_wind", "v_component_of_wind"], "levels": ["850"], "filename_tpl": "era5_uv_850_{year}.nc"},
-    {"name": "rh7085","variables": ["relative_humidity"],           "levels": ["700", "850"],"filename_tpl": "era5_rh_700_850_{year}.nc"},
-    {"name": "vo850", "variables": ["vorticity"],                   "levels": ["850"],       "filename_tpl": "era5_vo_850_{year}.nc"},
+    {"name": "z",     "variables": ["geopotential"],                                 "levels": ["500", "1000"], "filename_tpl": "era5_z_500_1000_{year}.nc"},
+    {"name": "t850",  "variables": ["temperature"],                                  "levels": ["850"],         "filename_tpl": "era5_t_850_{year}.nc"},
+    {"name": "uv500", "variables": ["u_component_of_wind", "v_component_of_wind"],   "levels": ["500"],         "filename_tpl": "era5_uv_500_{year}.nc"},
+    {"name": "uv850", "variables": ["u_component_of_wind", "v_component_of_wind"],   "levels": ["850"],         "filename_tpl": "era5_uv_850_{year}.nc"},
+    {"name": "rh7085","variables": ["relative_humidity"],                            "levels": ["700", "850"],  "filename_tpl": "era5_rh_700_850_{year}.nc"},
+    {"name": "vo850", "variables": ["vorticity"],                                    "levels": ["850"],         "filename_tpl": "era5_vo_850_{year}.nc"},
+    {"name": "vo500", "variables": ["vorticity"],                                    "levels": ["500"],         "filename_tpl": "era5_vo_500_{year}.nc"},
+    {"name": "q850",  "variables": ["specific_humidity"],                            "levels": ["850"],         "filename_tpl": "era5_q_850_{year}.nc"},
+    {"name": "w500",  "variables": ["vertical_velocity"],                            "levels": ["500"],         "filename_tpl": "era5_w_500_{year}.nc"},
+    {"name": "w700",  "variables": ["vertical_velocity"],                            "levels": ["700"],         "filename_tpl": "era5_w_700_{year}.nc"},
+    {"name": "d850",  "variables": ["divergence"],                                   "levels": ["850"],         "filename_tpl": "era5_d_850_{year}.nc"},
+]
+
+# 追加: 単一レベルの有用変数（IVT/TCWV/CAPE/CIN/TCC/TP）
+SINGLE_TASKS = [
+    {"name": "tcwv",     "variables": ["total_column_water_vapour"],                                                                      "filename_tpl": "era5_tcwv_{year}.nc"},
+    {"name": "ivt_flux", "variables": ["vertical_integral_of_eastward_water_vapour_flux", "vertical_integral_of_northward_water_vapour_flux"], "filename_tpl": "era5_ivt_flux_{year}.nc"},
+    {"name": "cape_cin", "variables": ["convective_available_potential_energy", "convective_inhibition"],                                 "filename_tpl": "era5_cape_cin_{year}.nc"},
+    {"name": "tcc",      "variables": ["total_cloud_cover"],                                                                              "filename_tpl": "era5_tcc_{year}.nc"},
+    {"name": "tp",       "variables": ["total_precipitation"],                                                                            "filename_tpl": "era5_tp_{year}.nc"},
+    {"name": "u10v10",   "variables": ["10m_u_component_of_wind", "10m_v_component_of_wind"],                                             "filename_tpl": "era5_u10_v10_{year}.nc"},
+    {"name": "sst",      "variables": ["sea_surface_temperature"],                                                                        "filename_tpl": "era5_sst_{year}.nc"},
+    {"name": "tclw",     "variables": ["total_column_cloud_liquid_water"],                                                                "filename_tpl": "era5_tclw_{year}.nc"},
+    {"name": "tciw",     "variables": ["total_column_cloud_ice_water"],                                                                   "filename_tpl": "era5_tciw_{year}.nc"},
+    {"name": "tcrw",     "variables": ["total_column_rain_water"],                                                                        "filename_tpl": "era5_tcrw_{year}.nc"},
+    {"name": "tcsw",     "variables": ["total_column_snow_water"],                                                                        "filename_tpl": "era5_tcsw_{year}.nc"},
 ]
 
 def ensure_dirs():
-    for d in [OUTPUT_DIR_MSL, OUTPUT_DIR_PL, os.path.join(DATA_DIR, "nc")]:
+    for d in [OUTPUT_DIR_MSL, OUTPUT_DIR_PL, OUTPUT_DIR_SL, os.path.join(DATA_DIR, "nc")]:
         os.makedirs(d, exist_ok=True)
 
 def retrieve_single_level_year(client: cdsapi.Client, year: str):
@@ -85,6 +121,25 @@ def retrieve_single_level_year(client: cdsapi.Client, year: str):
         print(f"❌ エラー: {year}年 SLP のダウンロードに失敗: {e}")
         if os.path.exists(fp):
             os.remove(fp)
+
+def retrieve_single_misc_year(client: cdsapi.Client, year: str):
+    for task in SINGLE_TASKS:
+        filename = task["filename_tpl"].format(year=year)
+        filepath = os.path.join(OUTPUT_DIR_SL, filename)
+        if os.path.exists(filepath):
+            print(f"✅ スキップ: {filename} は既に存在します。")
+            continue
+        req = BASE_REQUEST_SINGLE.copy()
+        req["year"] = year
+        req["variable"] = task["variables"]
+        try:
+            print(f"🚀 ダウンロード開始 (SL:{task['name']}): {year}年 変数={task['variables']}")
+            client.retrieve("reanalysis-era5-single-levels", req, filepath)
+            print(f"🎉 成功: {filename} を保存しました。")
+        except Exception as e:
+            print(f"❌ エラー: {year}年 {task['name']} のダウンロードに失敗: {e}")
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
 def retrieve_pressure_levels_year(client: cdsapi.Client, year: str):
     for task in PL_TASKS:
@@ -115,6 +170,7 @@ def download_era5_data():
     print(f"対象期間: {YEARS_TO_DOWNLOAD[0]}年 ～ {YEARS_TO_DOWNLOAD[-1]}年")
     print(f"保存先 (SLP): {OUTPUT_DIR_MSL}")
     print(f"保存先 (PL) : {OUTPUT_DIR_PL}")
+    print(f"保存先 (SL) : {OUTPUT_DIR_SL}")
     print("="*80)
     try:
         client = cdsapi.Client()
@@ -126,6 +182,7 @@ def download_era5_data():
     print("ダウンロード処理を開始します...")
     for year in tqdm(YEARS_TO_DOWNLOAD, desc="全体の進捗"):
         retrieve_single_level_year(client, year)
+        retrieve_single_misc_year(client, year)
         retrieve_pressure_levels_year(client, year)
     print("すべてのダウンロード処理が完了しました。")
 
@@ -327,9 +384,30 @@ def open_pl_files(pl_dir: str):
     ds = standardize_time(ds)
     if 'level' in ds.dims and 'pressure_level' not in ds.dims:
         ds = ds.rename({'level': 'pressure_level'})
-    expected_any = ['z', 't', 'u', 'v', 'r', 'vo']
+    expected_any = ['z', 't', 'u', 'v', 'r', 'vo', 'q', 'w', 'd']
     if not any(v in ds.variables for v in expected_any):
         raise ValueError("圧力面データに必要な変数が見つかりません。")
+    return ds
+
+def open_single_misc_files(sl_dir: str):
+    pattern = os.path.join(sl_dir, "*.nc")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print(f"単一レベル追加変数ファイルが見つかりません: {sl_dir}")
+        return None
+    print(f"単一レベル（追加）ファイル {len(files)} 個を結合中...")
+    ds = xr.open_mfdataset(
+        files,
+        combine='by_coords',
+        parallel=True,
+        join='outer',
+        compat='no_conflicts',
+        chunks="auto",
+        data_vars='minimal',
+        coords='minimal',
+        combine_attrs='drop_conflicts'
+    )
+    ds = standardize_time(ds)
     return ds
 
 def derive_fields_from_pl(pl_ds: xr.Dataset) -> xr.Dataset:
@@ -340,6 +418,7 @@ def derive_fields_from_pl(pl_ds: xr.Dataset) -> xr.Dataset:
             raise ValueError("圧力面データに 'pressure_level' 次元がありません。")
     g0 = 9.80665
     out = xr.Dataset()
+    # 基本層の抽出
     if 'z' in pl_ds:
         z500 = pl_ds['z'].sel(pressure_level=500, drop=True) / g0
         out['gh500'] = z500.rename('gh500').assign_attrs(long_name='Geopotential height at 500 hPa', units='m')
@@ -358,6 +437,14 @@ def derive_fields_from_pl(pl_ds: xr.Dataset) -> xr.Dataset:
         r850 = pl_ds['r'].sel(pressure_level=850, drop=True).rename('r850'); r850.attrs['long_name'] = 'Relative humidity at 850 hPa'; r850.attrs['units'] = '%'; out['r850'] = r850
     if 'vo' in pl_ds:
         vo850 = pl_ds['vo'].sel(pressure_level=850, drop=True).rename('vo850'); vo850.attrs['long_name'] = 'Relative vorticity at 850 hPa'; vo850.attrs['units'] = 's-1'; out['vo850'] = vo850
+        # 500hPa の相対渦度
+        try:
+            vo500 = pl_ds['vo'].sel(pressure_level=500, drop=True).rename('vo500')
+            vo500.attrs['long_name'] = 'Relative vorticity at 500 hPa'; vo500.attrs['units'] = 's-1'
+            out['vo500'] = vo500
+        except Exception:
+            pass
+    # 転置（valid_time, lat, lon）
     out = standardize_time(out)
     for v in out.data_vars:
         da = out[v]; dims = list(da.dims)
@@ -367,6 +454,167 @@ def derive_fields_from_pl(pl_ds: xr.Dataset) -> xr.Dataset:
         new_order = ['valid_time', 'latitude', 'longitude'] + dims
         try:
             out[v] = da.transpose(*new_order)
+        except Exception:
+            pass
+    # 追加派生
+    try:
+        # 厚さ（1000-500 hPa）
+        if 'z' in pl_ds:
+            if 1000 in pl_ds['pressure_level']:
+                z1000 = pl_ds['z'].sel(pressure_level=1000, drop=True) / g0
+                z1000 = z1000.rename('gh1000').assign_attrs(long_name='Geopotential height at 1000 hPa', units='m')
+                out['gh1000'] = z1000
+            if ('gh500' in out) and ('gh1000' in out):
+                thk = (out['gh500'] - out['gh1000']).rename('thk_1000_500')
+                thk.attrs['long_name'] = 'Thickness (1000-500 hPa)'
+                thk.attrs['units'] = 'm'
+                out['thk_1000_500'] = thk
+                # 厚さの水平勾配
+                R = 6371000.0
+                lat_rad = np.deg2rad(out['thk_1000_500']['latitude'])
+                dlat = out['thk_1000_500'].differentiate('latitude') * (np.pi/180.0) / R
+                dlon = out['thk_1000_500'].differentiate('longitude') * (np.pi/180.0) / (R * np.cos(lat_rad))
+                gthk = np.sqrt(dlat**2 + dlon**2).rename('grad_thk_1000_500')
+                gthk.attrs['long_name'] = 'Gradient magnitude of thickness (1000-500 hPa)'
+                gthk.attrs['units'] = 'm m-1'
+                out['grad_thk_1000_500'] = gthk
+        # q850
+        if 'q' in pl_ds:
+            q850 = pl_ds['q'].sel(pressure_level=850, drop=True).rename('q850')
+            q850.attrs['long_name'] = 'Specific humidity at 850 hPa'; q850.attrs['units'] = 'kg kg-1'
+            out['q850'] = q850
+        # 風速・シア
+        if all(k in out for k in ['u500','v500']):
+            vmag500 = np.sqrt(out['u500']**2 + out['v500']**2).rename('vmag500')
+            vmag500.attrs['long_name'] = 'Wind speed at 500 hPa'; vmag500.attrs['units'] = 'm s-1'
+            out['vmag500'] = vmag500
+        if all(k in out for k in ['u850','v850']):
+            vmag850 = np.sqrt(out['u850']**2 + out['v850']**2).rename('vmag850')
+            vmag850.attrs['long_name'] = 'Wind speed at 850 hPa'; vmag850.attrs['units'] = 'm s-1'
+            out['vmag850'] = vmag850
+        if all(k in out for k in ['u500','v500','u850','v850']):
+            shear = np.sqrt((out['u500'] - out['u850'])**2 + (out['v500'] - out['v850'])**2).rename('shear_850_500')
+            shear.attrs['long_name'] = 'Vector wind shear magnitude (500-850 hPa)'; shear.attrs['units'] = 'm s-1'
+            out['shear_850_500'] = shear
+        # θe850の計算（Bolton 1980 近似）とその勾配
+        if ('t850' in out) and ('q850' in out):
+            p = 85000.0
+            T = out['t850']
+            q = out['q850']
+            r = q / (1.0 - q)
+            e = (r / (0.622 + r)) * p
+            logT = _da_log(T.astype(np.float64))
+            loge = _da_log(e.clip(min=1.0).astype(np.float64))
+            Tl   = 2840.0 / (3.5 * logT - loge - 4.805) + 55.0
+            theta = T.astype(np.float64) * (100000.0 / p) ** (0.2854 * (1.0 - 0.28 * r.astype(np.float64)))
+            expterm = _da_exp((3.376 / Tl - 0.00254) * r.astype(np.float64) * (1.0 + 0.81 * r.astype(np.float64)))
+            theta_e = (theta * expterm)
+            theta_e = theta_e.rename('thetae850')
+            theta_e.attrs['long_name'] = 'Equivalent potential temperature at 850 hPa'
+            theta_e.attrs['units'] = 'K'
+            out['thetae850'] = theta_e
+            R = 6371000.0
+            lat_rad = np.deg2rad(out['thetae850']['latitude'])
+            dlat = out['thetae850'].differentiate('latitude') * (np.pi/180.0) / R
+            dlon = out['thetae850'].differentiate('longitude') * (np.pi/180.0) / (R * np.cos(lat_rad))
+            grad = np.sqrt(dlat**2 + dlon**2)
+            grad = grad.rename('grad_thetae850')
+            grad.attrs['long_name'] = 'Horizontal gradient magnitude of thetae (850 hPa)'
+            grad.attrs['units'] = 'K m-1'
+            out['grad_thetae850'] = grad
+        # 発散と鉛直流
+        if 'd' in pl_ds:
+            div850 = pl_ds['d'].sel(pressure_level=850, drop=True).rename('div850')
+            div850.attrs['long_name'] = 'Divergence at 850 hPa'; div850.attrs['units'] = 's-1'
+            out['div850'] = div850
+        if 'w' in pl_ds:
+            w500 = pl_ds['w'].sel(pressure_level=500, drop=True).rename('w500')
+            w500.attrs['long_name'] = 'Vertical velocity at 500 hPa'; w500.attrs['units'] = 'Pa s-1'
+            out['w500'] = w500
+            try:
+                w700 = pl_ds['w'].sel(pressure_level=700, drop=True).rename('w700')
+                w700.attrs['long_name'] = 'Vertical velocity at 700 hPa'; w700.attrs['units'] = 'Pa s-1'
+                out['w700'] = w700
+            except Exception:
+                pass
+        # Moisture flux convergence at 850 hPa: -∇·(q V)
+        try:
+            if all(k in out for k in ['q850', 'u850', 'v850']):
+                q = out['q850']; u = out['u850']; v = out['v850']
+                R = 6371000.0
+                lat_rad = np.deg2rad(q['latitude'])
+                dlon = (np.pi/180.0) / (R * np.cos(lat_rad))
+                dlat = (np.pi/180.0) / R
+                div_qv = ( (q*u).differentiate('longitude') * dlon + (q*v).differentiate('latitude') * dlat )
+                mfc = (-div_qv).rename('mfc850')
+                mfc.attrs['long_name'] = 'Moisture flux convergence at 850 hPa'
+                mfc.attrs['units'] = 's-1'
+                out['mfc850'] = mfc
+        except Exception as _e:
+            print("⚠ mfc850 計算で例外:", _e)
+    except Exception as _e:
+        print("⚠ 追加派生計算で例外:", _e)
+    return out
+
+def derive_fields_from_single(sl_ds: xr.Dataset) -> xr.Dataset:
+    if sl_ds is None:
+        return xr.Dataset()
+    out = xr.Dataset()
+    sl_ds = standardize_time(sl_ds)
+    # そのまま通す候補
+    passthrough = [
+        'tcwv', 'cape', 'cin', 'tcc', 'tp',
+        'u10', 'v10',
+        'tclw', 'tciw', 'tcrw', 'tcsw', 'sst',
+        'viwve', 'viwvn',
+        'vertical_integral_of_eastward_water_vapour_flux', 'vertical_integral_of_northward_water_vapour_flux',
+        'total_column_cloud_liquid_water', 'total_column_cloud_ice_water',
+        'total_column_rain_water', 'total_column_snow_water', 'sea_surface_temperature'
+    ]
+    for cand in passthrough:
+        if cand in sl_ds:
+            out[cand if cand in ['tcwv','cape','cin','tcc','tp','u10','v10','viwve','viwvn'] else cand] = sl_ds[cand]
+    # 別名の正規化（長名→短名）
+    alias_pairs = [
+        ('total_column_cloud_liquid_water', 'tclw'),
+        ('total_column_cloud_ice_water', 'tciw'),
+        ('total_column_rain_water', 'tcrw'),
+        ('total_column_snow_water', 'tcsw'),
+        ('sea_surface_temperature', 'sst'),
+    ]
+    for long_name, short in alias_pairs:
+        if long_name in sl_ds and short not in out:
+            out[short] = sl_ds[long_name].rename(short)
+    # IVT 大きさと方位
+    if ('viwve' in out) and ('viwvn' in out):
+        ivt = np.sqrt(out['viwve']**2 + out['viwvn']**2).rename('ivt')
+        ivt.attrs['long_name'] = 'Integrated vapor transport magnitude'; ivt.attrs['units'] = 'kg m-1 s-1'
+        out['ivt'] = ivt
+        angle = _da_arctan2(out['viwvn'].astype(np.float64), out['viwve'].astype(np.float64))
+        ivt_dir = _da_degrees(angle).rename('ivt_dir')
+        ivt_dir.attrs['long_name'] = 'IVT direction (meteorological angle, arctan2(north,east))'
+        ivt_dir.attrs['units'] = 'degree'
+        out['ivt_dir'] = ivt_dir
+    elif ('vertical_integral_of_eastward_water_vapour_flux' in out) and ('vertical_integral_of_northward_water_vapour_flux' in out):
+        uflx = out['vertical_integral_of_eastward_water_vapour_flux']
+        vflx = out['vertical_integral_of_northward_water_vapour_flux']
+        ivt = np.sqrt(uflx**2 + vflx**2).rename('ivt')
+        ivt.attrs['long_name'] = 'Integrated vapor transport magnitude'; ivt.attrs['units'] = 'kg m-1 s-1'
+        out['ivt'] = ivt
+        angle = _da_arctan2(vflx.astype(np.float64), uflx.astype(np.float64))
+        ivt_dir = _da_degrees(angle).rename('ivt_dir')
+        ivt_dir.attrs['long_name'] = 'IVT direction (meteorological angle, arctan2(north,east))'
+        ivt_dir.attrs['units'] = 'degree'
+        out['ivt_dir'] = ivt_dir
+    # 10m 風速
+    if ('u10' in out) and ('v10' in out):
+        vmag10 = np.sqrt(out['u10']**2 + out['v10']**2).rename('vmag10')
+        vmag10.attrs['long_name'] = '10 m wind speed'; vmag10.attrs['units'] = 'm s-1'
+        out['vmag10'] = vmag10
+    out = standardize_time(out)
+    for v in out.data_vars:
+        try:
+            out[v] = out[v].transpose('valid_time', 'latitude', 'longitude')
         except Exception:
             pass
     return out
@@ -411,6 +659,7 @@ def merge_and_save():
     print("="*80)
     print(f"msl_dir: {OUTPUT_DIR_MSL}")
     print(f"pl_dir : {OUTPUT_DIR_PL}")
+    print(f"sl_dir : {OUTPUT_DIR_SL}")
     if not os.path.isdir(OUTPUT_DIR_MSL):
         print(f"❌ エラー: ディレクトリ '{OUTPUT_DIR_MSL}' が存在しません。")
         return
@@ -429,15 +678,23 @@ def merge_and_save():
     except Exception as e:
         print(f"❌ 圧力面読み込みでエラー: {e}")
         return
+    try:
+        sl_ds = open_single_misc_files(OUTPUT_DIR_SL)
+    except Exception as e:
+        print(f"⚠ 単一レベル（追加）読み込みでエラー: {e}")
+        sl_ds = None
 
     print("\n" + "="*80)
     print("Phase 2: 圧力面データから必要変数の生成")
     print("="*80)
     try:
         pl_fields = derive_fields_from_pl(pl_ds)
-        print(f"  ✅ 生成した変数: {list(pl_fields.data_vars)}")
+        print(f"  ✅ 生成した変数(PL): {list(pl_fields.data_vars)}")
+        sl_fields = derive_fields_from_single(sl_ds) if sl_ds is not None else xr.Dataset()
+        if sl_fields.data_vars:
+            print(f"  ✅ 生成した変数(SL): {list(sl_fields.data_vars)}")
     except Exception as e:
-        print(f"❌ 圧力面派生変数生成でエラー: {e}")
+        print(f"❌ 派生変数生成でエラー: {e}")
         return
 
     print("\n" + "="*80)
@@ -448,17 +705,52 @@ def merge_and_save():
         pl_fields = standardize_time(pl_fields)
 
         common_times = np.intersect1d(msl_ds['valid_time'].values, pl_fields['valid_time'].values)
+        if sl_ds is not None and sl_fields is not None and sl_fields.data_vars:
+            common_times = np.intersect1d(common_times, sl_fields['valid_time'].values)
         if len(common_times) == 0:
-            raise ValueError("msl と PL の時間が一致しません。")
+            raise ValueError("msl / PL / SL の時間が一致しません。")
         msl_ds = msl_ds.sel(valid_time=common_times)
         pl_fields = pl_fields.sel(valid_time=common_times)
+        if sl_ds is not None and sl_fields is not None and sl_fields.data_vars:
+            sl_fields = sl_fields.sel(valid_time=common_times)
 
         for coord in ['latitude', 'longitude']:
             if not np.array_equal(msl_ds[coord].values, pl_fields[coord].values):
                 pl_fields = pl_fields.reindex({coord: msl_ds[coord].values}, method=None)
+            if sl_ds is not None and sl_fields is not None and sl_fields.data_vars:
+                if (coord in sl_fields.coords) and (not np.array_equal(msl_ds[coord].values, sl_fields[coord].values)):
+                    sl_fields = sl_fields.reindex({coord: msl_ds[coord].values}, method=None)
 
-        combined_ds = xr.merge([msl_ds, pl_fields], compat='no_conflicts', join='inner')
+        if sl_ds is not None and sl_fields is not None and sl_fields.data_vars:
+            combined_ds = xr.merge([msl_ds, pl_fields, sl_fields], compat='no_conflicts', join='inner')
+        else:
+            combined_ds = xr.merge([msl_ds, pl_fields], compat='no_conflicts', join='inner')
         combined_ds = add_astronomical_seasonal_encoding(combined_ds)
+        # 24h SLP傾度（前日との差分; 先頭は0で埋める）と空間勾配・ラプラシアン
+        try:
+            diff = combined_ds['msl'] - combined_ds['msl'].shift(valid_time=1)
+            combined_ds['msl_dt24'] = diff.fillna(0.0)
+            combined_ds['msl_dt24'].attrs['long_name'] = '24h MSL change'
+            combined_ds['msl_dt24'].attrs['units'] = 'Pa per 24h'
+            # 水平勾配とラプラシアン（平面近似の球面メトリック補正）
+            R = 6371000.0
+            lat_rad = np.deg2rad(combined_ds['latitude'])
+            dlat = combined_ds['msl'].differentiate('latitude') * (np.pi/180.0) / R
+            dlon = combined_ds['msl'].differentiate('longitude') * (np.pi/180.0) / (R * np.cos(lat_rad))
+            grad = np.sqrt(dlat**2 + dlon**2).rename('grad_msl')
+            grad.attrs['long_name'] = 'Horizontal gradient magnitude of MSLP'
+            grad.attrs['units'] = 'Pa m-1'
+            combined_ds['grad_msl'] = grad
+            # 二階微分（簡易ラプラシアン）
+            d2lat = combined_ds['msl'].differentiate('latitude').differentiate('latitude') * ((np.pi/180.0)/R)**2
+            # cosφ の緯度依存は無視した近似
+            d2lon = combined_ds['msl'].differentiate('longitude').differentiate('longitude') * ((np.pi/180.0)/(R*np.cos(lat_rad)))**2
+            lap = (d2lat + d2lon).rename('lap_msl')
+            lap.attrs['long_name'] = 'Approx. Laplacian of MSLP'
+            lap.attrs['units'] = 'Pa m-2'
+            combined_ds['lap_msl'] = lap
+        except Exception as _e:
+            print("⚠ msl_dt24/grad/lap 計算に失敗:", _e)
 
         time_coord = combined_ds['valid_time']
         dates = pd.to_datetime(time_coord.values).date
@@ -540,7 +832,11 @@ def merge_and_save():
 # ================================================================================
 def main():
     ensure_dirs()
-    download_era5_data()
+    skip_dl = os.environ.get("SKIP_DOWNLOAD", "").lower() in ("1", "true", "yes", "y")
+    if skip_dl:
+        print("環境変数 SKIP_DOWNLOAD が設定されています。download_era5_data() をスキップします。")
+    else:
+        download_era5_data()
     merge_and_save()
 
 if __name__ == '__main__':
