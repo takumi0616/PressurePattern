@@ -38,7 +38,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
-from sklearn.metrics import average_precision_score, classification_report, precision_recall_curve
+from sklearn.metrics import average_precision_score, classification_report, precision_recall_curve, multilabel_confusion_matrix
 
 import matplotlib
 matplotlib.use("Agg")
@@ -671,6 +671,35 @@ def main():
             )
             _save_json(report, VAL_REPORT_JSON_PATH)
             logi(f"検証レポート保存: {VAL_REPORT_JSON_PATH}")
+
+            # 混同行列（マルチラベル: クラス別 2x2）を図として保存
+            try:
+                cm = multilabel_confusion_matrix(y_true_best.astype(int), y_pred_best.astype(int))
+                n_classes = cm.shape[0]
+                n_cols = min(5, n_classes)
+                n_rows = int(np.ceil(n_classes / n_cols))
+                fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows), squeeze=False)
+                vmax = int(cm.max())
+                for i in range(n_rows * n_cols):
+                    r, c = divmod(i, n_cols)
+                    ax = axes[r, c]
+                    if i < n_classes:
+                        m = cm[i]
+                        im = ax.imshow(m, cmap="Blues", vmin=0, vmax=max(1, vmax))
+                        for (ii, jj), val in np.ndenumerate(m):
+                            ax.text(jj, ii, int(val), ha="center", va="center", color="black", fontsize=9)
+                        ax.set_title(BASE_LABELS[i])
+                        ax.set_xticks([0, 1]); ax.set_xticklabels(["Pred 0", "Pred 1"])
+                        ax.set_yticks([0, 1]); ax.set_yticklabels(["True 0", "True 1"])
+                    else:
+                        ax.axis("off")
+                plt.tight_layout()
+                cm_path = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_confusion_matrices.png")
+                plt.savefig(cm_path, dpi=150)
+                plt.close(fig)
+                print(f"混同行列の保存: {cm_path}")
+            except Exception as e:
+                print("混同行列の作成に失敗:", e)
     except Exception as e:
         print("classification_report でエラー:", e)
 
