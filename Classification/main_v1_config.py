@@ -59,6 +59,15 @@ EMA_UPDATE_BN = False     # 各エポック後にEMAのBN統計を再推定(upda
 # マルチラベルの閾値（0–1 の確率をラベル有無に変換するときのしきい値）
 PREDICTION_THRESHOLD = 0.7
 
+# 学習・評価の高度化オプション
+SELECTION_METRIC = "val_map"     # "val_map" もしくは "val_loss"
+USE_FOCAL_LOSS = True            # True: FocalLoss を使用 / False: BCEWithLogits
+FOCAL_GAMMA = 2.0                # FocalLoss の gamma
+USE_WEIGHTED_SAMPLER = True      # WeightedRandomSampler を使用してバランス化
+USE_LR_SCHEDULER = True          # ReduceLROnPlateau を有効化
+LR_PATIENCE = 5                  # plateau 監視の猶予エポック
+LR_FACTOR = 0.5                  # plateau 時の学習率減衰係数
+
 
 # クラス不均衡対策：陽性クラス重みを有効化（BCEWithLogitsLoss の pos_weight に反映）
 USE_POSITIVE_CLASS_WEIGHTS = True
@@ -73,6 +82,7 @@ BEST_WEIGHTS_PATH     = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}.best.pt")
 HISTORY_JSON_PATH     = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_history.json")
 NORM_STATS_JSON_PATH  = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_norm.json")
 VAL_REPORT_JSON_PATH  = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_val_report.json")
+THRESHOLDS_JSON_PATH  = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_thresholds.json")
 TENSORBOARD_LOGS_DIR  = os.path.join(OUTPUT_DIR, "logs")  # 任意（使わない場合も可）
 
 # ラベル体系（基本型 15 クラス）

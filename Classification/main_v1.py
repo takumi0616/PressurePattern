@@ -37,8 +37,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 import torch
 from torch import nn
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import average_precision_score, classification_report
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+from sklearn.metrics import average_precision_score, classification_report, precision_recall_curve
 
 import matplotlib
 matplotlib.use("Agg")
@@ -82,6 +82,14 @@ try:
         BASE_LABELS,
         VAR_CANDIDATES,
         COARSEN_FACTOR,
+        SELECTION_METRIC,
+        USE_FOCAL_LOSS,
+        FOCAL_GAMMA,
+        USE_WEIGHTED_SAMPLER,
+        USE_LR_SCHEDULER,
+        LR_PATIENCE,
+        LR_FACTOR,
+        THRESHOLDS_JSON_PATH,
     )
 except Exception:
     import os as _os, sys as _sys
@@ -114,6 +122,14 @@ except Exception:
         BASE_LABELS,
         VAR_CANDIDATES,
         COARSEN_FACTOR,
+        SELECTION_METRIC,
+        USE_FOCAL_LOSS,
+        FOCAL_GAMMA,
+        USE_WEIGHTED_SAMPLER,
+        USE_LR_SCHEDULER,
+        LR_PATIENCE,
+        LR_FACTOR,
+        THRESHOLDS_JSON_PATH,
     )
 
 _LABEL_TOKEN_PATTERN = re.compile(r"[+\-]")  # '+' または '-' で分割
@@ -126,6 +142,34 @@ def set_global_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+class FocalLoss(nn.Module):
+    """
+    マルチラベル用 Focal Loss
+    - BCEWithLogits をベースに (1 - p_t)^gamma を掛ける
+    - pos_weight（BCEと同様の意味）を併用可能：陽性側の重み付け
+    """
+    def __init__(self, gamma: float = 2.0, pos_weight: torch.Tensor | None = None, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # BCE logits loss (要素別)
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction="none"
+        )
+        # p_t = sigmoid(logits) if target=1 else 1 - sigmoid(logits)
+        prob = torch.sigmoid(logits)
+        p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
+        focal_factor = (1.0 - p_t).clamp(min=1e-6).pow(self.gamma)
+        loss = bce * focal_factor
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 def _ensure_output_dirs():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -391,7 +435,19 @@ def main():
 
     train_ds = TensorDataset(x_train_t, y_train_t)
     val_ds = TensorDataset(x_val_t, y_val_t)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=num_workers, pin_memory=pin_mem)
+
+    # WeightedRandomSampler（サンプル重み = Σ 1/freq(label)）
+    if USE_WEIGHTED_SAMPLER:
+        class_freq = y_train.sum(axis=0) + 1e-6
+        inv = 1.0 / class_freq
+        sample_w = (y_train * inv).sum(axis=1).astype(np.float64)
+        sampler = WeightedRandomSampler(torch.from_numpy(sample_w), num_samples=len(sample_w), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, shuffle=False,
+                                  num_workers=num_workers, pin_memory=pin_mem)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                                  num_workers=num_workers, pin_memory=pin_mem)
+
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers, pin_memory=pin_mem)
     logi(f"DataLoader: batch_size={BATCH_SIZE} steps(train/val)=({len(train_loader)}/{len(val_loader)})")
 
@@ -411,13 +467,32 @@ def main():
         print("陽性クラス重み（先頭表示）:", [round(float(w), 2) for w in pos_w[:8]], "...")
         pos_weight_tensor = torch.from_numpy(pos_w).to(device)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # 損失関数（Focal / BCE）
+    if USE_FOCAL_LOSS:
+        criterion = FocalLoss(gamma=float(FOCAL_GAMMA), pos_weight=pos_weight_tensor)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+
+    # Optimizer / LR scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = None
+    if USE_LR_SCHEDULER:
+        if SELECTION_METRIC.lower() == "val_map":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max",
+                                                                   factor=float(LR_FACTOR), patience=int(LR_PATIENCE))
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
+                                                                   factor=float(LR_FACTOR), patience=int(LR_PATIENCE))
 
     # 学習ループ（シンプル）
     best_val_loss = float("inf")
     best_epoch = -1
     best_map = -1.0
+    # 選択指標に応じたベスト値
+    if SELECTION_METRIC.lower() == "val_map":
+        best_sel = -float("inf")
+    else:
+        best_sel = float("inf")
     history = {"train_loss": [], "val_loss": [], "val_map": []}
 
     for epoch in range(1, EPOCHS + 1):
@@ -471,12 +546,29 @@ def main():
 
         print(f"[Epoch {epoch:03d}/{EPOCHS}] train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_mAP={map_macro:.4f}")
 
-        # ベスト更新（val_loss 最小）
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_map = max(best_map, map_macro)
-            torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
+        # ベスト更新（選択指標）
+        updated = False
+        if SELECTION_METRIC.lower() == "val_map":
+            if map_macro > best_sel:
+                best_sel = map_macro
+                best_val_loss = val_loss
+                best_map = map_macro
+                best_epoch = epoch
+                torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
+                updated = True
+        else:  # val_loss
+            if val_loss < best_sel:
+                best_sel = val_loss
+                best_val_loss = val_loss
+                best_map = max(best_map, map_macro)
+                best_epoch = epoch
+                torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
+                updated = True
+
+        # LR scheduler step
+        if scheduler is not None:
+            monitor_value = map_macro if SELECTION_METRIC.lower() == "val_map" else val_loss
+            scheduler.step(monitor_value)
 
     # 最終保存（ベストを FINAL として保存）
     try:
@@ -528,7 +620,7 @@ def main():
         "best_val_map": best_map,
         "best_val_loss": float(best_val_loss),
         "best_epoch": best_epoch,
-        "selection_metric": "val_loss"
+        "selection_metric": SELECTION_METRIC
     }
     _save_json(norm_info, NORM_STATS_JSON_PATH)
     print(f"モデル保存: {FINAL_MODEL_PATH}")
@@ -536,7 +628,7 @@ def main():
     print(f"学習履歴保存: {HISTORY_JSON_PATH}")
     print(f"正規化統計保存: {NORM_STATS_JSON_PATH}")
 
-    # ベスト重みでの検証レポート（threshold で 0/1 へ）
+    # ベスト重みでの検証レポート（クラス別最適閾値を推定・保存）
     model.eval()
     all_probs_best, all_trues_best = [], []
     with torch.no_grad():
@@ -549,7 +641,28 @@ def main():
             all_trues_best.append(yb.detach().cpu().numpy())
     y_prob_best = np.concatenate(all_probs_best, axis=0) if all_probs_best else np.zeros((0, num_classes), dtype=np.float32)
     y_true_best = np.concatenate(all_trues_best, axis=0) if all_trues_best else np.zeros((0, num_classes), dtype=np.float32)
-    y_pred_best = (y_prob_best >= PREDICTION_THRESHOLD).astype(int)
+
+    # クラス別最適閾値（F1最大点）
+    thresholds = [float(PREDICTION_THRESHOLD)] * num_classes
+    try:
+        for c in range(num_classes):
+            try:
+                p, r, t = precision_recall_curve(y_true_best[:, c], y_prob_best[:, c])
+                if t is not None and len(t) > 0:
+                    f1 = 2 * p * r / (p + r + 1e-9)
+                    idx = int(np.nanargmax(f1))
+                    thresholds[c] = float(t[idx]) if idx < len(t) else float(PREDICTION_THRESHOLD)
+            except Exception:
+                thresholds[c] = float(PREDICTION_THRESHOLD)
+        # 保存
+        _save_json({"thresholds": thresholds, "labels": BASE_LABELS}, THRESHOLDS_JSON_PATH)
+        logi(f"クラス別最適閾値を保存: {THRESHOLDS_JSON_PATH}")
+    except Exception as e:
+        print("閾値推定でエラー:", e)
+
+    # 推定した閾値で2値化して classification_report を作成
+    thr_arr = np.array(thresholds)[None, :]
+    y_pred_best = (y_prob_best >= thr_arr).astype(int)
     try:
         if y_true_best.shape[0] > 0:
             report = classification_report(
