@@ -110,7 +110,7 @@ class MiniSom:
         # 距離タイプ（許可手法に限定）
         activation_distance = activation_distance.lower()
         allowed_distances = ('s1', 'euclidean', 'ssim5', 'kappa', 's1k', 'msssim',
-                            'msssim_kappa', 'ssim5_kappa', 'msssim_s1', 'ssim5_s1')
+                            'msssim_kappa', 'ssim5_kappa', 'msssim_s1', 'ssim5_s1', 'ssim5_s1_kappa')
         if activation_distance not in allowed_distances:
             raise ValueError(f'activation_distance must be one of {allowed_distances}')
         self.activation_distance = activation_distance
@@ -588,6 +588,30 @@ class MiniSom:
         return torch.sqrt((ds5 * ds5 + d1n * d1n) / 2.0)
 
 
+    @torch.no_grad()
+    def _ssim5_s1_kappa_distance_batch(self, Xb: Tensor, nodes_chunk: Optional[int] = None) -> Tensor:
+        """
+        概要:
+          SSIM5・S1・κ（Kappa 曲率）距離を“理論値域”で正規化し、RMSで合成した距離を返す。
+          D = sqrt((dSSIM5^2 + dS1n^2 + dKappa^2)/3)
+            - dSSIM5: [0,1]
+            - dS1n  : S1(~[0,200]) を 200 で割って [0,1] にクリップ
+            - dKappa: [0,1]
+        引数:
+          - Xb (Tensor): 入力バッチ (B,H,W)。
+          - nodes_chunk (Optional[int]): ノード分割処理のチャンク。None なら self.nodes_chunk。
+        戻り値:
+          - Tensor: 形状 (B,m) の距離行列。
+        """
+        if nodes_chunk is None:
+            nodes_chunk = self.nodes_chunk
+        ds5 = self._ssim5_distance_batch(Xb, nodes_chunk=nodes_chunk)   # [0,1]
+        d1  = self._s1_distance_batch(Xb, nodes_chunk=nodes_chunk)      # ~[0,200]
+        dk  = self._kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)   # [0,1]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((ds5 * ds5 + d1n * d1n + dk * dk) / 3.0)
+
+
 
     @torch.no_grad()
     def _gaussian_kernel1d(self, sigma: float, dtype: torch.dtype, device: torch.device) -> Tensor:
@@ -677,6 +701,8 @@ class MiniSom:
             return self._msssim_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
         elif self.activation_distance == 'ssim5_s1':
             return self._ssim5_s1_distance_batch(Xb, nodes_chunk=nodes_chunk)
+        elif self.activation_distance == 'ssim5_s1_kappa':
+            return self._ssim5_s1_kappa_distance_batch(Xb, nodes_chunk=nodes_chunk)
         else:
             raise RuntimeError('Unknown activation_distance')
 
@@ -923,6 +949,21 @@ class MiniSom:
         return torch.sqrt((ds5 * ds5 + d1n * d1n) / 2.0)
 
     @torch.no_grad()
+    def _ssim5_s1_kappa_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
+        """
+        概要:
+          対参照の SSIM5・S1・κ 距離を“理論値域”で正規化してRMS合成した距離。
+          D = sqrt((dSSIM5^2 + dS1n^2 + dKappa^2)/3)
+        戻り値:
+          - Tensor: 形状 (B,) の距離。
+        """
+        ds5 = self._ssim5_to_ref(Xb, ref)   # [0,1]
+        d1  = self._s1_to_ref(Xb, ref)      # ~[0,200]
+        dk  = self._kappa_to_ref(Xb, ref)   # [0,1]
+        d1n = torch.clamp(d1 / 200.0, min=0.0, max=1.0)
+        return torch.sqrt((ds5 * ds5 + d1n * d1n + dk * dk) / 3.0)
+
+    @torch.no_grad()
     def _distance_to_ref(self, Xb: Tensor, ref: Tensor) -> Tensor:
         """
         現在のactivation_distanceに対応した「Xb vs 単一参照ref」の距離ベクトル(B,)
@@ -947,6 +988,8 @@ class MiniSom:
             return self._msssim_s1_to_ref(Xb, ref)
         elif self.activation_distance == 'ssim5_s1':
             return self._ssim5_s1_to_ref(Xb, ref)
+        elif self.activation_distance == 'ssim5_s1_kappa':
+            return self._ssim5_s1_kappa_to_ref(Xb, ref)
         else:
             raise RuntimeError('Unknown activation_distance')
 

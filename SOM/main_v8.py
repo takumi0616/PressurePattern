@@ -1725,7 +1725,7 @@ def compute_node_true_medoids(
     """
     各ノードについて「総距離最小（true medoid）」のサンプルを選ぶ。
     - 各ノードの割当集合 Ic の中で、候補 i∈Ic について cost(i) = Σ_{j∈Ic} d(X_j, X_i) を計算し最小の i を選ぶ。
-    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k'
+    - method_name: 'euclidean' | 'ssim5' | 's1' | 'kappa' | 's1k' | 'ssim5_s1_kappa'
     - 戻りの距離は、選ばれたメドイドに対する平均距離（sum/|Ic|）。
     """
     H, W = field_shape
@@ -1912,6 +1912,13 @@ def compute_node_true_medoids(
                 D1  = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
                 D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
                 D   = torch.sqrt((Ds5 * Ds5 + D1n * D1n) / 2.0)
+            elif method_name == 'ssim5_s1_kappa':
+                # SSIM5[0,1], S1~[0,200], κ[0,1] を理論値域で正規化しRMS合成
+                Ds5 = pairwise_by_ref(lambda Xb, ref: _ssim5_dist_to_ref(Xb, ref), Xcand)
+                D1  = pairwise_by_ref(lambda Xb, ref: _s1_dist_to_ref(Xb, ref), Xcand)
+                Dk  = pairwise_by_ref(lambda Xb, ref: _kappa_to_ref(Xb, ref), Xcand)
+                D1n = torch.clamp(D1 / 200.0, min=0.0, max=1.0)
+                D   = torch.sqrt((Ds5 * Ds5 + D1n * D1n + Dk * Dk) / 3.0)
             elif method_name == 'gvd':
                 # GVD: 二階微分不変量
                 D = pairwise_by_ref(lambda Xb, ref: _gvd_to_ref(Xb, ref), Xcand)
@@ -3006,6 +3013,7 @@ def main():
         ('ssim5_kappa', 'ssim5_kappa'),
         ('msssim_s1', 'msssim_s1'),
         ('ssim5_s1', 'ssim5_s1'),
+        ('ssim5_s1_kappa', 'ssim5_s1_kappa'),
     ]
     for mname, adist in methods:
         # 学習
