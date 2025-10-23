@@ -3008,10 +3008,10 @@ def main():
         ('s1',        's1'),
         ('kappa',     'kappa'),
         ('s1k',       's1k'),
-        ('msssim',    'msssim'),
-        ('msssim_kappa', 'msssim_kappa'),
+        # ('msssim',    'msssim'),
+        # ('msssim_kappa', 'msssim_kappa'),
         ('ssim5_kappa', 'ssim5_kappa'),
-        ('msssim_s1', 'msssim_s1'),
+        # ('msssim_s1', 'msssim_s1'),
         ('ssim5_s1', 'ssim5_s1'),
         ('ssim5_s1_kappa', 'ssim5_s1_kappa'),
     ]
