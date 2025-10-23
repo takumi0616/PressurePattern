@@ -44,6 +44,7 @@ Options:
   --channel NAME  notify-run channel (default: gpu02)
   --script PATH   Target script to launch (default: main_v5.py)
   --python BIN    Python binary to use (default: python)
+  --only-gpu1     Launch only GPU1 jobs; skip GPU0. Seeds run sequentially on GPU1 (s += 1).
   -h, --help      Show this help
   --              All following arguments are forwarded to the Python script
 EOF
@@ -57,6 +58,7 @@ GPU1=1
 CHANNEL="gpu02"
 SCRIPT="main_v5.py"
 PYTHON_BIN="python"
+ONLY_GPU1=0
 EXTRA_ARGS=()
 
 # Parse args
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
     --channel) CHANNEL="${2:?}"; shift 2 ;;
     --script)  SCRIPT="${2:?}"; shift 2 ;;
     --python)  PYTHON_BIN="${2:?}"; shift 2 ;;
+    --only-gpu1) ONLY_GPU1=1; shift 1 ;;
     -h|--help) usage; exit 0 ;;
     --)        shift; EXTRA_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1" 1>&2; usage; exit 1 ;;
@@ -144,6 +147,30 @@ while [[ "$s" -le "$END" ]]; do
   ts="$(date '+%F %T')"
   pid0=''
   pid1=''
+
+  # Single-GPU mode: run only on GPU1 sequentially (s += 1)
+  if [[ "${ONLY_GPU1:-0}" -eq 1 ]]; then
+    echo "[INFO] Launching single: seed $s0 -> GPU $GPU1 (only-gpu1 mode)"
+    echo "[CMD ] notify-run $CHANNEL -- $PYTHON_BIN $SCRIPT --gpu $GPU1 --seed $s0 ${EXTRA_ARGS[*]} > seed${s0}.out 2>&1 &"
+    notify-run "$CHANNEL" -- "$PYTHON_BIN" "$SCRIPT" --gpu "$GPU1" --seed "$s0" "${EXTRA_ARGS[@]}" > "seed${s0}.out" 2>&1 &
+    pid1=$!
+
+    ACTIVE_PIDS=()
+    [[ -n "$pid1" ]] && ACTIVE_PIDS+=("$pid1")
+    echo "[INFO] Launched at $ts. Waiting for completion..."
+    status1=0
+    if [[ -n "$pid1" ]]; then
+      if ! wait "$pid1"; then status1=$?; fi
+    fi
+    echo "[INFO] Seed $s0 finished: exit=$status1"
+    if [[ $status1 -ne 0 ]]; then
+      echo "[WARN] Job exited non-zero. Continuing to next seed..."
+    fi
+
+    ACTIVE_PIDS=()
+    s=$((s + 1))
+    continue
+  fi
 
   # GPU0 job
   echo "[CMD ] notify-run $CHANNEL -- $PYTHON_BIN $SCRIPT --gpu $GPU0 --seed $s0 ${EXTRA_ARGS[*]} > seed${s0}.out 2>&1 &"
