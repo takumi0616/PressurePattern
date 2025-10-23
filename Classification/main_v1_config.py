@@ -47,9 +47,17 @@ VAL_YEARS   = list(range(1998, 2001))  # 1998–2000
 
 # 学習パラメータ
 EPOCHS = 100
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
+
+# モデルバックボーンの選択
+# 環境変数 MODEL_BACKBONE で上書き可
+#   候補: "simple", "resnet_small", "deformable", "convnext_tiny"
+MODEL_BACKBONE = os.environ.get("MODEL_BACKBONE", "simple").lower()
+if MODEL_BACKBONE not in {"simple", "resnet_small", "deformable", "convnext_tiny"}:
+    print(f"[main_v1_config] WARNING: 不正な MODEL_BACKBONE={MODEL_BACKBONE!r} -> 'simple' にフォールバック")
+    MODEL_BACKBONE = "simple"
 
 # EMA/評価関連
 USE_EMA = False           # AveragedModel を使う（無効にすると常に生モデルで評価）

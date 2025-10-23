@@ -90,6 +90,7 @@ try:
         LR_PATIENCE,
         LR_FACTOR,
         THRESHOLDS_JSON_PATH,
+        MODEL_BACKBONE,
     )
 except Exception:
     import os as _os, sys as _sys
@@ -130,9 +131,32 @@ except Exception:
         LR_PATIENCE,
         LR_FACTOR,
         THRESHOLDS_JSON_PATH,
+        MODEL_BACKBONE,
     )
 
+# MICRO_BATCH_SIZE の安全な取得（設定に無ければ環境変数→既定16）
+try:
+    from .main_v1_config import MICRO_BATCH_SIZE as _MB  # type: ignore
+    MICRO_BATCH_SIZE = _MB
+except Exception:
+    try:
+        from main_v1_config import MICRO_BATCH_SIZE as _MB  # type: ignore
+        MICRO_BATCH_SIZE = _MB
+    except Exception:
+        MICRO_BATCH_SIZE = int(os.environ.get("MICRO_BATCH_SIZE", "16"))
+
 _LABEL_TOKEN_PATTERN = re.compile(r"[+\-]")  # '+' または '-' で分割
+
+# 出力パスをバックボーン別サフィックスで分離
+BACKBONE_TAG = (MODEL_BACKBONE or "simple").lower()
+OUT_DIR = os.path.join(OUTPUT_DIR, BACKBONE_TAG)
+MODEL_TAG = f"{MODEL_NAME}_{BACKBONE_TAG}"
+FINAL_MODEL_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}.pt")
+BEST_WEIGHTS_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}.best.pt")
+HISTORY_JSON_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}_history.json")
+NORM_STATS_JSON_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}_norm.json")
+VAL_REPORT_JSON_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}_val_report.json")
+THRESHOLDS_JSON_PATH_B = os.path.join(OUT_DIR, f"{MODEL_TAG}_thresholds.json")
 
 
 def set_global_seed(seed: int = 42):
@@ -172,8 +196,9 @@ class FocalLoss(nn.Module):
         return loss
 
 def _ensure_output_dirs():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(os.path.dirname(FINAL_MODEL_PATH), exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for p in [FINAL_MODEL_PATH_B, BEST_WEIGHTS_PATH_B, HISTORY_JSON_PATH_B, NORM_STATS_JSON_PATH_B, VAL_REPORT_JSON_PATH_B, THRESHOLDS_JSON_PATH_B]:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
 
 
 def _to_datetime64(ds: xr.Dataset) -> pd.DatetimeIndex:
@@ -454,10 +479,11 @@ def main():
     # モデル/最適化/損失
     in_ch = x_train_t.shape[1]
     num_classes = y_train_t.shape[1]
-    model = build_cnn(in_channels=in_ch, num_classes=num_classes).to(device)
+    model = build_cnn(in_channels=in_ch, num_classes=num_classes, backbone=MODEL_BACKBONE).to(device)
     try:
         n_params = sum(p.numel() for p in model.parameters())
         logi(f"モデル: params={n_params:,} in_ch={in_ch} out_classes={num_classes}")
+        print(f"バックボーン: {MODEL_BACKBONE}")
     except Exception:
         pass
 
@@ -500,14 +526,19 @@ def main():
         model.train()
         running = 0.0
         for xb, yb in train_loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
+            # マイクロバッチで順次GPUへ載せる（DataLoaderのバッチは維持）
+            bs = xb.size(0)
+            num_splits = int(np.ceil(bs / float(MICRO_BATCH_SIZE))) if bs > MICRO_BATCH_SIZE else 1
             optimizer.zero_grad(set_to_none=True)
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
+            for i in range(0, bs, MICRO_BATCH_SIZE):
+                xb_mb = xb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                yb_mb = yb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                logits_mb = model(xb_mb)
+                loss_mb = criterion(logits_mb, yb_mb)
+                # 勾配を分割数で割って累積し、全体として元バッチ相当の更新にする
+                (loss_mb / num_splits).backward()
+                running += loss_mb.item() * xb_mb.size(0)
             optimizer.step()
-            running += loss.item() * xb.size(0)
         train_loss = running / len(train_loader.dataset)
 
         # Validate
@@ -516,14 +547,16 @@ def main():
         all_probs, all_trues = [], []
         with torch.no_grad():
             for xb, yb in val_loader:
-                xb = xb.to(device, non_blocking=True)
-                yb = yb.to(device, non_blocking=True)
-                logits = model(xb)
-                loss = criterion(logits, yb)
-                probs = torch.sigmoid(logits)
-                val_running += loss.item() * xb.size(0)
-                all_probs.append(probs.detach().cpu().numpy())
-                all_trues.append(yb.detach().cpu().numpy())
+                bs = xb.size(0)
+                for i in range(0, bs, MICRO_BATCH_SIZE):
+                    xb_mb = xb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                    yb_mb = yb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                    logits_mb = model(xb_mb)
+                    loss_mb = criterion(logits_mb, yb_mb)
+                    probs_mb = torch.sigmoid(logits_mb)
+                    val_running += loss_mb.item() * xb_mb.size(0)
+                    all_probs.append(probs_mb.detach().cpu().numpy())
+                    all_trues.append(yb_mb.detach().cpu().numpy())
         val_loss = val_running / len(val_loader.dataset)
         y_prob = np.concatenate(all_probs, axis=0) if all_probs else np.zeros((0, num_classes), dtype=np.float32)
         y_true = np.concatenate(all_trues, axis=0) if all_trues else np.zeros((0, num_classes), dtype=np.float32)
@@ -554,7 +587,7 @@ def main():
                 best_val_loss = val_loss
                 best_map = map_macro
                 best_epoch = epoch
-                torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
+                torch.save(model.state_dict(), BEST_WEIGHTS_PATH_B)
                 updated = True
         else:  # val_loss
             if val_loss < best_sel:
@@ -562,7 +595,7 @@ def main():
                 best_val_loss = val_loss
                 best_map = max(best_map, map_macro)
                 best_epoch = epoch
-                torch.save(model.state_dict(), BEST_WEIGHTS_PATH)
+                torch.save(model.state_dict(), BEST_WEIGHTS_PATH_B)
                 updated = True
 
         # LR scheduler step
@@ -572,22 +605,22 @@ def main():
 
     # 最終保存（ベストを FINAL として保存）
     try:
-        state = torch.load(BEST_WEIGHTS_PATH, map_location=device)
+        state = torch.load(BEST_WEIGHTS_PATH_B, map_location=device)
         model.load_state_dict(state)
-        torch.save(model.state_dict(), FINAL_MODEL_PATH)
+        torch.save(model.state_dict(), FINAL_MODEL_PATH_B)
         logi(f"最終モデルはベストエポック（val_loss最小）: epoch={best_epoch} best_val_loss={best_val_loss:.4f} best_mAP={best_map:.4f}")
     except Exception as e:
         logi(f"ベスト重み読込失敗（現状モデルを保存）: {e}")
-        torch.save(model.state_dict(), FINAL_MODEL_PATH)
+        torch.save(model.state_dict(), FINAL_MODEL_PATH_B)
 
     # 履歴保存
     history["best_epoch"] = best_epoch
     history["best_val_loss"] = float(best_val_loss)
     history["best_map"] = float(best_map)
-    _save_json(history, HISTORY_JSON_PATH)
+    _save_json(history, HISTORY_JSON_PATH_B)
 
     # 損失曲線の保存
-    loss_curve_path = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_loss_curve.png")
+    loss_curve_path = os.path.join(OUT_DIR, f"{MODEL_TAG}_loss_curve.png")
     try:
         plt.figure(figsize=(6, 4))
         epochs_range = np.arange(1, len(history["train_loss"]) + 1)
@@ -622,23 +655,25 @@ def main():
         "best_epoch": best_epoch,
         "selection_metric": SELECTION_METRIC
     }
-    _save_json(norm_info, NORM_STATS_JSON_PATH)
-    print(f"モデル保存: {FINAL_MODEL_PATH}")
-    print(f"ベスト重み保存: {BEST_WEIGHTS_PATH}")
-    print(f"学習履歴保存: {HISTORY_JSON_PATH}")
-    print(f"正規化統計保存: {NORM_STATS_JSON_PATH}")
+    _save_json(norm_info, NORM_STATS_JSON_PATH_B)
+    print(f"モデル保存: {FINAL_MODEL_PATH_B}")
+    print(f"ベスト重み保存: {BEST_WEIGHTS_PATH_B}")
+    print(f"学習履歴保存: {HISTORY_JSON_PATH_B}")
+    print(f"正規化統計保存: {NORM_STATS_JSON_PATH_B}")
 
     # ベスト重みでの検証レポート（クラス別最適閾値を推定・保存）
     model.eval()
     all_probs_best, all_trues_best = [], []
     with torch.no_grad():
         for xb, yb in val_loader:
-            xb = xb.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            logits = model(xb)
-            probs = torch.sigmoid(logits)
-            all_probs_best.append(probs.detach().cpu().numpy())
-            all_trues_best.append(yb.detach().cpu().numpy())
+            bs = xb.size(0)
+            for i in range(0, bs, MICRO_BATCH_SIZE):
+                xb_mb = xb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                yb_mb = yb[i:i+MICRO_BATCH_SIZE].to(device, non_blocking=True)
+                logits_mb = model(xb_mb)
+                probs_mb = torch.sigmoid(logits_mb)
+                all_probs_best.append(probs_mb.detach().cpu().numpy())
+                all_trues_best.append(yb_mb.detach().cpu().numpy())
     y_prob_best = np.concatenate(all_probs_best, axis=0) if all_probs_best else np.zeros((0, num_classes), dtype=np.float32)
     y_true_best = np.concatenate(all_trues_best, axis=0) if all_trues_best else np.zeros((0, num_classes), dtype=np.float32)
 
@@ -655,8 +690,8 @@ def main():
             except Exception:
                 thresholds[c] = float(PREDICTION_THRESHOLD)
         # 保存
-        _save_json({"thresholds": thresholds, "labels": BASE_LABELS}, THRESHOLDS_JSON_PATH)
-        logi(f"クラス別最適閾値を保存: {THRESHOLDS_JSON_PATH}")
+        _save_json({"thresholds": thresholds, "labels": BASE_LABELS}, THRESHOLDS_JSON_PATH_B)
+        logi(f"クラス別最適閾値を保存: {THRESHOLDS_JSON_PATH_B}")
     except Exception as e:
         print("閾値推定でエラー:", e)
 
@@ -669,8 +704,8 @@ def main():
                 y_true_best.astype(int), y_pred_best.astype(int),
                 target_names=BASE_LABELS, zero_division=0, output_dict=True
             )
-            _save_json(report, VAL_REPORT_JSON_PATH)
-            logi(f"検証レポート保存: {VAL_REPORT_JSON_PATH}")
+            _save_json(report, VAL_REPORT_JSON_PATH_B)
+            logi(f"検証レポート保存: {VAL_REPORT_JSON_PATH_B}")
 
             # 混同行列（マルチラベル: クラス別 2x2）を図として保存
             try:
@@ -694,7 +729,7 @@ def main():
                     else:
                         ax.axis("off")
                 plt.tight_layout()
-                cm_path = os.path.join(OUTPUT_DIR, f"{MODEL_NAME}_confusion_matrices.png")
+                cm_path = os.path.join(OUT_DIR, f"{MODEL_TAG}_confusion_matrices.png")
                 plt.savefig(cm_path, dpi=150)
                 plt.close(fig)
                 print(f"混同行列の保存: {cm_path}")

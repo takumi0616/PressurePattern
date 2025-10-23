@@ -6,6 +6,16 @@ nohup python main_v1.py > main_v1.log 2>&1 &
 notify-run via-tml2 -- nohup python main_v1.py > main_v1.log 2>&1 &
 
 pkill -f "main_v1.py"
+
+pkill -f "run_backbones.py"
+
+notify-run via-tml2 -- nohup python run_backbones.py --backbones resnet_small,deformable,convnext_tiny > run_backbones.log 2>&1 &
+```
+
+via-tml2→mac
+
+```bash
+rsync -avz --progress via-tml2:/home/s233319/docker_miniconda/src/PressurePattern/Classification/result_1 /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/Classification/result_via-tml2
 ```
 
 ## 研究概要（現状構成の要約）
