@@ -218,8 +218,8 @@ rsync -avz --progress \
 
 ```bash
 rsync -avz --progress \
-  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/results_v8_iter10000_batch128_seed{1}_*' \
-  /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/result_gpu02
+  'gpu02:/home/devel/work_takasuka_git/docker_miniconda/src/PressurePattern/SOM/results_v8_iter1000_batch128_seed{81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100}_*' \
+  /Users/takumi0616/Develop/docker_miniconda/src/PressurePattern/SOM/results_v8_iter1000_128
 ```
 
 注意:
@@ -267,7 +267,7 @@ nohup bash run_seeds.sh --start 1 --end 10 --gpu0 0 --gpu1 1 --channel gpu01 --s
 
 nohup bash run_seeds.sh --start 1 --end 20 --gpu1 1 --only-gpu1 --channel gpu01 --script main_v8.py > orchestrator.log 2>&1 &
 
-nohup bash run_seeds.sh --start 21 --end 50 --gpu1 1 --only-gpu1 --channel gpu02 --script main_v8.py > orchestrator.log 2>&1 &
+nohup bash run_seeds.sh --start 81 --end 100 --gpu1 1 --only-gpu1 --channel gpu02 --script main_v8.py > orchestrator.log 2>&1 &
 ```
 
 そのコマンドは正常に動きます。前提として src/PressurePattern に移動してから実行する場合、以下が成立します。
